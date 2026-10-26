@@ -1,0 +1,72 @@
+MIT License
+
+Copyright (c) 2026 PC2005-cloud  (upstream dsh-pet)
+Copyright (c) 2026 Jessicaisleep (modifications and this distribution)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+────────────────────────────────────────────────────────────────────────────
+素材排除声明 / ASSET EXCLUSION NOTICE
+────────────────────────────────────────────────────────────────────────────
+
+上面这份 MIT 授权**仅覆盖本仓库中的源代码、配置模板与文档**。
+
+THE MIT GRANT ABOVE COVERS THE SOURCE CODE, CONFIGURATION TEMPLATES AND
+DOCUMENTATION IN THIS REPOSITORY ONLY.
+
+以下内容**不在**本 MIT 授权范围内，版权仍归各自权利人，本仓库不授予任何
+使用、复制、修改或再分发它们的许可：
+
+The following are expressly EXCLUDED from the MIT grant above. Copyright in
+them remains with their respective owners, and no license to use, copy,
+modify or redistribute them is granted by this repository:
+
+1. **角色形象与角色素材** —— 任何角色立绘、贴图、动画、语音、名称或形象，
+   包括但不限于 `dsh-pet/assets/` 下的图片、动图、视频与字体文件。
+   这些素材的权利属于原游戏 / 角色权利人，与本仓库作者无关。
+   若你重新分发本仓库，**必须自行移除这些素材**，或自行取得授权。
+
+   Character artwork and character-derived assets — including but not limited
+   to images, animated images, videos and font files under
+   `dsh-pet/assets/`. Rights belong to the original game / character rights
+   holders and are unrelated to this repository's authors. Redistributing
+   this repository requires removing these assets or obtaining a license.
+
+2. **第三方字体** —— `dsh-pet/assets/fonts/` 下的字体文件按字体自身的许可
+   协议使用，不适用 MIT。
+
+   Bundled third-party fonts under `dsh-pet/assets/fonts/` are governed by
+   their own font licenses, not by MIT.
+
+3. **凭据与用户数据** —— 本仓库**不包含**任何 API 密钥、访问令牌、会话
+   数据或对话记忆。`.gitignore` 已显式排除 `.credentials.yaml`、`.env`、
+   `standalone-ai.json`、`memory.json`、`logs.txt` 等文件。
+   任何人在本地配置的密钥都由其自行保管，不属于本仓库内容。
+
+   Credentials and user data — this repository contains NO API keys, access
+   tokens, session data or conversation memory. `.gitignore` explicitly
+   excludes `.credentials.yaml`, `.env`, `standalone-ai.json`, `memory.json`
+   and `logs.txt`. Any credentials configured locally are the sole
+   responsibility of whoever configured them.
+
+如需使用本项目的**代码部分**做二次开发，请遵守上面的 MIT 条款；如需使用
+**角色素材**，请另行联系相应权利人。
+
+To build on the CODE, follow the MIT terms above. To use the CHARACTER
+ASSETS, contact the respective rights holders separately.
