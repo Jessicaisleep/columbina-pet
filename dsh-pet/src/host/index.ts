@@ -97,7 +97,7 @@ import { createReadStream, existsSync, fstatSync, readFileSync } from 'node:fs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { homedir } from 'node:os';
-import { join, normalize, resolve, sep } from 'node:path';
+import { dirname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
@@ -174,6 +174,17 @@ import {
 import { profileNameFrom, storageEntries } from './storage-paths';
 import { parseStateWaitQuery, PollStateStore } from './state';
 import { composeSystemPrompt, petPersona } from './persona';
+import { ScreenReader, screenContextOf, screenReaderAvailable } from './screen-context';
+import { runAssistant } from './assistant/loop';
+import { appendRecord, buildRecord, clearRecords, countRecords, readRecords } from './assistant/history';
+import {
+  GrantStore,
+  isAssistantPermission,
+  resolvePetWorkspace,
+  resolveWorkspaceRoot,
+  type AssistantPermission,
+} from './assistant/permissions';
+import type { ToolContext } from './assistant/tools';
 import {
   HelperProcess,
   defaultElectronExe,
@@ -392,6 +403,218 @@ export function apply(ctx: any): void {
   // 老用户一次性迁移：main-config.json → main-config.jsonc（重命名，内容一字不动；
   // 新文件已存在则不动旧文件）。失败不影响运行——读取侧对旧路径有回落。
   migrateUserConfig(configPaths, (msg) => log.info('[dsh-pet] ' + msg));
+
+  // ---- 读屏与 AI 助手（2026-10-26 新增）----
+  // 读屏：常驻一个 PowerShell UIA 子进程。**懒启动**——`screenContextEnabled` 为 false 时
+  // 连进程都不 spawn（隐私 + 性能双重要求：不读屏时不该有任何后台进程在跑）。
+  // 第二个参数是「脚本落盘目录」：生产环境本文件在 app.asar 内，PowerShell 打不开 asar 路径，
+  // 必须先把 uia-reader.ps1 解到真实磁盘（见 screen-context.ts 的 materializeScript）。
+  const screenReader = new ScreenReader(
+    join(PACKAGE_ROOT, 'runtime', 'electron-helper', 'uia-reader.ps1'),
+    join(userRoot, 'uia'),
+  );
+  // 助手工作区根：独立模式下 DSH_HOME=<安装目录>/data，上一级就是桌宠文件夹（符合「工作区只有桌宠文件夹」）。
+  // 每只宠物在其下再分一个自己的干净目录（宠物工作区/<petId>/），互不覆盖。
+  const assistantWorkspace = resolveWorkspaceRoot(dshHome);
+  // 助手操作记录：JSONL 追加（一行一条），供设置页留痕。
+  // 路径放在用户数据目录（不是工作区）：这是系统记录，不该让助手自己读写到。
+  const assistantHistoryPaths = { file: join(userRoot, 'assistant-history.jsonl') };
+  // 一次性授权表：审批通过后只对「同一个工具 + 同一个目标路径」放行，120 秒过期，用过即焚。
+  const assistantGrants = new GrantStore();
+
+  /**
+   * 读当前生效的读屏 / 助手配置。
+   *
+   * 每次都现读 `readAllConfig`（配置随时可能被设置页改）：不做缓存，避免「改了开关要重启」。
+   * 全部字段带安全缺省——配置缺失/非法时按**最保守**处理（读屏关、助手关、只读权限）。
+   */
+  const assistantConfigOf = (
+    conf: Record<string, unknown>,
+  ): {
+    screenOn: boolean;
+    excludes: string[];
+    assistantOn: boolean;
+    permission: AssistantPermission;
+    network: boolean;
+  } => ({
+    screenOn: conf.screenContextEnabled === true,
+    excludes: Array.isArray(conf.screenExcludePatterns)
+      ? (conf.screenExcludePatterns as unknown[]).filter((v): v is string => typeof v === 'string')
+      : [],
+    assistantOn: conf.assistantEnabled === true,
+    // 非法值回落 readonly（默认最保守）：这是权限，宁可少给不能多给。
+    permission: isAssistantPermission(conf.assistantPermission) ? conf.assistantPermission : 'readonly',
+    network: conf.assistantNetworkEnabled !== false,
+  });
+
+  /**
+   * 生成一段屏幕上下文（追加到 system 末尾）。
+   *
+   * 失败/关闭一律返回空串：**读不到屏幕绝不能拖死碎碎念与对话**——这是本功能的硬约束。
+   */
+  const screenSection = async (conf: Record<string, unknown>): Promise<string> => {
+    const cfg = assistantConfigOf(conf);
+    if (!cfg.screenOn) return '';
+    try {
+      const snap = await screenReader.capture(cfg.excludes);
+      const section = screenContextOf(snap);
+      // 诊断日志：没有它就无法区分「读屏关了」「读到了但被排除项拦了」「读到了但没注入」。
+      // 只打长度与前 60 字（不打全文：屏幕内容可能含隐私，日志会留在盘上）。
+      if (snap === undefined) {
+        log.info('[dsh-pet] 读屏：本次未取到快照（窗口被排除项拦下 / 前台无焦点 / 读取失败）');
+      } else {
+        log.info(
+          `[dsh-pet] 读屏：窗口「${snap.title.slice(0, 40)}」类=${snap.cls} ` +
+            `${snap.pieces} 段/${snap.text.length} 字/耗时 ${snap.ms}ms` +
+            (snap.truncated ? '（已截断）' : '') +
+            ` → 注入 ${section.length} 字`,
+        );
+      }
+      return section;
+    } catch (e) {
+      log.warn('[dsh-pet] 读屏失败（已跳过，不影响本次生成）：' + (e instanceof Error ? e.message : String(e)));
+      return '';
+    }
+  };
+
+  /**
+   * 建（必要时）某宠物的干净工作区目录，返回其绝对路径。
+   *
+   * 位置：`<程序根>/宠物工作区/<petId>/`。**每次对话前都 ensure 一次**——
+   * 用户手工删掉目录后助手不该报错，直接重建即可。
+   * 创建失败（权限/磁盘）返回空串，调用方据此让助手明确失败，而不是拿一个不存在的路径瞎写。
+   */
+  const ensurePetWorkspace = async (petId: string): Promise<string> => {
+    const dir = resolvePetWorkspace(assistantWorkspace, petId);
+    try {
+      await mkdir(dir, { recursive: true });
+      return dir;
+    } catch (e) {
+      log.warn('[dsh-pet] 创建宠物工作区失败 pet=' + petId + '：' + (e instanceof Error ? e.message : String(e)));
+      return '';
+    }
+  };
+
+  /** 组装工具上下文（每只宠物自己的 workspace + 当前权限 + 共享授权表） */
+  const toolContextOf = (petWorkspace: string, conf: Record<string, unknown>): ToolContext => {
+    const cfg = assistantConfigOf(conf);
+    return {
+      workspaceRoot: petWorkspace,
+      permission: cfg.permission,
+      grants: assistantGrants,
+      netTimeoutMs: 20_000,
+      networkEnabled: cfg.network,
+    };
+  };
+
+  /**
+   * 待审批的越权动作。
+   *
+   * 语义：某次助手动作被权限挡下 → 记一条（含宠物、工具、目标、原始用户指令）→
+   * 设置页拉到这条 → 用户点允许 → 按 `userText` **原样重放**那次对话（授权表已放行该动作）→ 删掉这条。
+   * 只保留**最近 20 条**：老的不该无限堆积，超出的丢掉（用户没处理就是不想处理）。
+   */
+  interface PendingApproval {
+    id: string;
+    petId: string;
+    tool: string;
+    target: string;
+    reason: 'readonly' | 'outside-workspace';
+    message: string;
+    /** 原始用户指令：允许后按这句重放 */
+    userText: string;
+    createdAt: number;
+  }
+  const pendingApprovals = new Map<string, PendingApproval>();
+  /** 待审批上限：超出就丢掉最老的（用户没处理就是不想处理，不该无限堆积） */
+  const MAX_PENDING_APPROVALS = 20;
+
+  /** 记一条待审批；超过上限时淘汰最老的那条 */
+  const pushPendingApproval = (item: PendingApproval): void => {
+    pendingApprovals.set(item.id, item);
+    while (pendingApprovals.size > MAX_PENDING_APPROVALS) {
+      const oldest = [...pendingApprovals.values()].sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (!oldest) break;
+      pendingApprovals.delete(oldest.id);
+    }
+  };
+
+  /**
+   * 助手循环用的 llm 缝隙。
+   *
+   * 独立模式下 `ctx.standaloneAi.toolTurn` 存在；DSH 宿主里没有这个能力 → 返回 undefined，
+   * `runAssistant` 会明确报 provider-missing（不假装成功）。
+   */
+  const assistantLlm = ():
+    | {
+        toolTurn(input: {
+          system: string;
+          messages: unknown[];
+          tools: unknown[];
+          signal?: AbortSignal;
+        }): Promise<
+          | { ok: true; kind: 'text'; text: string }
+          | { ok: true; kind: 'tools'; toolCalls: Array<{ id: string; name: string; arguments: string }>; text: string }
+          | { ok: false; reason: string; message: string }
+        >;
+      }
+    | undefined => {
+    const svc = optionalService('standaloneAi') as
+      | { toolTurn?: (input: unknown) => Promise<unknown> }
+      | undefined;
+    if (!svc || typeof svc.toolTurn !== 'function') return undefined;
+    return {
+      toolTurn: (input) =>
+        svc.toolTurn!(input) as ReturnType<
+          NonNullable<ReturnType<typeof assistantLlm>>['toolTurn']
+        > extends never
+          ? never
+          : Promise<
+              | { ok: true; kind: 'text'; text: string }
+              | { ok: true; kind: 'tools'; toolCalls: Array<{ id: string; name: string; arguments: string }>; text: string }
+              | { ok: false; reason: string; message: string }
+            >,
+    };
+  };
+
+  /**
+   * 助手模式的补充 system 段：告诉模型工作区在哪、当前权限是什么、能做什么。
+   *
+   * 为什么必须显式告知权限：模型不知道「我现在只读」，就会反复尝试写文件、
+   * 每次都撞权限墙，然后给用户一句「我做不了」——而正确行为是**先说清楚需要提权**。
+   */
+  const assistantSystemHint = (workspace: string, permission: AssistantPermission, network: boolean): string => {
+    const permText =
+      permission === 'readonly'
+        ? '【当前权限：只读】你不能写或删除任何文件，只能读工作区内的文件并联网查资料。'
+        : permission === 'workspace'
+          ? '【当前权限：工作区内修改】你可以读写工作区里的文件；工作区之外的路径会被拦下。'
+          : '【当前权限：完全权限】你可以读写任意路径。请格外谨慎，删除或覆盖前先确认目标。';
+    return (
+      '【你可以动手做事】' +
+      '你的工作区目录是：' +
+      workspace +
+      '（相对路径按这个目录解析）。' +
+      permText +
+      (network
+        ? '你可以联网（web_search 搜索、fetch_url 抓网页）。'
+        : '【联网已关闭】你不能搜索或抓网页；需要资料时告诉用户去设置页打开联网。') +
+      '\n做事的原则：' +
+      '① 先想清楚要做几步，再一步步调用工具；能一次读完的就别反复读。' +
+      '② 工具失败时看错误信息再调整，不要重复同一个失败动作。' +
+      // 这一条是 2026-10-26 实机验收后补的：模型原本遇到「可能要越权」就自己先拒绝，
+      // 从不真正调用工具，于是权限层和审批 UI 全成了摆设——用户永远看不到「它想做什么」。
+      // 正确行为是**照做、让权限层去拦**，拦住之后由用户决定放不放。
+      '③ 用户要求的目标如果可能超出工作区或当前权限，**照样发起工具调用**——' +
+      '权限层会拦下并让用户决定是否放行。**不要自己预先拒绝**，那样用户连「你想做什么」都不知道。' +
+      '只有在你确实没有对应工具时才说不做。' +
+      '④ **不要把你正在做什么、调用了什么工具说出来**——那些是你的内部动作，用户不需要看。' +
+      '⑤ 全部做完后，用符合你人设的口吻说**一到两句**话，告诉用户结果就行了。' +
+      '不要罗列步骤、不要写「已完成以下操作」这种报告腔。' +
+      '⑥ 如果什么都没做成（被拦下 / 工具失败），就说清一件事：为什么没做成、需要用户做什么。'
+    );
+  };
+
   // 用户动画目录（thumb 播放时优先于包内素材；webm 放 main-animation/webm/，mov（macOS 定制）放 main-animation/mov/）
   const thumbUserRoot = join(userRoot, 'main-animation');
   // 用户表情包目录（碎碎念/对话配图的图片：优先于包内 assets/memes，加图不必改包）
@@ -868,7 +1091,10 @@ export function apply(ctx: any): void {
     // ——配置随时可能被设置页 / 右键菜单 / 手改文件改动，两次读之间就是窗口。
     // **明确失败：不生成、不写 S**。写下去就是一只已不存在宠物的幽灵叶子（/state 里常驻到进程重启）。
     if (!found) return { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + petId };
-    const system = petSystemPrompt(found);
+    // 读屏上下文（2026-10-26）：开关打开时抓一次前台窗口，把「用户在干什么」追加到 system 末尾。
+    // 失败返回空串 -> system 与原来逐字一致，绝不因读屏失败而改变碎碎念行为。
+    const screen = await screenSection(found.conf);
+    const system = screen === '' ? petSystemPrompt(found) : petSystemPrompt(found) + '\n' + screen;
     // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
     const meme =
       found.conf.whisperImageEnabled === true
@@ -1013,6 +1239,93 @@ export function apply(ctx: any): void {
       // 已摘要的那部分**本来就不该进上下文**（它们的内容已由摘要承载），从 summarized 之后开始截。
       const live = entry.messages.slice(summarizedOf(entry));
       const list = sliceMemoryRounds(live, rounds);
+      const acfg = assistantConfigOf(found.conf);
+
+      // ---- 助手模式（2026-10-26）：assistantEnabled 打开时，对话改走「多步工具循环」 ----
+      // 与普通对话的关系：**同一个人设、同一份记忆**，区别只在于模型可以真的动手，
+      // 且思考过程不弹给用户（只进日志），用户看到的还是最后那句带人设的回复。
+      if (acfg.assistantOn) {
+        const petWorkspace = await ensurePetWorkspace(petId);
+        if (petWorkspace === '') {
+          return { ok: false, reason: 'generate-error', message: '无法创建宠物工作区目录，助手暂时不可用。' };
+        }
+        // 屏幕上下文在这里也拼一次（助手同样要知道用户在干什么）
+        const screen = await screenSection(found.conf);
+        const assistantSystem =
+          (screen === '' ? system : system + '\n' + screen) +
+          '\n' +
+          assistantSystemHint(petWorkspace, acfg.permission, acfg.network);
+        const runStart = Date.now();
+        const outcome = await runAssistant({
+          llm: assistantLlm(),
+          system: assistantSystem,
+          history: list.map((m) => ({ role: m.role, content: m.content })),
+          userText: text,
+          toolCtx: toolContextOf(petWorkspace, found.conf),
+          log: (level, message) => (level === 'warn' ? log.warn(message) : log.info(message)),
+        });
+        // 留痕（无论成功/被拦/失败都记一条）：
+        // 「AI 动过我电脑里的什么」是事后唯一的追责依据，所以失败也要落盘。
+        // 写盘失败只在日志里 warn，绝不影响本次对话的结果。
+        const record = (status: 'ok' | 'blocked' | 'failed', reply: string, blockedTarget?: string): void => {
+          const rec = buildRecord({
+            petId,
+            petName: String(found.pet.name ?? ''),
+            permission: acfg.permission,
+            userText: text,
+            status,
+            reply,
+            steps: outcome.steps,
+            ms: Date.now() - runStart,
+            ...(blockedTarget ? { blockedTarget } : {}),
+          });
+          void appendRecord(assistantHistoryPaths, rec).then((ok) => {
+            if (!ok) log.warn('[dsh-pet] 助手操作记录写入失败（不影响对话）');
+          });
+        };
+        // 权限被挡：记下待审批，把提示弹给用户；本条不写记忆（这次没做成）
+        if (!outcome.ok && outcome.reason === 'needs-approval') {
+          const id = 'apr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          pushPendingApproval({
+            id,
+            petId,
+            tool: outcome.blocked.tool,
+            target: outcome.blocked.target,
+            reason: outcome.blocked.reason,
+            message: outcome.blocked.message,
+            userText: text,
+            createdAt: Date.now(),
+          });
+          const tip = outcome.blocked.message + '（在设置页点「允许」后我会重试这一次）';
+          state.writePet(petId, 'say', { text: tip });
+          record('blocked', tip, outcome.blocked.target);
+          return { ok: false, reason: 'generate-error', message: tip };
+        }
+        if (!outcome.ok) {
+          const msg = outcome.message;
+          state.writePet(petId, 'say', { text: msg });
+          record('failed', msg);
+          return { ok: false, reason: 'generate-error', message: msg };
+        }
+        // 成功：记忆存正文（动作明细不进对话历史，避免把工具日志当聊天记录读回去）
+        const now2 = Date.now();
+        entry.messages.push({ role: 'user', content: text, ts: now2 });
+        entry.messages.push({ role: 'assistant', content: outcome.text, ts: now2 });
+        await writeMemory(mem);
+        try {
+          await compressMemory(mem, entry, found.conf);
+        } catch (e) {
+          log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
+        }
+        state.writePet(petId, 'say', { text: outcome.text });
+        log.info(
+          `[dsh-pet] 助手完成 pet=${petId}，${outcome.steps.length} 步动作：` +
+            outcome.steps.map((s) => s.name + (s.ok ? '✓' : '✗')).join(' '),
+        );
+        record('ok', outcome.text);
+        return { ok: true as const, text: outcome.text };
+      }
+
       // 模型：条目配置的 chatModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
       const generated = await generateChat(ctx, system, list, text, pool, configuredModel(found.conf, 'chatModel'));
       if (!generated.ok) return generated;
@@ -1191,6 +1504,22 @@ export function apply(ctx: any): void {
         `[dsh-pet] 桌面判定：pets=${pets.length}，桌面可见=${desktopPets.length}` +
           `（${desktopPets.map((p) => String(p.id)).join(',') || '无'}）→ hasDesktopPet=${hasDesktopPet} tray=${trayOn}`,
       );
+      // 启动时就把每只宠物的助手工作区建好。
+      //
+      // 为什么必须在这里做（2026-10-27 用户报「宠物工作区目前是两个，但我们有3个桌宠」）：
+      // 原来只有**真的发起一次助手对话**才会按需 mkdir（ensurePetWorkspace），
+      // 于是从没用过助手的那只宠物永远没有目录 —— 看起来像漏了一只。
+      // 工作区是"每只宠物一个干净目录"的承诺，属于配置事实，不该等第一次对话才成立。
+      //
+      // 内联 mkdir 而不是调 ensurePetWorkspace：那个 helper 定义在文件更下方，
+      // 这里在 `const` 之前调用会踩 TDZ。同时它失败只 warn，不影响启动。
+      for (const p of pets) {
+        const id = String(p.id ?? '');
+        if (!id) continue;
+        void mkdir(resolvePetWorkspace(assistantWorkspace, id), { recursive: true }).catch((e) => {
+          log.warn('[dsh-pet] 创建宠物工作区失败 pet=' + id + '：' + (e instanceof Error ? e.message : String(e)));
+        });
+      }
     } catch (e) {
       log.warn(`[dsh-pet] 宠物配置非法，桌面模式已跳过：${e instanceof Error ? e.message : String(e)}`);
     }
@@ -2662,6 +2991,188 @@ export function apply(ctx: any): void {
           kind: 'json',
           status: 200,
           obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 助手 / 读屏的开关读写：/dsh-pet-7340/assistant/settings
+    //   GET  —— 当前 5 个字段 + 每只宠物的工作区绝对路径（设置页「读屏与助手」区用）
+    //   POST —— { screenContextEnabled?, screenExcludePatterns?, assistantEnabled?,
+    //             assistantPermission?, assistantNetworkEnabled? } 部分更新
+    // 为什么单独一条而不是走 /config：设置页只该改这几个字段，走 /config 的整包 PUT
+    // 要求调用方先拿到并回传完整 pets 数组，漏一个字段就可能把用户配置改坏。
+    if (rest === 'assistant/settings') {
+      const cfgNow = readAllConfig(configPaths);
+      const mainNow = cfgNow.main ?? {};
+      if (method === 'GET') {
+        const pets = flattenPetList(cfgNow).map((p) => ({
+          id: String(p.id ?? ''),
+          name: String(p.name ?? ''),
+          workspace: resolvePetWorkspace(assistantWorkspace, String(p.id ?? '')),
+        }));
+        return {
+          kind: 'json',
+          status: 200,
+          obj: {
+            ok: true,
+            screenContextEnabled: mainNow.screenContextEnabled === true,
+            screenExcludePatterns: Array.isArray(mainNow.screenExcludePatterns)
+              ? mainNow.screenExcludePatterns
+              : [],
+            assistantEnabled: mainNow.assistantEnabled === true,
+            assistantPermission: isAssistantPermission(mainNow.assistantPermission)
+              ? mainNow.assistantPermission
+              : 'readonly',
+            assistantNetworkEnabled: mainNow.assistantNetworkEnabled !== false,
+            workspaceRoot: assistantWorkspace,
+            pets,
+            /** 读屏能力是否可用（pwsh 找不到时为 false，设置页据此禁用开关并说明原因） */
+            /** 读屏能力是否可用（脚本随包存在 + 系统有 PowerShell；否则设置页禁用开关并说明） */
+            screenAvailable: screenReaderAvailable(join(PACKAGE_ROOT, 'runtime', 'electron-helper', 'uia-reader.ps1')),
+          },
+          headers: { 'cache-control': 'no-cache, no-store' },
+        };
+      }
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let patch: Record<string, unknown>;
+      try {
+        patch = JSON.parse(body ?? 'null') as Record<string, unknown>;
+      } catch {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '请求体不是合法 JSON' } };
+      }
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '请求体必须是对象' } };
+      }
+      // 逐字段校验（与读取侧同一套 topFieldValid 语义），非法值直接拒，不做部分写入
+      //
+      // ⚠️ pets 必须取**用户层原文**，不能取合并结果 `cfgNow.main.pets`：
+      // 合并器会把默认值填满每只宠物，把那份写回用户层等于把默认值固化成用户的显式设置，
+      // 以后改内置默认就再也影响不到这个用户了（与 /pet-persona「整段替换该层 pets」同一口径）。
+      const existing = readUserConfig(configPaths);
+      const existingPets = Array.isArray(existing?.pets)
+        ? (existing.pets as unknown[])
+        : Array.isArray(cfgNow.main?.pets)
+          ? (cfgNow.main.pets as unknown[])
+          : [];
+      const next: Record<string, unknown> = { pets: existingPets };
+      for (const key of [
+        'screenContextEnabled',
+        'screenExcludePatterns',
+        'assistantEnabled',
+        'assistantPermission',
+        'assistantNetworkEnabled',
+      ]) {
+        if (patch[key] === undefined) continue;
+        next[key] = patch[key];
+      }
+      const saved = saveUserConfig(next, existing);
+      if (!saved) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '提交的值不合法' } };
+      }
+      try {
+        await mkdir(dirname(userConfigPath), { recursive: true });
+        await writeFile(userConfigPath, JSON.stringify(saved, null, 2) + '\n', 'utf8');
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+      // 权限档位变了 → 之前的一次性授权必须失效（降权后旧授权不能继续用）
+      assistantGrants.clear();
+      state.writeSection('config', {});
+      // 配置变更后按新设置重建各宠物工作区（新加的宠物也要有目录）
+      for (const p of flattenPetList(readAllConfig(configPaths))) {
+        void ensurePetWorkspace(String(p.id ?? ''));
+      }
+      return { kind: 'json', status: 200, obj: { ok: true } };
+    }
+
+    // 助手操作记录：/dsh-pet-7340/assistant/history
+    //   GET    —— ?limit=N（默认 100，上限 1000）返回最近 N 条，新的在前
+    //   DELETE —— 清空全部记录
+    // 记录内容见 assistant/history.ts 的文件头注释（存什么、不存什么、体积边界）。
+    if (rest === 'assistant/history') {
+      if (method === 'GET') {
+        const limitRaw = Number(url.searchParams.get('limit') ?? '100');
+        const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? limitRaw : 100;
+        const items = await readRecords(assistantHistoryPaths, limit);
+        const total = await countRecords(assistantHistoryPaths);
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: true, total, limit, items },
+          headers: { 'cache-control': 'no-cache, no-store' },
+        };
+      }
+      if (method === 'DELETE') {
+        const ok = await clearRecords(assistantHistoryPaths);
+        return { kind: 'json', status: 200, obj: ok ? { ok: true } : { ok: false, message: '清空失败' } };
+      }
+      return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+    }
+
+    // 助手待审批队列：/dsh-pet-7340/assistant/approvals
+    //   GET  —— 列出待审批的越权动作（设置页轮询/打开时拉一次）
+    //   POST —— { id, allow: true|false } 处理一条：允许 = 记一次性授权并按原指令重放；拒绝 = 只删掉
+    // 设计意图：越权动作**不静默失败**。用户能看到「它想干什么、想改哪个文件」，
+    // 由人来决定这一次是否放行；批准只覆盖这一个动作这一个路径，不是永久开洞。
+    if (rest === 'assistant/approvals') {
+      if (method === 'GET') {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: {
+            ok: true,
+            workspace: assistantWorkspace,
+            items: [...pendingApprovals.values()]
+              .sort((a, b) => b.createdAt - a.createdAt)
+              .map((a) => ({
+                id: a.id,
+                petId: a.petId,
+                tool: a.tool,
+                target: a.target,
+                reason: a.reason,
+                message: a.message,
+                createdAt: a.createdAt,
+              })),
+          },
+          headers: { 'cache-control': 'no-cache, no-store' },
+        };
+      }
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let parsed: { id?: unknown; allow?: unknown };
+      try {
+        parsed = JSON.parse(body ?? 'null') as { id?: unknown; allow?: unknown };
+      } catch {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '请求体不是合法 JSON' } };
+      }
+      const id = String(parsed?.id ?? '');
+      const item = pendingApprovals.get(id);
+      if (!item) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'unknown-approval', message: '这条审批不存在或已处理' } };
+      }
+      pendingApprovals.delete(id);
+      if (parsed?.allow !== true) {
+        return { kind: 'json', status: 200, obj: { ok: true, allowed: false } };
+      }
+      // 允许：只放行「这个工具 + 这个目标路径」一次，然后按原用户指令重放整轮
+      assistantGrants.grant(item.tool, item.target);
+      try {
+        const replayed = await chatWithPet(item.petId, item.userText);
+        return {
+          kind: 'json',
+          status: 200,
+          obj: replayed.ok
+            ? { ok: true, allowed: true, text: replayed.text }
+            : { ok: false, allowed: true, reason: replayed.reason, message: replayed.message },
+        };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, allowed: true, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
         };
       }
     }

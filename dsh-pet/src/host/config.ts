@@ -113,6 +113,14 @@ const GLOBAL_DEFAULT_KEYS = [
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
+  // 读屏与助手（2026-10-26 新增）：都是「用户级偏好」，一份生效、多只宠物共享。
+  // 放这里有明确的理由——「要不要让桌宠读我的屏幕」「要不要让它能改文件」是用户的隐私与
+  // 安全决定，不该因为多开一只宠物就被各自问一遍，也不该出现「这只读那只不读」的分裂状态。
+  'screenContextEnabled',
+  'screenExcludePatterns',
+  'assistantEnabled',
+  'assistantPermission',
+  'assistantNetworkEnabled',
 ] as const;
 
 /** 已告警过的 文件:字段（进程内去重：同一问题只告警一次，避免每请求刷屏；重启重置） */
@@ -427,6 +435,31 @@ function topFieldValid(key: string, value: unknown): boolean {
       return typeof value === 'boolean';
     case 'trayEnabled':
       // 桌面模式系统托盘开关（main 条目顶层；helper 读它决定建不建托盘图标）
+      return typeof value === 'boolean';
+    // ---- 读屏（2026-10-26 新增）----
+    case 'screenContextEnabled':
+      // 读屏总开关：默认关闭（缺省 false），用户必须在设置页显式打开。
+      // 这是隐私开关，不是性能开关——任何「默认开启」都是错的。
+      return typeof value === 'boolean';
+    case 'screenExcludePatterns':
+      // 窗口标题黑名单：字符串数组，每项是一个子串（大小写不敏感），命中就不读那个窗口。
+      // 上限 40 条、单条 80 字符：这是「排除私人窗口」用的，不是拿来做复杂匹配的。
+      return (
+        Array.isArray(value) &&
+        value.length <= 40 &&
+        value.every((v) => typeof v === 'string' && v.length <= 80)
+      );
+    // ---- AI 助手（2026-10-26 新增）----
+    case 'assistantEnabled':
+      // 助手总开关：默认关闭。打开后对话才会走「工具调用循环」。
+      return typeof value === 'boolean';
+    case 'assistantPermission': {
+      // 三档权限：readonly / workspace / full。非法值一律拒（读取侧回落默认 readonly）。
+      const allowed = ['readonly', 'workspace', 'full'];
+      return typeof value === 'string' && allowed.includes(value);
+    }
+    case 'assistantNetworkEnabled':
+      // 助手能否联网（web_search / fetch_url）。与助手开关独立：可以允许写文件但禁网。
       return typeof value === 'boolean';
     case 'animations':
       return animationsValid(value);
@@ -826,6 +859,18 @@ export function saveUserConfig(
   if (mcr !== undefined && !topFieldValid('memoryCompressRounds', mcr)) return null;
   const mkr = o.memoryKeepRounds;
   if (mkr !== undefined && !topFieldValid('memoryKeepRounds', mkr)) return null;
+  // ---- 读屏 / 助手（2026-10-26 新增）：与上面几个全局字段同一套语义 ----
+  // 传了就校验后进白名单，没传则走下面的透传保留（用户手改的值原样不动）。
+  const sce = o.screenContextEnabled;
+  if (sce !== undefined && !topFieldValid('screenContextEnabled', sce)) return null;
+  const sep = o.screenExcludePatterns;
+  if (sep !== undefined && !topFieldValid('screenExcludePatterns', sep)) return null;
+  const ae = o.assistantEnabled;
+  if (ae !== undefined && !topFieldValid('assistantEnabled', ae)) return null;
+  const ap = o.assistantPermission;
+  if (ap !== undefined && !topFieldValid('assistantPermission', ap)) return null;
+  const ane = o.assistantNetworkEnabled;
+  if (ane !== undefined && !topFieldValid('assistantNetworkEnabled', ane)) return null;
   const cleanModel = (v: Record<string, unknown>): { provider: string; model: string } => ({
     provider: String(v.provider).trim(),
     model: String(v.model).trim(),
@@ -850,6 +895,24 @@ export function saveUserConfig(
   if (mce !== undefined) outConfig.memoryCompressEnabled = mce;
   if (mcr !== undefined) outConfig.memoryCompressRounds = Number(mcr);
   if (mkr !== undefined) outConfig.memoryKeepRounds = Number(mkr);
+  // 读屏与助手：布尔原样存，黑名单做一次去空白/去重/去空串再落盘
+  if (sce !== undefined) outConfig.screenContextEnabled = sce;
+  if (sep !== undefined) {
+    const seenPat = new Set<string>();
+    const clean: string[] = [];
+    for (const raw of sep as unknown[]) {
+      const s = String(raw).trim();
+      if (s === '') continue;
+      const k = s.toLowerCase();
+      if (seenPat.has(k)) continue;
+      seenPat.add(k);
+      clean.push(s);
+    }
+    outConfig.screenExcludePatterns = clean;
+  }
+  if (ae !== undefined) outConfig.assistantEnabled = ae;
+  if (ap !== undefined) outConfig.assistantPermission = ap;
+  if (ane !== undefined) outConfig.assistantNetworkEnabled = ane;
   // 透传保留：请求体未携带的顶层字段，从 existing（磁盘现有用户文件）原样带回——
   // 设置页只提交 pets(+全局开关+physics+模型+对话历史条数)，手改的 whisperPrompt/memes/... 借此保住。
   // 白名单字段只在「请求体传了」时才算白名单（已由上方写入）；未传时走这里透传磁盘旧值——
@@ -870,6 +933,11 @@ export function saveUserConfig(
   if (mce !== undefined) bodyOwned.add('memoryCompressEnabled');
   if (mcr !== undefined) bodyOwned.add('memoryCompressRounds');
   if (mkr !== undefined) bodyOwned.add('memoryKeepRounds');
+  if (sce !== undefined) bodyOwned.add('screenContextEnabled');
+  if (sep !== undefined) bodyOwned.add('screenExcludePatterns');
+  if (ae !== undefined) bodyOwned.add('assistantEnabled');
+  if (ap !== undefined) bodyOwned.add('assistantPermission');
+  if (ane !== undefined) bodyOwned.add('assistantNetworkEnabled');
   if (existing && typeof existing === 'object') {
     for (const key of Object.keys(existing)) {
       if (bodyOwned.has(key)) continue; // 白名单字段由请求体决定

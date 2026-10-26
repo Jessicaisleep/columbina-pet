@@ -51,6 +51,20 @@ export interface StandaloneModelService {
   isReady(): boolean;
   canWhisper(): boolean;
   getSettings(): { whisperIntervalSec: number };
+  /**
+   * 带工具的对话轮（AI 助手用；2026-10-26 新增）。
+   * 可选：测试替身可以不实现，宿主侧按「不存在 = 助手不可用」降级。
+   */
+  toolTurn?(input: {
+    system: string;
+    messages: unknown[];
+    tools: unknown[];
+    signal?: AbortSignal;
+  }): Promise<
+    | { ok: true; kind: 'text'; text: string }
+    | { ok: true; kind: 'tools'; toolCalls: Array<{ id: string; name: string; arguments: string }>; text: string }
+    | { ok: false; reason: string; message: string }
+  >;
   dispose(): void;
 }
 
@@ -199,6 +213,22 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
             isReady: () => ai.isReady(),
             canWhisper: () => ai.canWhisper(),
             whisperIntervalSec: () => ai.getSettings().whisperIntervalSec,
+            /**
+             * 带工具的对话轮（2026-10-26 新增，AI 助手用）。
+             *
+             * 这里必须显式转发：`src/host/index.ts` 的 `assistantLlm()` 靠
+             * 「`standaloneAi.toolTurn` 存不存在」来判断能不能开助手。
+             * 只暴露 isReady/canWhisper 时助手会静默退化成「当前没有可用的模型」——
+             * 表现为用户明明配了 API、开了助手开关，对话却一直不做事
+             * （这正是 2026-10-26 实机验收抓到的那个缺口）。
+             *
+             * 用可选调用：`toolTurn` 在接口上是可选的（测试替身可以不实现），
+             * 真不存在时返回 undefined，`assistantLlm()` 会把它当成「助手不可用」。
+             */
+            toolTurn: (input: unknown) =>
+              typeof ai.toolTurn === 'function'
+                ? ai.toolTurn(input as Parameters<NonNullable<StandaloneModelService['toolTurn']>>[0])
+                : Promise.resolve({ ok: false as const, reason: 'tools-unsupported', message: '模型服务不支持工具调用' }),
           },
         }
       : {}),

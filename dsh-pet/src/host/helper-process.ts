@@ -135,8 +135,38 @@ export function hasGraphicalDisplay(): boolean {
 }
 
 export function dshHomeDir(): string {
+  // 绿色分发优先：程序目录旁边**真的存在** data\dsh-pet\ 时就用它，压过系统 DSH_HOME。
+  //
+  // 为什么这条必须排第一（2026-10-27 实测踩到）：
+  //   绿色包要能在「干净 Windows」上双击就跑，而且必须是**这一个包自己的数据**。
+  //   但 DSH_HOME 一旦是系统级环境变量（本机就是：DSH_HOME=D:\Program Files (x86)\DSH_Data），
+  //   任何进程都会继承它 —— 包括 WMI 代建的那个。结果桌宠虽然起来了，读写的却是
+  //   另一个数据目录（实测日志写进了 DSH_Data\dsh-pet\logs.txt，包内 data\ 没动），
+  //   表现就是「宠物不是包里的这几只」。
+  //   要绕开它就得在启动时清环境变量，那就不得不经过 cmd（会多一个控制台进程）。
+  //   把「包内 data 存在」判定放到最前面，启动器就能直接起 exe，零窗口、零残留。
+  //
+  // 只在 data\dsh-pet\ 真存在时才采纳，所以：
+  //   - 插件形态（没有 data\ 目录）→ 照旧用 DSH_HOME；
+  //   - 开发时 `pnpm test` / `node scripts/*.mjs`（不在 dist-app\win-unpacked 里
+  //     也没有 data\）→ 照旧用 DSH_HOME / ~/.dsh，不会把源码树当数据根。
+  try {
+    const exeDir = dirname(process.execPath);
+    const bundled = join(exeDir, 'data');
+    if (existsSync(join(bundled, 'dsh-pet'))) return bundled;
+    // macOS 解包形态：execPath 在 Foo.app/Contents/MacOS/ 里，往上找同级 data
+    if (process.platform === 'darwin') {
+      const macBundled = join(exeDir, '..', '..', '..', 'data');
+      if (existsSync(join(macBundled, 'dsh-pet'))) return macBundled;
+    }
+  } catch {
+    /* 读不到就按下面的老口径回落 */
+  }
+  // 2) 显式 DSH_HOME（插件形态、开发调试）
+  if (process.env.DSH_HOME) return process.env.DSH_HOME;
+  // 3) 老口径：~/.dsh
   const userProfile = process.env.USERPROFILE || process.env.HOME || '';
-  return process.env.DSH_HOME || join(userProfile, '.dsh');
+  return join(userProfile, '.dsh');
 }
 
 // ---------- 平台适配（win32 / darwin / linux）----------

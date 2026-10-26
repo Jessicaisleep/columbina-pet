@@ -188,11 +188,19 @@ const css = [
   '.dsh-pet-stage{position:relative;width:var(--dsh-pet-size,462px);height:calc(var(--dsh-pet-size,462px)*9/16);pointer-events:none}',
   '.dsh-pet-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;opacity:0;transition:opacity .18s ease;transform-origin:center;z-index:0}',
   '.dsh-pet-video.is-front{opacity:1}',
-  // 切换时新动画必须压在旧动画**上面**淡入。两层若同时反向过渡（旧 1→0、新 0→1），
-  // 中途整体合成不透明度只剩约 75%，透明窗口就把桌面透出来 —— 就是肉眼看到的「切一下闪一下」
-  // （实测总亮度掉到中位 76%，持续 30~90ms）。抬高 z-index 后新层始终盖在**仍全不透明**的
-  // 旧层之上，底面不透，淡入全程不掉亮度。
-  '.dsh-pet-video.is-incoming{z-index:2}',
+  // 切换时新动画必须压在旧动画**上面**，而且是**瞬切**（transition:none），不能淡入。
+  //
+  // 两代踩坑，别改回去：
+  //   ① 最早是两层同时反向过渡（旧 1→0、新 0→1），中途整体合成不透明度只剩约 75%，
+  //      透明窗口把桌面透出来 —— 肉眼「切一下闪一下」（总亮度掉到中位 76%，持续 30~90ms）。
+  //   ② 把旧层退出过渡摘掉、只让新层 0→1 淡入，亮度不掉了，但**半透明期间露出的正是旧层**：
+  //      新姿势 α 与旧姿势 (1-α) 叠 180ms，就是一帧里两个不同姿势的「重影/重叠」。
+  //      实测抓帧证据：切动画那帧（PrintWindow 连拍 f77）等于前帧与后帧的线性混合，
+  //      最佳混合系数 0.45 时残差 3.15，而取纯前帧/纯后帧残差是 27.9 / 21.1。
+  //      重影正是用户报的「动画出现重叠现象」。
+  //      → 结论：桌宠切动作只能硬切。新层直接 opacity:1 盖上去，旧层 200ms 后再摘，
+  //        全程没有半透明时刻，既不掉亮度也不产生混合。
+  '.dsh-pet-video.is-incoming{z-index:2;transition:none}',
   // 触屏拖拽必需：缺 touch-action:none 时浏览器把手势判成页面滚动并发 pointercancel，
   // 宠物就不跟手指走；两条 -webkit-* 抑制长按选中与 iOS 长按呼出系统菜单
   '.dsh-pet-hit{position:absolute;pointer-events:auto;cursor:url("/dsh-pet-7340/pic/cursor-grab.png") 16 16, grab;z-index:1;touch-action:none;-webkit-user-select:none;-webkit-touch-callout:none}',
@@ -373,6 +381,10 @@ export function makePetUI(rt: {
     /** 当前正在播的第三方点播编号（null = 自播动画，不上报）；播完 / 失败 / 被打断后清空 */
     const playingPlaybackRef = useRef<string | null>(null);
     const genRef = useRef(0);
+    // 旧层的「摘除」动作：新层真正画出第一帧后才调用（详见 switchTo 里那段注释）。
+    // 用 ref 而不是局部变量，是为了让它能跨越 loadeddata → play() → 首帧回调 三段异步。
+    // 带上 el：A/B 双缓冲会复用元素，取消挂起项时要能判断「这一层是不是正被重新启用」。
+    const pendingDropRef = useRef<null | { el: HTMLVideoElement; drop: () => void }>(null);
     // ---- 占用锁（issue #122 第 4 项）----
     // `frozenRef` = 本宠物此刻是否被第三方占用（冻结）。初值就从叶子算：页面刷新时若正处在
     // 占用期间，第一帧就该是冻的，而不是先动一下再冻。
@@ -563,17 +575,19 @@ export function makePetUI(rt: {
         el.removeEventListener('loadeddata', onReady);
         if (pendingRef.current?.gen !== gen) return;
         const old = frontRef.current === 0 ? videoARef : videoBRef;
-        // 先抬 z-index 再淡入：新层盖在旧层之上，旧层保持全不透明垫底（见 CSS 里 is-incoming 的说明）。
+        // 先抬 z-index 再**瞬切**入位：新层盖在仍全不透明的旧层之上，
+        // 全程没有半透明时刻 → 既不掉亮度（不闪），也不与旧姿势叠出重影（不重叠）。
+        // 见 CSS 里 is-incoming 的三代踩坑记录，别把它改回 0→1 淡入。
         el.classList.add('is-incoming');
         el.classList.add('is-front');
         if (old.current && old.current !== el) {
-          // 旧层**不参与过渡**：这里只清 handler + 停播，is-front 留到新层淡入完成后再瞬摘。
+          // 旧层**不参与过渡**：这里清 handler + 停播，稍后在本函数末尾当场摘掉 is-front。
           // 拆雷：降级为背景的视频继续播完会触发它身上残留的 onended → handleEnded，
           // 掐断当前前台动画（历史上表现为随机急速跳转/雪崩）。清 handler + 停播彻底消除。
           old.current.onended = null;
           old.current.onerror = null;
           old.current.pause();
-          // 旧层退回 z-index:0（仍 is-front=全不透明，垫在新层下面）。
+          // 旧层退回 z-index:0，稍后（本函数末尾）连 is-front 一起摘掉 → 完全不可见。
           // 不摘的话它会一直带着 is-incoming，下一次切换两个元素就同为 z-index:2、
           // 谁在上变成看 DOM 顺序，等于把刚修好的层序又交回给偶然性。
           old.current.classList.remove('is-incoming');
@@ -584,32 +598,87 @@ export function makePetUI(rt: {
           if (outgoing !== null && outgoing !== cuePlaybackId) {
             reportPlayback(outgoing, 'cancelled', 'superseded');
           }
-          // 淡入 180ms 结束后才摘旧层。摘的瞬间新层已经 opacity:1 盖在上面，故不可见。
-          // 兜底：这段等待期间如果又切换过、旧层被重新启用为前台，就别摘（o === 当前前台则跳过）。
-          window.setTimeout(() => {
-            const o = old.current;
-            const cur = frontRef.current === 0 ? videoARef.current : videoBRef.current;
-            if (!o || o === cur) return;
-            o.style.transition = 'none';
-            o.classList.remove('is-front');
-            o.classList.remove('is-incoming');
-            // 下一帧恢复过渡，否则这个元素以后每次淡入都会变成硬切
-            window.requestAnimationFrame(() => {
-              o.style.transition = '';
-            });
-          }, 200);
+          // 旧层的摘除时机：**等新层真的画出第一帧**，不是等一个固定毫秒数。
+          //
+          // 2026-10-27 第四代坑（用户报「动画本身没问题，是动画和动画之间切换时重叠」，
+          // 且明确指出「自然切换几乎不重叠，手动切动画才重叠」）：
+          //
+          //   原实现等 200ms 才摘 is-front（那是新层「淡入 180ms」时代留下的缓冲）。
+          //   但素材是 **640x360 带 alpha 的透明画布**，人物只占中间一块，其余全透明。
+          //   旧层在这 200ms 里被压在下面、z-index 更低 —— 可新层除了人物轮廓以外
+          //   **全透明**，旧层的旧姿势就从那些透明区域里透出来，两套姿势同屏并存。
+          //
+          //   为什么只有手动切换看得出来：自然切换发生在上一段**播完**的那一刻，
+          //   而素材的首末帧是循环闭合的（loopIoU 0.989~0.995），旧姿势≈中立站姿，
+          //   与新动画首帧本来就接近，叠住也看不出。手动点播则打断在**任意中间帧**
+          //   （抬手、歪头、蹲下），错位立刻可见 —— 这正是用户描述的差异。
+          //
+          //   修法不能简单改成「当场摘」：旧层之所以存在，是为了盖住新层首帧尚未
+          //   画出来的那一瞬。直接摘会换来另一种毛病 —— 一帧空白。
+          //   所以用**真实的首帧事件**做边界：requestVideoFrameCallback 在视频
+          //   真正把一个帧送进合成器之后才回调，此时摘旧层既不会露白也不会重叠。
+          //   不支持该 API 时退回 rAF 双帧 + 250ms 兜底（宁可早一点，也不再叠 200ms）。
+          const o = old.current;
+          if (o) {
+            // 连续快速切换时，上一次挂起的「摘旧层」必须**先兑现**，否则被覆盖后
+            // 那一层永远留着 is-front（opacity:1）垫在最底下 —— 从「切一次双影 200ms」
+            // 变成「永久多一层」。
+            // 但只兑现「不属于正要上台那个元素」的那一层：A/B 双缓冲会复用元素，
+            // 上一次待摘的 A 很可能正是这一次的新前台 el，盲目兑现会把刚抬上来的层
+            // 又按下去（表现为整块空白）。
+            if (pendingDropRef.current && pendingDropRef.current.el !== el) {
+              pendingDropRef.current.drop();
+            }
+            let done = false;
+            const dropOld = () => {
+              if (done) return;
+              done = true;
+              // 守卫（原实现就有，别删）：A/B 双缓冲会复用元素，等待期间这一层可能
+              // 已经被重新抬成前台（连续快速点击/碎碎念插播）。此时若摘掉 is-front，
+              // 画面直接空白。摘之前必须重新确认「它不是我该保护的前台」。
+              const cur = frontRef.current === 0 ? videoARef.current : videoBRef.current;
+              if (o === cur) return;
+              o.style.transition = 'none';
+              o.classList.remove('is-front');
+              o.classList.remove('is-incoming');
+              // 下一帧恢复过渡，否则这个元素以后被复用时状态会被这段 none 粘住
+              window.requestAnimationFrame(() => {
+                o.style.transition = '';
+              });
+            };
+            pendingDropRef.current = { el: o, drop: dropOld };
+          }
         }
         frontRef.current = frontRef.current === 0 ? 1 : 0;
         pendingRef.current = null;
         playingPlaybackRef.current = cuePlaybackId;
         el.style.transform = facingRef.current === 'right' ? 'scaleX(-1)' : '';
+        // 旧层摘除的触发点（见上面 pendingDropRef 的注释）：
+        //   1) 优先用 requestVideoFrameCallback —— 视频真的把一帧交给合成器后才摘，
+        //      既不会露白（新层已出画）也不会重叠（旧层这时才消失）。
+        //   2) 不支持时退回 rAF 两帧（约 33ms，远小于旧的 200ms）。
+        //   3) 再加一道 250ms 兜底，防止回调因元素被复用/暂停而永远不来。
+        const dropOld = pendingDropRef.current?.drop;
+        pendingDropRef.current = null;
         el.play()
           .then(() => {
             // 只有 play() 兑现才代表"确实开始出画"（loadeddata 只代表可解码）
             if (cuePlaybackId !== null) reportPlayback(cuePlaybackId, 'playing');
+            if (!dropOld) return;
+            const rvfc = (el as HTMLVideoElement & {
+              requestVideoFrameCallback?: (cb: () => void) => number;
+            }).requestVideoFrameCallback;
+            if (typeof rvfc === 'function') {
+              rvfc.call(el, () => dropOld());
+              window.setTimeout(dropOld, 250);
+            } else {
+              window.requestAnimationFrame(() => window.requestAnimationFrame(dropOld));
+              window.setTimeout(dropOld, 250);
+            }
           })
           .catch(() => {
             // 自动播放被拒 / 元素不可播：既有实现静默吞掉 → 现在如实回 failed（不改播放控制）
+            dropOld?.();
             if (cuePlaybackId === null) return;
             if (playingPlaybackRef.current === cuePlaybackId) playingPlaybackRef.current = null;
             reportPlayback(cuePlaybackId, 'failed', 'play-rejected');

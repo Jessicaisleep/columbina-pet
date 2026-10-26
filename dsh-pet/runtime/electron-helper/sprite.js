@@ -600,10 +600,27 @@ class PetSprite {
       // 新层透明区就会透出那个冻结姿势，且之后每次切换只摘最新的那一层，这块残影永久留在底下
       // —— 用户报的「拖拽之后待机动画重叠（双影）」正是这个。
       this.front = this.front === 0 ? 1 : 0;
-      // 松手硬切（见构造函数 hardCut 的注释）：新层当场以全不透明出现，不参与 0.18s 淡入。
-      // 旧层（停在拖拽姿势）因此不会与新层同时可见 —— 这就是「抓取/释放动画重叠」（双影）的根因。
-      // 旧层随后在**同一帧**被摘掉，也不会退化成「两层各半 → 合成约 75% → 透出桌面」的闪烁。
-      const hardCut = this.hardCut;
+      // 硬切（见构造函数 hardCut 的注释）：新层当场以全不透明出现，不参与 0.18s 淡入。
+      //
+      // 2026-10-27 第五代坑（用户报「动画本身没问题，是**动画和动画之间切换时**重叠」，
+      // 且明确说「自然切换几乎不重叠，手动切动画才重叠」）：
+      //   这里原先只有「拖拽松手」那条路径置 hardCut=true（sprite.js:1436），
+      //   其余切换（右键菜单点播、点击触发、碎碎念、状态动画）都走 0→1 的 0.18s 淡入
+      //   + 旧层 setTimeout(stripOld, 200)。
+      //
+      //   而素材是 640x360 **带 alpha 的透明画布**，人物只占中间一块，其余全透明。
+      //   于是那 200ms 里：新层正在半透明淡入（自身就不够实），旧层又还全不透明地
+      //   垫在下面 —— 旧姿势从新层的透明区透出来，两套姿势同屏，就是「重叠」。
+      //
+      //   为什么自然切换看不出来：自然切换发生在上一段**播完**的那一帧，而素材首末帧
+      //   是循环闭合的（loopIoU 0.989~0.995），旧姿势≈中立站姿，与新动画首帧本就接近，
+      //   叠住也看不出差别。手动点播打断在**任意中间帧**（抬手/歪头/蹲下），错位立刻可见。
+      //   —— 这正是用户描述的那个不对称，也是「只有手动切换才重叠」的唯一解释。
+      //
+      //   所以：**所有切换一律硬切**，不再区分拖拽与菜单。旧层仍保留到新层真正画出
+      //   第一帧才摘（见下面 pendingDrop / requestVideoFrameCallback），既不会露白，
+      //   也不会让旧姿势多停留哪怕一帧。
+      const hardCut = true;
       this.hardCut = false;
       if (hardCut) el.style.transition = 'none';
       // 先抬 z-index 再淡入：新层盖在旧层之上，旧层保持全不透明垫底。
@@ -631,11 +648,22 @@ class PetSprite {
         if (this.playback && this.playback !== playbackId) {
           this.reportPlayback(this.playback, 'cancelled', 'superseded');
         }
-        // 收掉旧层。正常路径等淡入 180ms 结束（摘的瞬间新层已 opacity:1 盖住，不可见）；
-        // 硬切路径**当场收**——否则旧姿势会在新姿势后面留 200ms，透过新层的透明区
-        // 露出来，用户看到的就是「两个姿势叠着」（松手重叠的第二个成因）。
-        // 兜底：这段等待期间如果又切换过、旧层被重新启用为前台，就别摘。
+        // 收掉旧层。**等新层真的画出第一帧**再收，不是等固定毫秒数（2026-10-27）。
+        //
+        // 旧实现：正常路径 setTimeout(stripOld, 200)（等淡入 180ms 结束），硬切路径当场收。
+        // 现在所有切换都走硬切，200ms 这条路已经没有存在理由 —— 它不是「等新层出现」，
+        // 只是「等一个计时器」，而这期间旧姿势一直在新层透明区后面露着。
+        //
+        // 正确边界是新层的**首帧事件**：requestVideoFrameCallback 在视频真正把一帧交给
+        // 合成器后才回调。此时摘旧层既不会露白（新层已出画），也不会多留一帧旧姿势。
+        // 不支持该 API 时退回 rAF 双帧；再加 250ms 兜底防回调永不到达。
+        //
+        // 守卫（原实现就有，别删）：等待期间这一层可能已被重新抬成前台（连续快速切换），
+        // 盲目摘 is-front 会让画面整块空白。
+        let stripped = false;
         const stripOld = () => {
+          if (stripped) return;
+          stripped = true;
           const cur = this.front === 0 ? this.videoA : this.videoB;
           if (!old || old === cur) return;
           old.style.transition = 'none';
@@ -646,25 +674,29 @@ class PetSprite {
             old.style.transition = '';
           });
         };
-        if (hardCut) stripOld();
-        else window.setTimeout(stripOld, 200);
-      }
+        this.pendingDrop = stripOld;
+        el.play()
+          .then(() => {
+            // 只有 play() 兑现才代表"确实开始出画"（loadeddata 只代表可解码）
+            if (playbackId) this.reportPlayback(playbackId, 'playing');
+            const rvfc = el.requestVideoFrameCallback;
+            if (typeof rvfc === 'function') rvfc.call(el, () => stripOld());
+            else window.requestAnimationFrame(() => window.requestAnimationFrame(stripOld));
+            window.setTimeout(stripOld, 250);
+          })
+          .catch(() => {
+            // 自动播放被拒 / 元素不可播：既有实现静默吞掉 → 现在如实回 failed（不改播放控制）
+            stripOld();
+            if (!playbackId) return;
+            if (this.playback === playbackId) this.playback = null;
+            this.reportPlayback(playbackId, 'failed', 'play-rejected');
+          });
+        }
       // 前台的翻转已在函数开头做过（见那里的注释）——这里绝不能再翻一次，
       // 否则 front 会来回抵消，旧层判定与新层判定同时错位。
       this.pending = null;
       this.playback = playbackId || null;
       el.style.transform = this.facing === 'right' ? 'scaleX(-1)' : '';
-      el.play()
-        .then(() => {
-          // 只有 play() 兑现才代表"确实开始出画"（loadeddata 只代表可解码）
-          if (playbackId) this.reportPlayback(playbackId, 'playing');
-        })
-        .catch(() => {
-          // 自动播放被拒 / 元素不可播：既有实现静默吞掉 → 现在如实回 failed（不改播放控制）
-          if (!playbackId) return;
-          if (this.playback === playbackId) this.playback = null;
-          this.reportPlayback(playbackId, 'failed', 'play-rejected');
-        });
       // 点击 Q 弹：等新动画就位后才压（压的是新点击动画的首帧，与浏览器一致）
       if (this.pendingSquash) {
         this.pendingSquash = false;

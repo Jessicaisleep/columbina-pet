@@ -4,6 +4,7 @@ import { createAiConfig } from './ai-config';
 import type { StandaloneAiPublicSettings } from './ai-config';
 import { isAuthenticationFailure, isRateLimitFailure, sdkTextStream } from './ai-transport';
 import type { AiFetch, AiRequest, AiTransportEvent } from './ai-transport';
+import { toolTurn } from './ai-tools';
 
 const PROVIDER = 'standalone';
 const MAX_INPUT_CHARS = 32_768;
@@ -44,6 +45,24 @@ export interface StandaloneAiService {
   }): Promise<{ ok: boolean; message: string; reply?: string }>;
   isReady(): boolean;
   canWhisper(): boolean;
+  /**
+   * 跑一轮「带工具」的对话（2026-10-26 新增，AI 助手用）。
+   *
+   * 与 `stream` 的区别：`stream` 是流式纯文本，拿不到 tool_calls；这里是**非流式**一轮，
+   * 返回「纯文本」或「要调用的工具」二选一，由 `src/host/assistant/loop.ts` 驱动多步循环。
+   *
+   * 未就绪 / 忙 / 协议不支持工具时返回结构化失败，**不抛异常**（抛了会中断循环）。
+   */
+  toolTurn(input: {
+    system: string;
+    messages: unknown[];
+    tools: unknown[];
+    signal?: AbortSignal;
+  }): Promise<
+    | { ok: true; kind: 'text'; text: string }
+    | { ok: true; kind: 'tools'; toolCalls: Array<{ id: string; name: string; arguments: string }>; text: string }
+    | { ok: false; reason: 'tools-unsupported' | 'provider-error' | 'empty'; message: string }
+  >;
   dispose(): void;
 }
 /** Optional third argument is an isolated transport/clock seam; production uses official SDKs. */
@@ -204,6 +223,69 @@ export function createStandaloneAi(
         ? { id: model, name: model }
         : undefined,
     stream,
+    /**
+     * 一轮带工具的对话（AI 助手）。
+     *
+     * 与 `stream` 共用同一套就绪判定、限流、单并发闸与超时，但**不走流式**：
+     * OpenAI 的 tool_calls 在流式下是增量拼装的，各家兼容层行为不一，非流式一次拿全更可靠。
+     *
+     * 关键点：**不能抛异常**。助手循环靠返回值分支，抛了会中断整个多步流程，
+     * 模型就没机会看到「工具不支持」这类可纠正的信息。
+     */
+    async toolTurn(input) {
+      if (!ready()) {
+        return {
+          ok: false as const,
+          reason: 'provider-error' as const,
+          message: 'Standalone AI is not ready. Configure and enable the model first.',
+        };
+      }
+      const settings = store.current();
+      // 单并发：与 stream 共用 active，避免助手轮与碎碎念同时抢一个实例
+      if (active) {
+        return { ok: false as const, reason: 'provider-error' as const, message: 'Standalone AI is busy. Please wait.' };
+      }
+      const recent = requests.filter((time) => now() - time < RATE_WINDOW_MS);
+      if (recent.length >= REQUESTS_PER_MINUTE) {
+        return {
+          ok: false as const,
+          reason: 'provider-error' as const,
+          message: 'Standalone AI rate limit reached. Please wait.',
+        };
+      }
+      requests = [...recent, now()];
+      const controller = new AbortController();
+      active = controller;
+      const callerSignal = input.signal;
+      const abort = () => controller.abort();
+      callerSignal?.addEventListener('abort', abort, { once: true });
+      const timer = setTimeout(abort, settings.timeoutMs);
+      try {
+        const result = await toolTurn(
+          settings,
+          input.system,
+          input.messages as never,
+          input.tools as never,
+          controller.signal,
+          fetcher,
+        );
+        if (!ready()) {
+          return { ok: false as const, reason: 'provider-error' as const, message: 'Standalone AI request cancelled.' };
+        }
+        return result;
+      } catch (e) {
+        return {
+          ok: false as const,
+          reason: 'provider-error' as const,
+          message: e instanceof Error ? e.message : String(e),
+        };
+      } finally {
+        clearTimeout(timer);
+        callerSignal?.removeEventListener('abort', abort);
+        controller.abort();
+        if (active === controller) active = undefined;
+      }
+    },
     getSettings: () => store.publicSettings(),
     async saveSettings(input) {
       if (disposed) throw new Error('Standalone AI is disposed.');
