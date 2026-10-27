@@ -603,6 +603,76 @@ describe('saveUserConfig —— 宠物固定 fixedEnabled（per-pet 白名单）
   });
 });
 
+describe('position.pinned —— 位置固定（三兄弟必须整组成立）', () => {
+  const petAt = (out: Record<string, unknown> | null, n = 0): Record<string, unknown> =>
+    (out?.pets as Record<string, unknown>[])[n];
+  const posOf = (out: Record<string, unknown> | null): Record<string, unknown> =>
+    petAt(out).position as Record<string, unknown>;
+  /** 基准 position（corner/margin 齐全，但不含 pinned 相关键） */
+  const POS = { corner: 'bottom-right', marginX: 40, marginY: 40 };
+
+  test('固定 + 坐标 → 三兄弟一起落盘', () => {
+    const out = saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: true, pinX: 0.25, pinY: 0.75 } }] });
+    const pos = posOf(out);
+    assert.equal(pos.pinned, true);
+    assert.equal(pos.pinX, 0.25);
+    assert.equal(pos.pinY, 0.75);
+  });
+
+  test('未固定 → 三个键都不出现（缺键 = 不固定，不写噪声）', () => {
+    const pos = posOf(saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: false } }] }));
+    assert.equal(pos.pinned, undefined);
+    assert.equal(pos.pinX, undefined);
+    assert.equal(pos.pinY, undefined);
+  });
+
+  test('固定但没有坐标 → 整包拒绝（不能静默钉到 0,0 那个左上角）', () => {
+    assert.equal(saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: true } }] }), null);
+  });
+
+  test('固定但坐标非数字 → 整包拒绝', () => {
+    assert.equal(
+      saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: true, pinX: 'a', pinY: 0.5 } }] }),
+      null,
+    );
+  });
+
+  test('pinned 传非布尔 → 整包拒绝', () => {
+    assert.equal(saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: 'yes' } }] }), null);
+  });
+});
+
+describe('readAllConfig —— position.pinned 合并与兜底', () => {
+  const petAt = (merged: Record<string, Record<string, unknown>>, n = 0): Record<string, unknown> =>
+    (merged.main.pets as Record<string, unknown>[])[n];
+  const posOf = (merged: Record<string, Record<string, unknown>>): Record<string, unknown> =>
+    petAt(merged).position as Record<string, unknown>;
+  /** 基准 position（corner/margin 齐全，但不含 pinned 相关键） */
+  const POS = { corner: 'bottom-right', marginX: 40, marginY: 40 };
+
+  test('没写 pinned → 结果里没有这些键（渲染端按未固定处理）', () => {
+    const pos = posOf(readAllConfig(withBase({})));
+    assert.equal(pos.pinned, undefined);
+    assert.equal(pos.pinX, undefined);
+  });
+
+  test('写了 pinned + 坐标 → 原样带出', () => {
+    const merged = readAllConfig(
+      withBase({}, { pets: [{ ...BASE.pets[0], position: { ...POS, pinned: true, pinX: 0.1, pinY: 0.9 } }] }),
+    );
+    const pos = posOf(merged);
+    assert.equal(pos.pinned, true);
+    assert.equal(pos.pinX, 0.1);
+    assert.equal(pos.pinY, 0.9);
+  });
+
+  test('写了 pinned 但没有坐标 → 静默回落未固定（告警一次，绝不钉到左上角）', () => {
+    const merged = readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], position: { ...POS, pinned: true } }] }));
+    const pos = posOf(merged);
+    assert.equal(pos.pinned, undefined, '坏配置必须当成未固定');
+  });
+});
+
 describe('readAllConfig —— 实例级人设 whisperPrompt（实例覆盖 / 不填生效值）', () => {
   const petAt = (merged: Record<string, Record<string, unknown>>, n = 0): Record<string, unknown> =>
     (merged.main.pets as Record<string, unknown>[])[n];

@@ -97,3 +97,48 @@ export const anchorPixel = (o: {
       return { x: right, y: bottom };
   }
 };
+
+/**
+ * 位置固定（`position.pinned`）时的根节点左上角坐标：把**宠物中心**放到 (pinX, pinY) 归一化点。
+ *
+ * 为什么锚中心而不是左上角：屏幕分辨率/缩放变化后，同一个中心点在同一块屏上看起来仍在原处；
+ * 若锚左上角，窗口高度（= size*9/16，随 size 变）一变，宠物就像往上/下"漂"了一截。
+ * 这与 `POST /position` 的语义完全一致（那条也是"把中心挪到归一化坐标"），两套坐标可以互换，
+ * 所以"固定"其实就是"把某个 /position 落点存进配置"。
+ *
+ * `area` 与 anchorPixel 同义：角落所属的工作区矩形；缺省用 {0,0,W,H}。
+ */
+export const pinPixel = (o: {
+  pinX: number;
+  pinY: number;
+  size: number;
+  W: number;
+  H: number;
+  area?: Rect;
+}): { x: number; y: number } => {
+  const height = (o.size * 9) / 16;
+  const a = o.area ?? { x: 0, y: 0, width: o.W, height: o.H };
+  return {
+    x: a.x + o.pinX * a.width - o.size / 2,
+    y: a.y + o.pinY * a.height - height / 2,
+  };
+};
+
+/**
+ * 把"宠物中心在屏幕坐标系里的像素点"换算成 `position.pinned` 要存的两个归一化比例。
+ * 归一化空间与 `POST /position` / customPos 一致 = 所有屏工作区并集的**外接矩形**（hull）。
+ * `hull` 缺省时按 (W,H) 单矩形算（浏览器端就是视口）。
+ */
+export const pixelToPin = (o: {
+  cx: number;
+  cy: number;
+  W: number;
+  H: number;
+  hull?: Rect;
+}): { pinX: number; pinY: number } => {
+  const a = o.hull ?? { x: 0, y: 0, width: o.W, height: o.H };
+  const w = a.width || 1;
+  const h = a.height || 1;
+  return { pinX: (o.cx - a.x) / w, pinY: (o.cy - a.y) / h };
+};
+

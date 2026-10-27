@@ -29,6 +29,14 @@ export const settingsPage = `<!doctype html>
 <div class="test-row"><button id="persona-save" type="button">保存人设</button><span id="persona-result" class="test-result" role="status" aria-live="polite"></span></div>
 <details class="preview"><summary>查看最终生效的 system prompt</summary><pre id="persona-preview" class="pre"></pre></details>
 </fieldset>
+<fieldset><legend>宠物位置</legend>
+<p class="hint" id="pin-lead">选一只宠物，把它<b>钉在当前屏幕位置</b>。固定后：拖拽不跟手、松手不抛掷、不会自己走开、也不会被别的宠物撞飞——<b>动画、点击回应、碎碎念、对话全部照常</b>（只锁位置，不锁功能）。</p>
+<div class="pair"><div><label for="pin-pet">宠物</label><select id="pin-pet" aria-describedby="pin-lead"></select></div>
+<div><label for="pin-state">当前状态</label><input id="pin-state" type="text" readonly tabindex="-1" value="读取中…"></div></div>
+<label class="check"><input id="pin-enabled" type="checkbox">固定位置（钉在保存时的中心点）</label>
+<p class="hint" id="pin-hint">勾选后保存，宠物会钉在它<b>此刻</b>所在的位置（中心点按屏幕比例记，换分辨率也不会跑飞）。想换位置就先取消固定、拖到新地方、再勾选保存。也可以直接在桌宠上右键 →「固定位置」——那条路更快，效果与这里完全一致。</p>
+<div class="test-row"><button id="pin-save" type="button">保存位置设置</button><span id="pin-result" class="test-result" role="status" aria-live="polite"></span></div>
+</fieldset>
 <fieldset><legend>定时自动碎碎念</legend>
 <label class="check"><input id="automaticWhispers" type="checkbox" aria-describedby="cost">开启自动碎碎念</label>
 <p id="cost" class="notice">开启后，桌宠会按设定间隔定时调用模型并在桌面上说话冒泡（产生 API 费用）。默认关闭；右键菜单中的手动对话与手动碎碎念不受此开关限制。</p>
@@ -339,7 +347,7 @@ export const settingsScript = `
         }
       }
     } catch { pets = []; }
-    for (const select of [petSelect, historyPet]) {
+    for (const select of [petSelect, historyPet, pinSelect]) {
       select.textContent = '';
       if (!pets.length) {
         const option = document.createElement('option');
@@ -355,8 +363,74 @@ export const settingsScript = `
         select.appendChild(option);
       }
     }
-    if (pets.length) { void loadPersona(); }
+    if (pets.length) { void loadPersona(); void loadPin(); }
   }
+
+   // ---------- 宠物位置（固定位置）----------
+  const pinSelect = get('pin-pet');
+  const pinEnabled = get('pin-enabled');
+  const pinState = get('pin-state');
+  const pinResult = get('pin-result');
+  let pinLoaded = false;
+  function pinMessage(text, kind) {
+    pinResult.className = 'test-result' + (kind ? ' ' + kind : '');
+    pinResult.textContent = text;
+  }
+  /** 读这只宠物当前的 pinned 状态（成品配置里读，与桌面端/浏览器端同一份） */
+  async function loadPin() {
+    if (!pinSelect.value) return;
+    pinResult.textContent = '';
+    pinEnabled.disabled = true;
+    pinState.value = '读取中…';
+    try {
+      const merged = await petRequest('/dsh-pet-7340/config');
+      let found = null;
+      for (const conf of Object.values(merged || {})) {
+        const list = conf && Array.isArray(conf.pets) ? conf.pets : [];
+        const hit = list.find((p) => p && String(p.id) === pinSelect.value);
+        if (hit) { found = hit; break; }
+      }
+      const pos = (found && found.position) || {};
+      const isPinned = pos.pinned === true && Number.isFinite(Number(pos.pinX)) && Number.isFinite(Number(pos.pinY));
+      pinEnabled.checked = isPinned;
+      if (isPinned) {
+        pinState.value = '已固定（' + (Number(pos.pinX) * 100).toFixed(1) + '%, ' + (Number(pos.pinY) * 100).toFixed(1) + '%）';
+      } else {
+        pinState.value = '未固定（跟角落配置走）';
+      }
+      pinLoaded = true;
+    } catch (error) {
+      pinState.value = '读取失败';
+      pinMessage(error.message, 'test-error');
+    } finally {
+      pinEnabled.disabled = false;
+    }
+  }
+  pinSelect.addEventListener('change', () => { void loadPin(); });
+  pinEnabled.addEventListener('change', () => {
+    // 只改本地勾选，等「保存位置设置」才落盘 —— 与下面所有卡片同一纪律：
+    // 开关一拨就写盘会让"拨错了"没有反悔机会（这个页面其余开关也都是显式保存）。
+    if (!pinLoaded) return;
+    pinMessage('改了还没保存——点「保存位置设置」生效。');
+  });
+  get('pin-save').addEventListener('click', async () => {
+    if (!pinSelect.value) return;
+    const btn = get('pin-save');
+    btn.disabled = true;
+    pinMessage('正在保存…');
+    try {
+      // 只发 id + pinned：坐标由宿主自己取（优先桌面端实况上报的当前位置，
+      // 退而用配置里上次固定的点）。设置页拿不到显示器几何，乱算一个比不给更糟。
+      const data = await petRequest('/dsh-pet-7340/pet-pinned', 'POST', {
+        id: pinSelect.value,
+        pinned: pinEnabled.checked,
+      });
+      if (!data.ok) throw new Error(data.message || data.reason || '保存失败');
+      await loadPin();
+      pinMessage(pinEnabled.checked ? '已固定。桌宠会停在此刻的位置，不再跟着鼠标走。' : '已解除固定，宠物回到配置的角落。', 'test-success');
+    } catch (error) { pinMessage(error.message, 'test-error'); }
+    finally { btn.disabled = false; }
+  });
 
   get('clearApiKey').addEventListener('change', () => {
     get('apiKey').disabled = get('clearApiKey').checked;

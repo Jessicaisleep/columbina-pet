@@ -735,6 +735,50 @@ describe('/pet-display —— 业务失败一律 200 + ok:false（不用 400/404
   });
 });
 
+describe('/pet-pinned —— 位置固定（与 /pet-display 同一套失败口径）', () => {
+  // 注意：本文件用**源码形态**的 apply()，包内 assets 不可达，readAllConfig 会抛 → 凡是要读
+  // 配置的分支都走到 generate-error（这是本文件既有的边界，见开头注释）。所以这里只钉
+  // **读配置之前**那几道校验：方法、JSON、id、pinned 类型。写盘/合并的正确性由
+  // config.test.ts 的 pinned 组与 displays.test.ts 的 pinPixel 组覆盖。
+  test('GET → 405（写端点）', async () => {
+    assert.equal((await call('/dsh-pet-7340/pet-pinned')).status, 405);
+  });
+
+  test('请求体不是合法 JSON → 400', async () => {
+    const r = await call('/dsh-pet-7340/pet-pinned', 'POST', '{ 不是 json');
+    assert.equal(r.status, 400);
+    assert.match(r.body, /invalid JSON body/);
+  });
+
+  test('缺 id → 200 + pet-required', async () => {
+    const r = await call('/dsh-pet-7340/pet-pinned', 'POST', JSON.stringify({ pinned: false }));
+    assert.equal(r.status, 200);
+    const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, 'pet-required');
+  });
+
+  test('pinned 不是布尔 → 200 + bad-request（不静默当成 false）', async () => {
+    for (const bad of ['true', 1, null]) {
+      const r = await call('/dsh-pet-7340/pet-pinned', 'POST', JSON.stringify({ id: 'main', pinned: bad }));
+      assert.equal(r.status, 200, String(bad));
+      const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+      assert.equal(body.ok, false);
+      assert.equal(body.reason, 'bad-request');
+    }
+  });
+
+  test('固定但坐标缺失 → 走配置读取（本文件里落到 generate-error，不静默钉到 0,0）', async () => {
+    const r = await call('/dsh-pet-7340/pet-pinned', 'POST', JSON.stringify({ id: 'main', pinned: true }));
+    assert.equal(r.status, 200);
+    const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    // 坐标缺失时它去读配置补坐标（读实况快照 / 上次固定点）——本文件读不到配置，
+    // 于是落到 generate-error。关键断言是 **ok:false**：绝不会静默成功并钉到 (0,0)。
+    assert.ok(['generate-error', 'pin-needs-position'].includes(body.reason), `reason=${body.reason}`);
+  });
+});
+
 describe('/work-status —— 外部写入工作状态', () => {
   type StateBody = { sections: { workStatus: { data: { state: string | null; task: string | null } } } };
   const work = async () => JSON.parse((await call('/dsh-pet-7340/state')).body) as StateBody;

@@ -504,6 +504,14 @@ export function apply(ctx: any): void {
       grants: assistantGrants,
       netTimeoutMs: 20_000,
       networkEnabled: cfg.network,
+      // 再读一次屏幕（read_screen 工具）。开关关着 / 读不到 → undefined，
+      // 工具会翻成「读屏没开」而不是编内容（见 assistant/tools.ts 的 readScreenTool）。
+      readScreen: async () => {
+        if (!cfg.screenOn) return undefined;
+        const snap = await screenReader.capture(cfg.excludes);
+        if (!snap) return undefined;
+        return { text: snap.text, title: snap.title, when: snap.stale ? 'last' : 'now' };
+      },
     };
   };
 
@@ -1227,7 +1235,12 @@ export function apply(ctx: any): void {
       // 人设：实例级 whisperPrompt 优先，没写回落所属条目（与碎碎念同一拼装）。
       // 末尾追加长期记忆段——`memorySection` 在摘要为空时返回空串，拼出来的 system 与改造前**逐字一致**，
       // 所以没压缩过的宠物行为不变。
-      const system = petSystemPrompt(found) + memorySection(entry.summary ?? '');
+      // 读屏（2026-10-27 修）：**普通对话也要拼**。改造前只有碎碎念和助手模式拼了，
+      // 于是「问它屏幕上有什么」永远答不上来；设置页文案却写着「碎碎念和回答都能接上」。
+      // 失败返回空串 -> system 与原来逐字一致，绝不因读屏失败而改变对话行为。
+      const chatScreen = await screenSection(found.conf);
+      const baseSystem = petSystemPrompt(found) + memorySection(entry.summary ?? '');
+      const system = chatScreen === '' ? baseSystem : baseSystem + '\n' + chatScreen;
       // 配图：开关关闭 → 空池（指令与解析都不介入，与旧行为逐字一致）；目录链按所属条目取。
       // 张数上限（chatImageLimit，0 = 不限制）：整张清单每条消息都要附，截断后费用上限可控。
       const pool =
@@ -1249,12 +1262,11 @@ export function apply(ctx: any): void {
         if (petWorkspace === '') {
           return { ok: false, reason: 'generate-error', message: '无法创建宠物工作区目录，助手暂时不可用。' };
         }
-        // 屏幕上下文在这里也拼一次（助手同样要知道用户在干什么）
-        const screen = await screenSection(found.conf);
+        // 屏幕上下文**不再在这里拼第二次**：上面构造 `system` 时已经拼进去了（2026-10-27）。
+        // 改造前这里单独再拼一次，是因为普通对话那份没拼；现在两份共用同一个 `system`，
+        // 再拼一次会让 prompt 里出现两段「用户此刻的屏幕」，白烧 token 还可能让模型重复描述。
         const assistantSystem =
-          (screen === '' ? system : system + '\n' + screen) +
-          '\n' +
-          assistantSystemHint(petWorkspace, acfg.permission, acfg.network);
+          system + '\n' + assistantSystemHint(petWorkspace, acfg.permission, acfg.network);
         const runStart = Date.now();
         const outcome = await runAssistant({
           llm: assistantLlm(),
@@ -1800,7 +1812,9 @@ export function apply(ctx: any): void {
     const url = new URL(rawUrl, 'http://localhost');
     const rest = decodeURIComponent(url.pathname.slice(ROUTE_PREFIX.length + 1));
     const run = (): Promise<RouteResult> => dispatchPetRoute(url, rest, method, body, signal);
-    if (rest === 'config' || (rest === 'pet-display' && method === 'POST')) {
+    // /pet-pinned 与 /pet-display 是同一类写：读-改-写同一个 pets 数组，必须串行（否则并发两笔
+    // 会互相覆盖，最后一笔把前一笔的改动抹掉）。所以走同一条 configQueue。
+    if (rest === 'config' || ((rest === 'pet-display' || rest === 'pet-pinned') && method === 'POST')) {
       const pending = configQueue.then(run, run);
       configQueue = pending.then(
         () => undefined,
@@ -1987,6 +2001,119 @@ export function apply(ctx: any): void {
       // 直接把它交给 petBridge.reload，不必再发一次 GET /config —— 与设置页保存走的是同一条路，
       // 也就不会拿到可能陈旧的配置（现场表现：不返回聚合时浏览器端要刷新才生效）。
       return { kind: 'json', status: 200, obj: readAllConfig(configPaths) };
+    }
+
+    // 单只宠物的**位置固定**（桌面端右键「固定位置」→ POST /pet-pinned）。
+    // 与 /pet-display 是同一个形状：只收 id + 目标值，层归属由服务端反查，写盘语义完全一致
+    // （saveUserConfig 白名单重建 + existing 透传，不抹掉用户手改的非白名单字段）。
+    //
+    // 与 /pet-display 的差别只有两点：
+    //   ① 不调 syncDesktop —— 固定/解除固定改的是**窗口几何**，渲染端已经自己 position() 重排过了；
+    //      重启 helper 会把这几个窗口全换掉（白闪一下），对"钉在当前点"这件事毫无必要。
+    //   ② 必须回写 pinX/pinY：解除固定时显式删掉这两个键（留着旧坐标会让"下次再固定"以为
+    //      用户上次钉的是那个点，而实际业务是"固定此刻位置"）。
+    if (rest === 'pet-pinned') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      const fail = (reason: string, message: string): RouteResult => ({
+        kind: 'json',
+        status: 200,
+        obj: { ok: false, reason, message },
+      });
+      let payload: { id?: unknown; pinned?: unknown; pinX?: unknown; pinY?: unknown };
+      try {
+        payload = JSON.parse(body ?? '') as typeof payload;
+      } catch {
+        return { kind: 'json', status: 400, obj: { error: 'invalid JSON body' } };
+      }
+      const petId = typeof payload.id === 'string' ? payload.id.trim() : '';
+      if (!petId) return fail('pet-required', 'pet 必填：要指定操作哪只桌宠');
+      if (typeof payload.pinned !== 'boolean') {
+        return fail('bad-request', 'pinned 必须是布尔（true = 固定在此位置，false = 解除固定）');
+      }
+      const wantPinned = payload.pinned;
+      let pinX = Number(payload.pinX);
+      let pinY = Number(payload.pinY);
+      let merged: Record<string, Record<string, unknown>>;
+      try {
+        merged = readAllConfig(configPaths);
+      } catch (e) {
+        return fail('generate-error', e instanceof Error ? e.message : String(e));
+      }
+      const hit = findPetInstance(merged, petId);
+      if (!hit) return fail('unknown-pet', `没有这只桌宠：${petId}`);
+      if (wantPinned && (!Number.isFinite(pinX) || !Number.isFinite(pinY))) {
+        // 没带坐标 = 调用方（设置页）不知道宠物此刻在屏幕哪儿，只想"打开固定"。
+        // 两个可信来源，按新鲜度优先：
+        //   ① 实况快照（pose store）—— 桌面端**一直在上报**宠物的中心归一化坐标
+        //      （`POST /pose/report`，与 /position 同一口径），这才是"此刻真正在哪"；
+        //   ② 配置里已有的 pinX/pinY —— 上一次真正固定过的那一点（宠物没在桌面跑时用它）。
+        // 都没有才拒绝：绝不静默钉到 (0,0) 那个左上角。
+        const live = pose.get(petId);
+        const cur = (hit.conf.position ?? {}) as Record<string, unknown>;
+        const ox = Number(cur.pinX);
+        const oy = Number(cur.pinY);
+        if (live) {
+          pinX = live.x;
+          pinY = live.y;
+        } else if (Number.isFinite(ox) && Number.isFinite(oy)) {
+          pinX = ox;
+          pinY = oy;
+        } else {
+          return fail(
+            'pin-needs-position',
+            '这只宠物还没固定过，也没收到过它的桌面实况（桌面端没起来？）。请先在桌宠上右键 →「固定位置」，那一下会把当前屏幕位置记下来；之后这里的开关就能自由开关了。',
+          );
+        }
+      }
+      let layerPath: string;
+      let layerDir: string;
+      let existing: Record<string, unknown> | undefined;
+      if (hit.entry === 'main') {
+        layerPath = userConfigPath;
+        layerDir = userRoot;
+        existing = readUserConfig(configPaths);
+      } else {
+        const file = readPetConfigEntry(configPaths, hit.entry);
+        if (!file) return fail('generate-error', `宠物条目配置文件找不到：${hit.entry}`);
+        layerPath = file.path;
+        layerDir = petConfigDir;
+        existing = file.raw;
+      }
+      // 整段替换语义：必须带上该层**全部**宠物，只改目标那只的 position（漏掉别的 = 删掉它们）。
+      const layerPets = Array.isArray(hit.conf.pets) ? (hit.conf.pets as Record<string, unknown>[]) : [];
+      const pets = layerPets.map((p) => {
+        if (String(p.id) !== petId) return p;
+        const copy = { ...p };
+        const pos = copy.position && typeof copy.position === 'object' ? { ...(copy.position as Record<string, unknown>) } : {};
+        pos.pinned = wantPinned;
+        if (wantPinned) {
+          pos.pinX = pinX;
+          pos.pinY = pinY;
+        } else {
+          // 解除固定：坐标本身保留（用户下次手动写配置还能用），但 pinned=false 已经让
+          // 渲染端完全忽略它们；这里**不删**是为了不让"解除"顺手丢掉用户可能想留的数据。
+          // 唯一删的情形是值本身已经坏了（undefined）——那种留着只会让下次读配置告警。
+          if (pos.pinX === undefined) delete pos.pinX;
+          if (pos.pinY === undefined) delete pos.pinY;
+        }
+        copy.position = pos;
+        return copy;
+      });
+      const clean = saveUserConfig({ pets }, existing);
+      if (!clean) return fail('bad-request', '宠物配置非法');
+      try {
+        await mkdir(layerDir, { recursive: true });
+        await writeFile(layerPath, JSON.stringify(clean, null, 2), 'utf8');
+      } catch (e) {
+        return fail('generate-error', e instanceof Error ? e.message : String(e));
+      }
+      // 配置变更信号：让浏览器端知道"有人在别处改过配置"（与 /pet-display 同一机制）。
+      state.writeSection('config', {});
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: true, id: petId, pinned: wantPinned, pinX: wantPinned ? pinX : null, pinY: wantPinned ? pinY : null },
+      };
     }
 
     // 桌面端「重载配置」（右键菜单 → POST /reload）：重启桌面 Helper，全部桌面宠物窗口按最新配置重建。

@@ -47,9 +47,12 @@ export interface MenuLeaf {
     | 'home'
     | 'reload'
     | 'set-display'
+    | 'set-pinned'
     | 'third-party';
   /** set-display 的目标显示位置（与设置页「显示位置」下拉框同一套取值） */
   display?: PetDisplay;
+  /** set-pinned 的目标状态：true = 钉在当前屏幕位置，false = 解除固定（回角落） */
+  pinned?: boolean;
   /** third-party：注册它的 owner（身份键，**只用于回传，不显示**）。同一个 owner 的项收在同一个
    *  分组下；只有一项时跳过这层、直接平铺（见 buildMoreBranch）。 */
   owner?: string;
@@ -86,8 +89,26 @@ export const displayMenuBranch = (): MenuBranch => ({
   ],
 });
 
-/** 第三方菜单项（宿主经 /state 的 sections.menu 下发的快照，一条 = 一个可点项）。 */
-export interface MenuMoreItem {
+/**
+ * 「固定位置」两级菜单 —— 桌面端与浏览器端注入**同一份**（与 displayMenuBranch 同一理由：
+ * 两端各写一份必然漂移）。
+ *
+ * 为什么是两级而不是一个勾选框：右键菜单没有复选框控件（MenuLeaf 只有 label），
+ * 一个「固定位置」项无法表达"当前是开还是关"。拆成「固定在此位置 / 解除固定」两项，
+ * 点哪个都是明确意图，不需要读当前状态——也不会出现"点了没反应且不知道点成了什么"。
+ *
+ * `current` 传进来只用于**文案标注**（当前生效的那项加个后缀），不参与取值：
+ * 取值永远是菜单项里写死的那一个（与 set-display 同一条纪律：渲染端不做状态推导）。
+ */
+export const pinnedMenuBranch = (current: boolean): MenuBranch => ({
+  label: '固定位置' + (current ? '（已固定）' : ''),
+  children: [
+    { label: current ? '固定在此位置（重新固定）' : '固定在此位置', action: 'set-pinned', pinned: true },
+    { label: '解除固定（回角落）', action: 'set-pinned', pinned: false },
+  ],
+});
+
+/** 第三方菜单项（宿主经 /state 的 sections.menu 下发的快照，一条 = 一个可点项）。 */export interface MenuMoreItem {
   /** 注册方身份；同时也是一级分组名（显示用） */
   owner: string;
   /** 项名（显示用，也是回传给注册方的标识） */

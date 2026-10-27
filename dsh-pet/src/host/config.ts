@@ -613,6 +613,38 @@ function petEnum(
   return typeof def === 'string' ? def : '';
 }
 
+/**
+ * 位置固定三兄弟（`position.pinned` / `pinX` / `pinY`）的合并。
+ *
+ * 为什么单拎出来：它们**互相依赖**——pinned 为真但 pinX/pinY 缺失或非法时不能"钉到 (0,0)"，
+ * 那会让宠物无声无息跑到左上角。所以整组要么全成立、要么整组不生效（回落到角落模式），
+ * 且必须告警一次让用户知道配置写坏了。用 petBool/petNumber 逐个字段读做不到这个联动。
+ *
+ * 继承规则：整组按"自己的 → 基座"的顺序取（与 corner/marginX/marginY 同一套逐字段合并语义）。
+ * 基座里 pinned=true 而实例只覆盖了 pinX —— 允许，pinY 从基座来，这正是"只微调坐标"的用法。
+ */
+function pinnedFields(
+  own: Record<string, unknown>,
+  base: Record<string, unknown>,
+  label: string,
+  id: string,
+): { pinned?: boolean; pinX?: number; pinY?: number } {
+  const pinned = petBool(own.pinned, base.pinned, label, 'position.pinned', id);
+  // 未固定时不吐任何键：合并结果多一个 `pinned: false` 会让所有既有的 deepEqual 断言
+  // 和 /config 消费端都要跟着改，而"没固定"本来就是绝大多数宠物的状态——不写就是最准确的表达。
+  // 渲染端读 `pos.pinned === true`，缺键与 false 同义（见 isPinned / pet.ts 的 pinnedAt）。
+  if (!pinned) return {};
+  const nx = Number(own.pinX !== undefined ? own.pinX : base.pinX);
+  const ny = Number(own.pinY !== undefined ? own.pinY : base.pinY);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+    warnOnce(
+      `${label}:position.pin:${id}`,
+      `宠物「${id}」开了位置固定但 pinX/pinY 缺失或非法，已按未固定处理（回落角落）`,
+    );
+    return {};
+  }
+  return { pinned: true, pinX: nx, pinY: ny };
+}
 /** 一只实例 → 完成品实例（id 必须自己的且全局唯一；其余字段没写/非法 → 默认 + 告警） */
 function mergePet(
   base: Record<string, unknown>,
@@ -649,6 +681,10 @@ function mergePet(
       corner: petEnum(ownPos.corner, CORNER_SET, basePos.corner, label, 'position.corner', id),
       marginX: petNumber(ownPos.marginX, basePos.marginX, -Infinity, label, 'position.marginX', id),
       marginY: petNumber(ownPos.marginY, basePos.marginY, -Infinity, label, 'position.marginY', id),
+      // 位置固定（position.pinned）：默认 false = 跟角落配置走（老行为一字不动）。
+      // pinX/pinY 只在 pinned 为真时才有意义，一并用同一个 petNumber 口径读：
+      // 允许 0~1 之外的值（用户可能想钉在屏幕外贴边），只要求是有限数字。
+      ...pinnedFields(ownPos, basePos, label, id),
     },
     // 实例级人设（可选）：只放行**非空字符串**；没写 / 空串 / 纯空白 / null → 该键不出现在结果里
     // （回落由消费端做：./persona 的 petPersona 取不到实例级就取条目顶层）；非字符串 → 告警 + 忽略。
@@ -788,6 +824,22 @@ export function saveUserConfig(
     const marginX = Number(pos.marginX);
     const marginY = Number(pos.marginY);
     if (!Number.isFinite(marginX) || !Number.isFinite(marginY)) return null;
+    // 位置固定（position.pinned/pinX/pinY）：可选三兄弟。pinned 传了必须是布尔；为真时
+    // pinX/pinY 必须是有限数字 —— 否则整包 400（与 marginX/marginY 同口径：配置写坏不静默吞）。
+    // 为假时不写 pinX/pinY（避免落盘一堆无效坐标让用户困惑），但显式传了非法值仍拒绝。
+    const pinnedRaw = pos.pinned;
+    if (pinnedRaw !== undefined && pinnedRaw !== null && typeof pinnedRaw !== 'boolean') return null;
+    const pinned = pinnedRaw === true;
+    let pinX: number | undefined;
+    let pinY: number | undefined;
+    if (pos.pinX !== undefined || pos.pinY !== undefined) {
+      const nx = Number(pos.pinX);
+      const ny = Number(pos.pinY);
+      if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
+      pinX = nx;
+      pinY = ny;
+    }
+    if (pinned && (pinX === undefined || pinY === undefined)) return null;
     // 实例级人设（可选）：非空字符串才落盘（trim 后写）；空串/纯空白 = 不写该键——
     // 落盘结果是"这只宠物没有自己的覆盖"，读取侧（./persona 的 petPersona）自动回落到所属条目。
     // 也就是说：清空输入框 + 保存 = 删除覆盖，而不是写一个空人设。
@@ -806,6 +858,15 @@ export function saveUserConfig(
       display,
       position: { corner, marginX, marginY },
     };
+    // 位置固定三兄弟：只在真的固定时落盘 pinX/pinY。pinned 也只在为真时写 ——
+    // "没固定"就是缺键（绝大多数宠物的状态），写一个 `pinned: false` 只会让每份配置文件都多一行
+    // 无意义的噪声，且 /pet-duisplay 那类"整段替换该层 pets"的写回会把 false 固化成显式值。
+    if (pinned && pinX !== undefined && pinY !== undefined) {
+      const posOut = pet.position as Record<string, unknown>;
+      posOut.pinned = true;
+      posOut.pinX = pinX;
+      posOut.pinY = pinY;
+    }
     if (persona) pet.whisperPrompt = persona;
     out.push(pet);
   }

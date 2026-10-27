@@ -110,7 +110,24 @@ export interface Pet {
   fixedEnabled: boolean;
   /** 显示位置（web/desktop/both/none，必填）：缺失即配置错误，代码不做兜底 */
   display: PetDisplay;
-  position: { corner: Corner; marginX: number; marginY: number };
+  position: {
+    corner: Corner;
+    marginX: number;
+    marginY: number;
+    /** **位置固定**（`position.pinned`）：true = 宠物钉在 `pinX/pinY` 那个点不动——
+     *  拖拽不跟手、松手不抛掷、自主漫游不走、被别的宠物撞也不飞、`/position` 位置指令整条忽略。
+     *  **只锁位置**：动画链、点击回应、碎碎念、对话、菜单点播全部照常（与 fixedEnabled 互补：
+     *  那个锁的是"随机链抽不抽得到转向/移动"，这个锁的是"窗口坐标能不能变"）。
+     *  缺失默认 false = 跟以前一样跟角落配置走。
+     *
+     *  与 corner/marginX/marginY 的关系：pinned 为真时**前者作废**（角落不再参与定位），
+     *  但字段仍原样保留 —— 取消固定后直接回到原来那个角落，不用用户重新配一遍。 */
+    pinned?: boolean;
+    /** 钉住的**中心点**归一化坐标（0~1，相对所有屏工作区并集的外接矩形）；`pinned` 为真时必须同时
+     *  存在且有限，否则按未固定处理（配置写坏不静默钉到 (0,0) 那个左上角）。 */
+    pinX?: number;
+    pinY?: number;
+  };
   /** **实例级人设**（可选，`pets[].whisperPrompt`）：碎碎念与对话共用的系统提示词正文。
    *  写了就**取代**所属条目顶层那一份（替换，不是拼接）；没写/空串 = 回落条目。回落发生在
    *  host 消费端（src/host/persona.ts 的 petPersona），合并器不填生效值——所以这里 undefined

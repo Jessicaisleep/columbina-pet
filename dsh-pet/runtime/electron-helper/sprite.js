@@ -434,14 +434,41 @@ class PetSprite {
     this.markPoseDirty();
   }
 
+  /**
+   * 位置是否被钉死（position.pinned）。配置写坏的兜底：pinned 为真但没有有效 pinX/pinY
+   * （host 合并器已把这种配置按未固定处理，这里是渲染端自己的第二道门——桌面端也可能
+   * 收到老版本 host 发来的、没经过新合并器的实例）→ 按未固定，绝不钉到 (0,0)。
+   */
+  isPinned() {
+    const p = this.pet.position;
+    return p.pinned === true && Number.isFinite(p.pinX) && Number.isFinite(p.pinY);
+  }
+
   // 角落/边距 → 窗口位置；拖拽后按会话内位置（比例）还原——**松手无任何边界夹取**，
   // 宠物停在哪就算哪（与浏览器一致：可以完全拖出工作区/屏幕；漫游仍有 planMove 边界检查兜底）
+  //
+  // 位置固定（position.pinned）：优先级最高——pinned 时角落与 customPos **都作废**，
+  // 窗口永远由 pinX/pinY 算出。不做"把 customPos 挪进配置"之类的换算：pinX/pinY 是权威值，
+  // 用户取消固定后 customPos 早已被清（见 setPinned），不会残留一个和角落打架的旧比例。
   position() {
     const W = VIEW.w;
     const H = VIEW.h;
     let x;
     let y;
-    if (this.customPos) {
+    if (this.isPinned()) {
+      // VIEW 本身就是「所有屏工作区并集的外接矩形」（applyDeskGeometry 里 VIEW = hull），
+      // 且已是视口相对坐标（原点 0,0）——所以不传 area，pinX/pinY 直接按 VIEW 归一化。
+      // 这与 POST /position 的归一化空间**完全同一套**，两边的比例可以互换。
+      const anchor = S.pinPixel({
+        pinX: this.pet.position.pinX,
+        pinY: this.pet.position.pinY,
+        size: this.size,
+        W,
+        H,
+      });
+      x = anchor.x;
+      y = anchor.y;
+    } else if (this.customPos) {
       x = this.customPos.rx * W - this.halfW;
       y = this.customPos.ry * H - this.halfH;
     } else {
@@ -512,10 +539,12 @@ class PetSprite {
   }
 
   currentCenterX() {
+    if (this.isPinned()) return this.pos.x + this.halfW;
     if (this.customPos) return this.customPos.rx * VIEW.w;
     return this.pos.x + this.halfW;
   }
   currentCenterY() {
+    if (this.isPinned()) return this.pos.y + this.halfH;
     if (this.customPos) return this.customPos.ry * VIEW.h;
     return this.pos.y + this.halfH;
   }
@@ -918,6 +947,7 @@ class PetSprite {
   // ---- 漫游（rAF 驱动，动画首尾各 leadSec/tailSec 秒原地不动；几何在 shared/planMove） ----
   // preferredName 传入时固定使用该动画（右键菜单点播移动动画），否则与随机链一致随机选
   tryMove(preferredName, playbackId) {
+    if (this.isPinned()) return false; // 位置固定：不走（返回 false = "走不动"，调用方退化为原地播放）
     if (this.moveRef !== null || this.pendingMove || this.throwRef !== null) return true;
     const moves = this.animations.moves;
     const actions = moves.actions;
@@ -1163,6 +1193,7 @@ class PetSprite {
    * 归一化空间 = **全部显示器工作区并集的外接矩形**；落点会被夹到 AREAS 并集（空洞不可达）。
    */
   moveToCenter(rx, ry, mode, duration) {
+    if (this.isPinned()) return; // 位置固定：位置指令整条忽略（钉住的宠物不该被任何外部指令挪走）
     if (this.dragState.active) return; // 用户交互优先
     this.stopThrow(); // 先显式接管：停掉飞行与走路（stopMove 顺带停掉上一次的位置跟随）
     this.stopMove();
@@ -1238,6 +1269,7 @@ class PetSprite {
    * 下游（重力 / 反弹 / 地面摩擦 / 落地 Q 弹 / 宠物间碰撞 / 落定写 customPos）全是**既有行为**。
    */
   throwWith(angleDeg, power) {
+    if (this.isPinned()) return; // 位置固定：不抛（宠物钉在原处）
     if (this.dragState.active) return; // 用户交互优先
     const v = S.throwVelocity(angleDeg, power);
     this.startThrow(this.pos.x, this.pos.y, v.vx, v.vy);
@@ -1245,6 +1277,7 @@ class PetSprite {
 
   /** 被撞回调（跨窗碰撞 broker 转发）：停当前动作，从落点以新初速抛出去（全复用现有物理） */
   onDeskHit(vx, vy) {
+    if (this.isPinned()) return; // 位置固定：被别的宠物撞也不飞——"固定"就该固定
     this.stopMove();
     this.stopDragFollow();
     this.stopThrow();
@@ -1350,6 +1383,11 @@ class PetSprite {
         });
       }
     }
+    // 位置固定（position.pinned）：不进入拖拽，但**点击照常**——上面那段已经做完了
+    // 冻结解除、按下积分判定；这里只是不再建立 dragState（没有 pointermove 跟手、没有松手抛掷）。
+    // 放在这里而不是函数最开头：解除第三方占用、飞行中点击收手这些"用户接管"语义与位置无关，
+    // 钉住的宠物也应该能点、能解冻。
+    if (this.isPinned()) return;
     this.stopThrow(); // 空中抓取：从当前落点开始新拖拽（this.pos 实时）
     this.stopDragFollow();
     this.stopMove();
@@ -1797,6 +1835,10 @@ class PetSprite {
       // 走与碎碎念同一条气泡展示链路（不在本地弹提示，保证浏览器/桌面看到同一句话）。
       { label: '压缩记忆', action: 'compress-memory' },
       { label: '回到初始位置', action: 'home' },
+      // 固定位置（钉在当前屏幕位置 / 解除固定）：写 position.pinned + pinX/pinY 配置。
+      // 与「回到初始位置」并列放在一起——两者都是"位置"这件事，用户找位置相关操作会看同一处。
+      // 当前状态只影响文案（已固定 后缀），取值永远来自菜单项本身（见 shared/menu 的 pinnedMenuBranch）。
+      S.pinnedMenuBranch(this.isPinned()),
       // 显示位置（仅网页/仅桌面/两者/都不）：改这只宠物的 display 配置 + 宿主重载生效。
       // 与浏览器端注入的是**同一份**子菜单（shared 的 displayMenuBranch），两端文案/取值不会漂移。
       // 为什么不就地关窗/开窗：桌面宠物共用一个 Electron 进程，窗口是进程启动时按 DSH_PET_PETS
@@ -1876,6 +1918,10 @@ class PetSprite {
     }
     if (leaf.action === 'set-display') {
       this.setPetDisplay(leaf.display); // 改这只宠物的显示位置：写 display 配置，由宿主重载生效
+      return;
+    }
+    if (leaf.action === 'set-pinned') {
+      this.setPinned(leaf.pinned === true); // 固定/解除固定当前屏幕位置：写 position.pinned 配置
       return;
     }
     if (leaf.action === 'reload') {
@@ -2085,6 +2131,96 @@ class PetSprite {
         window.clearTimeout(timer);
         console.warn('[dsh-pet] 显示位置请求失败（宿主不可达？）', e);
         this.showLocalNotice('改显示位置失败：连不上宿主');
+      });
+  }
+
+  /**
+   * 「固定位置」菜单：把宠物**此刻的中心**存成 position.pinned + pinX/pinY，或解除固定回角落。
+   *
+   * 为什么要把当前像素位置换算成比例再存：窗口坐标是绝对像素，换分辨率/插拔屏就失效；
+   * 比例（相对工作区并集外接矩形）与 `POST /position` / customPos 完全同一套空间，
+   * 所以"钉住的点"和"拖过去的点"可以互相换算，将来也能让别的宠物算出相对位置。
+   *
+   * 与 setPetDisplay 的区别（为什么这条不用等宿主重启）：它改的是**窗口几何**，
+   * 宿主重启会重建窗口、正好按新配置摆位；但"固定"这个动作对用户来说应该是**立即**的——
+   * 点完就该钉住/解开。所以这里：
+   *   ① 先把本地 this.pet.position 改掉（isPinned()/position() 立刻按新值生效）；
+   *   ② 再 POST /pet-pinned 让宿主落盘（不 await 重启：位置变更不需要重建窗口，
+   *      而 syncDesktop 会把整个 helper 换掉、白白闪一下）。
+   * 宿主写盘失败时回滚本地状态并弹提示 —— 绝不让"看起来固定了、重启又跑了"这种静默不一致发生。
+   */
+  setPinned(want) {
+    const id = this.pet.id;
+    const before = {
+      pinned: this.pet.position.pinned,
+      pinX: this.pet.position.pinX,
+      pinY: this.pet.position.pinY,
+    };
+    let payload;
+    if (want) {
+      // 中心点取**实时**位置（拖到一半也能固定：钉住的是松手后停的地方，符合直觉）
+      const pin = S.pixelToPin({
+        cx: this.pos.x + this.halfW,
+        cy: this.pos.y + this.halfH,
+        W: VIEW.w,
+        H: VIEW.h,
+      });
+      payload = { id, pinned: true, pinX: pin.pinX, pinY: pin.pinY };
+    } else {
+      payload = { id, pinned: false };
+    }
+    // ① 本地先生效
+    this.pet.position.pinned = payload.pinned;
+    if (payload.pinned) {
+      this.pet.position.pinX = payload.pinX;
+      this.pet.position.pinY = payload.pinY;
+    }
+    // 固定/解除都可能留下矛盾的会话位置：固定时清掉（位置已由 pin 决定），
+    // 解除时也清掉（否则会停在"上次拖到的比例"，而用户点的是"回角落"）。
+    this.stopThrow();
+    this.stopMove();
+    this.customPos = null;
+    this.position();
+    const rollback = (why) => {
+      this.pet.position.pinned = before.pinned;
+      this.pet.position.pinX = before.pinX;
+      this.pet.position.pinY = before.pinY;
+      this.position();
+      this.showLocalNotice(why);
+    };
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // 写入磁盘慢但没失败不算错：本地已生效，宿主那边晚点落定也一致。只记日志。
+      console.warn('[dsh-pet] 固定位置请求 6s 未返回 pet=' + id);
+    }, 6000);
+    fetch(BASE + '/pet-pinned', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+      .then(async (r) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        if (!r.ok) {
+          rollback('固定位置失败：HTTP ' + r.status);
+          return;
+        }
+        const body = await r.json().catch(() => null);
+        if (body && body.ok === false) {
+          rollback(
+            '固定位置被拒绝：' + String(body.reason || '未知原因') + (body.message ? '（' + body.message + '）' : ''),
+          );
+        }
+      })
+      .catch((e) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        console.warn('[dsh-pet] 固定位置请求失败（宿主不可达？）', e);
+        rollback('固定位置失败：连不上宿主');
       });
   }
 

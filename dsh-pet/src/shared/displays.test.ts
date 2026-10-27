@@ -25,7 +25,7 @@ import {
   regionHoleRatio,
   translateRects,
 } from './displays.ts';
-import { anchorPixel, planMove } from './motion.ts';
+import { anchorPixel, pinPixel, pixelToPin, planMove } from './motion.ts';
 import { DEFAULT_PHYSICS, throwBounds, throwStep, throwStepRegion, throwSpace, screenOfBox } from './physics.ts';
 import { HIT_BOX } from './constants.ts';
 import type { PhysicsParams, Rect } from './types.ts';
@@ -299,8 +299,7 @@ describe('anchorPixel / planMove —— 角落与漫游不进空洞', () => {
     }
   });
 
-  test('漫游落点落在空洞里时返回 null', () => {
-    const common = {
+  test('漫游落点落在空洞里时返回 null', () => {    const common = {
       cy: -300, // 主屏上方的高度：只有副屏在这条线上有像素
       W: 3795,
       H: 2147,
@@ -335,8 +334,7 @@ describe('anchorPixel / planMove —— 角落与漫游不进空洞', () => {
     assert.ok(Math.abs(plan.targetRatio * 3795 - 2800) < 1);
   });
 
-  test('锁定语义：areas 只给当前那块屏 ⇒ 同高度跨屏的那一步被拒', () => {
-    // 与上一条同一个起点 / 距离 / 方向：并集下会跨到副屏，只给主屏时必须被拒
+  test('锁定语义：areas 只给当前那块屏 ⇒ 同高度跨屏的那一步被拒', () => {    // 与上一条同一个起点 / 距离 / 方向：并集下会跨到副屏，只给主屏时必须被拒
     const common = {
       cx: 2300,
       cy: 700, // 主屏与副屏都覆盖这条线
@@ -372,6 +370,48 @@ describe('anchorPixel / planMove —— 角落与漫游不进空洞', () => {
     assert.equal(planMove({ ...base, cx: 100, dir: -1 }), null);
   });
 });
+
+describe('pinPixel / pixelToPin —— 位置固定（position.pinned）', () => {
+  test('pinPixel 把中心放到归一化点上（左上角 = 中心 − 半宽/半高）', () => {
+    const p = pinPixel({ pinX: 0.5, pinY: 0.5, size: 400, W: 1000, H: 800 });
+    // 中心 (500, 400)；尺寸 400 → 半宽 200；高度 = 400*9/16 = 225 → 半高 112.5
+    assert.deepEqual(p, { x: 300, y: 287.5 });
+  });
+
+  test('pinPixel 与 pixelToPin 互为逆运算（同一块矩形）', () => {
+    const W = 2560;
+    const H = 1382;
+    const size = 350;
+    // 随机取一个非对称点：任意对称点会让"半宽/半高"的符号错误也看起来是对的
+    const cx = 1834.5;
+    const cy = 661.25;
+    const pin = pixelToPin({ cx, cy, W, H });
+    const back = pinPixel({ pinX: pin.pinX, pinY: pin.pinY, size, W, H });
+    assert.ok(Math.abs(back.x + size / 2 - cx) < 1e-9, `x 逆运算：${back.x + size / 2} vs ${cx}`);
+    assert.ok(Math.abs(back.y + (size * 9) / 16 / 2 - cy) < 1e-9, `y 逆运算：${back.y} vs ${cy}`);
+  });
+
+  test('pixelToPin 按 hull 归一化（多屏并集坐标原点不为 0 时也对）', () => {
+    // 副屏在主屏左侧：hull.x = -1920。中心点 x=0 落在 hull 的 1/3 处（hull 宽 3840）
+    const pin = pixelToPin({ cx: -640, cy: 500, W: 3840, H: 1080, hull: { x: -1920, y: 0, width: 3840, height: 1080 } });
+    assert.ok(Math.abs(pin.pinX - 0.3333333333333333) < 1e-9, `pinX=${pin.pinX}`);
+    assert.ok(Math.abs(pin.pinY - 500 / 1080) < 1e-9);
+  });
+
+  test('零尺寸 hull 不会除出 NaN/Infinity（退化配置的兜底）', () => {
+    const pin = pixelToPin({ cx: 100, cy: 100, W: 0, H: 0, hull: { x: 0, y: 0, width: 0, height: 0 } });
+    assert.ok(Number.isFinite(pin.pinX) && Number.isFinite(pin.pinY), '必须是有限数');
+  });
+
+  test('固定点落在屏幕外时如实返回（不夹取 —— 用户可能就想让它贴边出界）', () => {
+    // 取明确出界的值：pinX=1.5 → 中心 1500，减半宽 200 = 1300（> W=1000）
+    // 注意别取 1.2：1.2*1000-200 正好等于 1000，断言 `> W` 会失败（边界值不是出界）
+    const p = pinPixel({ pinX: 1.5, pinY: -0.1, size: 400, W: 1000, H: 800 });
+    assert.ok(p.x > 1000, `x 应算出界：${p.x}`);
+    assert.ok(p.y < 0, `y 应算出界：${p.y}`);
+  });
+});
+
 
 describe('throwStepRegion —— confineToScreen：锁定屏后屏缝也当墙', () => {
   // 起点取「屏缘内 1px + 朝缝初速」：一步就会越界，最能看清放行 / 反弹的分叉

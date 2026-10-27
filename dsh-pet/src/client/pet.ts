@@ -58,6 +58,7 @@ import {
   buildMenuTree,
   buildMoreBranch,
   displayMenuBranch,
+  pinnedMenuBranch,
   mountContextMenu,
   isNoMirrorAnimation,
   readMenuItems,
@@ -1343,6 +1344,14 @@ export function makePetUI(rt: {
     /** 尝试发起一次移动：占用中返回 true（不重播），无法移动返回 false，成功返回动作名（供日志显示具体动作）。
      *  preferredName 传入时固定使用该动画（右键菜单点播移动动画），否则与随机链一致随机从 moves.actions 选。 */
     const tryMove = (preferredName?: string): boolean | string => {
+      // 位置固定：走不动（返回 false = 调用方退化为原地播放），与桌面端 sprite.js 同一条
+      if (
+        cfg.position.pinned === true &&
+        Number.isFinite(cfg.position.pinX) &&
+        Number.isFinite(cfg.position.pinY)
+      ) {
+        return false;
+      }
       if (moveRef.current !== null || pendingMoveRef.current || throwRef.current !== null) return true;
       const moves = petAnims.moves;
       const actions = moves.actions;
@@ -1873,6 +1882,17 @@ export function makePetUI(rt: {
           mountScorePopup({ x: e.clientX, y: e.clientY, score: sc, speed: grabSpeed, size });
         }
       }
+      // 位置固定（position.pinned）：不进入拖拽，但**点击照常**——上面已经做完了冻结解除与
+      // 按下积分判定，这里只是不再建立 dragRef（没有 pointermove 跟手、没有松手抛掷）。
+      // 放在这里而不是函数开头：解冻与积分是"用户接管"语义，与位置无关，钉住的宠物也该能点。
+      // 判据与渲染同源（都读 cfg.position）——两边不一致会出现"看着能拖但拖不动"。
+      if (
+        cfg.position.pinned === true &&
+        Number.isFinite(cfg.position.pinX) &&
+        Number.isFinite(cfg.position.pinY)
+      ) {
+        return;
+      }
       // 空中抓取：停掉抛掷/漫游/弹簧跟随，从当前落点开始新拖拽
       stopThrow();
       stopDragFollow();
@@ -2197,6 +2217,43 @@ export function makePetUI(rt: {
           .catch((e: unknown) => console.warn('[dsh-pet] 显示位置切换失败', e));
         return;
       }
+      if (leaf.action === 'set-pinned') {
+        // 固定位置：POST 到宿主写 position.pinned + pinX/pinY，成功后再用**权威成品**重拉配置。
+        // 为什么走 reload 而不是本地 setCustomPos：pin 状态来自配置（cfg.position.pinned），
+        // 浏览器端必须以配置为准 —— 本地先改一遍再让 reload 覆盖，会出现"闪一下又跳回去"
+        // （reload 是异步的，中间那几帧用的是本地猜的值）。桌面端不同：那边改了立即生效更符合
+        // 直觉（窗口就在眼前），且它自己就是唯一的渲染者，不存在二次覆盖。
+        const want = leaf.pinned === true;
+        const W = window.innerWidth;
+        const H = window.innerHeight;
+        // 固定时取**此刻中心**的归一化比例（与桌面端 pixelToPin 同一套空间：浏览器里视口就是全部）
+        const payload: Record<string, unknown> = { id: cfg.id, pinned: want };
+        if (want) {
+          const cp = customPosRef.current;
+          const rootEl = rootRef.current;
+          const cx = cp ? cp.rx * W : rootEl ? rootEl.getBoundingClientRect().left + halfW : W - 24 - halfW;
+          const cy = cp ? cp.ry * H : rootEl ? rootEl.getBoundingClientRect().top + halfH : H - 20 - halfH;
+          payload.pinX = cx / W;
+          payload.pinY = cy / H;
+        }
+        console.info('[dsh-pet] 菜单固定位置 pet=' + cfg.id + ' pinned=' + want);
+        void fetch('/dsh-pet-7340/pet-pinned', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+          .then(async (r) => {
+            if (!r.ok) throw new Error('pet-pinned HTTP ' + r.status);
+            const body = (await r.json()) as Record<string, unknown>;
+            if (body.ok === false) throw new Error('pet-pinned 被拒：' + String(body.reason ?? ''));
+            // 响应体是 {ok,pinned,pinX,pinY}（不是成品聚合）：这里必须自己重拉一次 /config，
+            // 与 set-display 那条（宿主直接回聚合）不同 —— 因为 /pet-pinned 不重启 helper，
+            // 没有别的地方会把新配置推过来。
+            petBridge.reload();
+          })
+          .catch((e: unknown) => console.warn('[dsh-pet] 固定位置切换失败', e));
+        return;
+      }
       if (leaf.action === 'home') {
         // 回到初始位置：停漫游/移动/抛掷，清掉拖拽/漫游留下的会话位置，回配置角落
         stopThrow();
@@ -2248,6 +2305,13 @@ export function makePetUI(rt: {
         // 它与「对话」是同一件事的两个动作——对话在写记忆，这一项在整理记忆（压成长期摘要）。
         { label: '压缩记忆', action: 'compress-memory' },
         { label: '回到初始位置', action: 'home' },
+        // 固定位置（固定在此位置 / 解除固定）：与桌面端注入**同一份**子菜单。
+        // 当前状态只决定文案的「已固定」后缀，取值永远来自菜单项本身。
+        pinnedMenuBranch(
+          cfg.position.pinned === true &&
+            Number.isFinite(cfg.position.pinX) &&
+            Number.isFinite(cfg.position.pinY),
+        ),
         // 显示位置（仅网页/仅桌面/两者/都不）：与桌面端注入**同一份**子菜单。
         // 改成不含 web 的值（仅桌面/都不）后，本宠物会随即从 visiblePets 里消失——字面意义上的"自己走掉"。
         displayMenuBranch(),
@@ -2277,20 +2341,37 @@ export function makePetUI(rt: {
     // 左右透明边余量（视频盒内宠物身体居中）：夹取按"身体"贴边——宠物能走到屏幕边缘，身体永不越界
     const sideAllow = (HIT_BOX.x0 / 640) * size;
     const stageStyle = dragging ? { transform: 'none' } : { transform: 'translateY(' + bottomPad + 'px)' };
-    const rootStyle = customPos
-      ? (() => {
-          const rx = customPos.rx;
-          const ry = customPos.ry;
-          // 拖拽位置即松手位置：不做边界夹取——宠物可被拖到屏幕任意位置（含贴边/出界），
-          // 松手不会被拉回；漫游/抛掷路径自身目标已界内，不受影响。
-          return {
-            left: rx * window.innerWidth - halfW + 'px',
-            top: ry * window.innerHeight - halfH + 'px',
-            right: 'auto',
-            bottom: 'auto',
-          };
-        })()
-      : {};
+    // 位置固定（position.pinned）：优先级最高——角落与 customPos 都作废，永远按 pinX/pinY 摆。
+    // 与桌面端 sprite.js 的 position() 同一条判定顺序（isPinned 先于 customPos），两端才一致。
+    // 配置写坏的兜底与桌面端相同：pinned 为真但没有有效坐标 → 按未固定（绝不钉到左上角）。
+    const pinnedAt =
+      cfg.position.pinned === true &&
+      Number.isFinite(cfg.position.pinX) &&
+      Number.isFinite(cfg.position.pinY)
+        ? { x: cfg.position.pinX as number, y: cfg.position.pinY as number }
+        : null;
+    const rootStyle = pinnedAt
+      ? {
+          // 与桌面端 pinPixel 同一公式：中心点 → 左上角（浏览器里 W/H 就是视口）
+          left: pinnedAt.x * window.innerWidth - halfW + 'px',
+          top: pinnedAt.y * window.innerHeight - halfH + 'px',
+          right: 'auto',
+          bottom: 'auto',
+        }
+      : customPos
+        ? (() => {
+            const rx = customPos.rx;
+            const ry = customPos.ry;
+            // 拖拽位置即松手位置：不做边界夹取——宠物可被拖到屏幕任意位置（含贴边/出界），
+            // 松手不会被拉回；漫游/抛掷路径自身目标已界内，不受影响。
+            return {
+              left: rx * window.innerWidth - halfW + 'px',
+              top: ry * window.innerHeight - halfH + 'px',
+              right: 'auto',
+              bottom: 'auto',
+            };
+          })()
+        : {};
     // ---- 气泡单槽（同一时刻只渲染一个）----
     // 三种气泡共用同一套定位 CSS（bubble.ts 的 .dsh-pet-bubble：同一个 left/bottom/z-index），
     // 同时渲染只会叠在同一个坐标上互相遮盖——所以这里按优先级挑一个出来渲染，其余不挂载。
