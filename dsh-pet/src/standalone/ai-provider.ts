@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { StandaloneLogger } from './context';
-import { createAiConfig } from './ai-config';
+import { createAiConfig, DEFAULT_AI_SETTINGS } from './ai-config';
 import type { StandaloneAiPublicSettings } from './ai-config';
 import { isAuthenticationFailure, isRateLimitFailure, sdkTextStream } from './ai-transport';
 import type { AiFetch, AiRequest, AiTransportEvent } from './ai-transport';
@@ -114,6 +114,50 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     signal.addEventListener('abort', abort, { once: true });
     promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
   });
+}
+
+/**
+ * 一个「AI 不可用但程序照常跑」的空实现。
+ *
+ * 为什么需要它（2026-10-27 修的真 bug）：`createStandaloneAi` 在两种情况下会抛
+ * `Cannot securely load standalone AI settings.` —— ①`standalone-ai.json` 内容不合法
+ * ②该文件的 ACL 太宽（`readAiSettings` 里 `/Everyone|BUILTIN\Users|Authenticated Users/`
+ * 一旦命中就抛 `Unsafe settings permissions`）。安全语义本身是对的（可疑密钥文件不许读），
+ * 但**抛出的地方是启动路径**：`src/app/main.ts` 里没有任何 try/catch，
+ * 结果是「一份配置文件有问题 → 整个桌宠起不来、弹 Error 对话框、一只宠物都没有」。
+ *
+ * 分发场景尤其必踩：zip / robocopy 默认**不保留 ACL**，所以别人解压出来的
+ * `standalone-ai.json` 一定带着 `BUILTIN\Users:(RX)` → 必然命中第 ② 条 → 必然崩。
+ * （实测：把包解压到新目录后 `Start-Pet.vbs` 只起 1 个进程 + 一个 Error 对话框；
+ *   把该文件的 ACL 收紧成仅当前用户，立刻恢复正常 5 进程。）
+ *
+ * 所以：**安全判定该拒还是拒，但不该让整个应用陪葬**。读不到就降级为「AI 三件套不可用」，
+ * 其余功能（待机、点击、拖拽、右键菜单、托盘、固定位置）全部照常。
+ */
+export function createDisabledStandaloneAi(reason: string): StandaloneAiService {
+  const message = `AI 设置无法安全读取（${reason}），AI 功能已停用。其余功能正常。`;
+  const disabled = false;
+  return {
+    currentSelection: () => ({ provider: PROVIDER, model: '' }),
+    listProviders: () => [{ id: PROVIDER, name: 'Standalone' }],
+    listModels: async () => [],
+    resolveModelInfo: async () => undefined,
+    stream: async function* () {
+      return;
+    },
+    getSettings: () => {
+      const { apiKey: _key, ...rest } = DEFAULT_AI_SETTINGS;
+      return { ...rest, hasKey: false };
+    },
+    saveSettings: async () => {
+      throw new Error('Cannot securely save standalone AI settings.');
+    },
+    testConnection: async () => ({ ok: false, message }),
+    isReady: () => disabled,
+    canWhisper: () => disabled,
+    toolTurn: async () => ({ ok: false, reason: 'provider-error', message }),
+    dispose: () => {},
+  };
 }
 
 export function createStandaloneAi(

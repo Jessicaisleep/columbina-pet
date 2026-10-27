@@ -32,7 +32,7 @@ import { flattenPetList, readAllConfig } from '../host/config';
 import { dshHomeDir } from '../host/helper-process';
 import { apply } from '../host/index';
 import { createFileLogger, setDefaultLogger } from '../host/log-file';
-import { createStandaloneAi } from '../standalone/ai-provider';
+import { createDisabledStandaloneAi, createStandaloneAi } from '../standalone/ai-provider';
 import { packageVersion } from '../standalone/check';
 import { createStandaloneContext, type RegisteredRoute } from '../standalone/context';
 import { configPathsFor } from '../standalone/options';
@@ -120,7 +120,17 @@ async function boot(): Promise<void> {
 
   // 与 CLI 同一套安全模型：令牌只经「配置页地址的 #token=」递到浏览器，不进日志
   const security = createRequestSecurity();
-  const ai = createStandaloneAi(dshHomeDir(), logger);
+  // AI 设置读不出来（内容不合法 / ACL 太宽）不该让整个桌宠陪葬 —— 降级成「AI 不可用」。
+  // 分发场景必踩：zip / robocopy 默认不保留 ACL，解压出来的 standalone-ai.json 一定带
+  // BUILTIN\Users:(RX)，readAiSettings 会判 Unsafe settings permissions。见 createDisabledStandaloneAi。
+  let ai: ReturnType<typeof createStandaloneAi>;
+  try {
+    ai = createStandaloneAi(dshHomeDir(), logger);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.error(`AI 设置无法安全读取，AI 功能停用（其余功能正常）：${reason}`);
+    ai = createDisabledStandaloneAi(reason);
+  }
   const context = createStandaloneContext({
     port: () => port,
     logger,

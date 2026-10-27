@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createStandaloneAi } from './ai-provider.ts';
+import { createDisabledStandaloneAi, createStandaloneAi } from './ai-provider.ts';
 import { isolatedFetch } from './ai-transport.ts';
 import { DEFAULT_AI_SETTINGS } from './ai-config.ts';
 
@@ -367,4 +367,35 @@ test('testConnection checks parameters and reports success or friendly error', a
       return new Response('Unauthorized', { status: 401 });
     },
   );
+});
+
+test('AI 设置读不出来时降级为空实现，绝不抛异常（否则整个桌宠起不来）', () => {
+  const ai = createDisabledStandaloneAi('Unsafe settings permissions');
+  // 关键：构造函数本身不抛，宿主才能继续启动
+  assert.equal(ai.isReady(), false);
+  assert.equal(ai.canWhisper(), false);
+  assert.deepEqual(ai.currentSelection(), { provider: 'standalone', model: '' });
+  const pub = ai.getSettings();
+  assert.equal(pub.enabled, false);
+  assert.equal(pub.hasKey, false);
+  assert.equal('apiKey' in pub, false); // 公开视图不带明文密钥
+  assert.deepEqual(ai.listProviders().map((p) => p.id), ['standalone']);
+});
+
+test('降级实现的每个异步入口都返回结构化失败，不冒泡', async () => {
+  const ai = createDisabledStandaloneAi('bad config');
+  assert.deepEqual(await ai.listModels('standalone'), []);
+  assert.equal(await ai.resolveModelInfo('standalone', 'm'), undefined);
+  // stream 必须能正常结束（空流），不能抛
+  const parts: string[] = [];
+  for await (const p of ai.stream({})) parts.push(p.text);
+  assert.deepEqual(parts, []);
+  const conn = await ai.testConnection({});
+  assert.equal(conn.ok, false);
+  assert.match(conn.message, /AI 功能已停用/);
+  const turn = await ai.toolTurn({ system: '', messages: [], tools: [] });
+  assert.equal(turn.ok, false);
+  // 保存仍然拒绝（安全语义不降级）
+  await assert.rejects(() => ai.saveSettings({}), /Cannot securely save/);
+  ai.dispose();
 });

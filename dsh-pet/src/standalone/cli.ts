@@ -27,7 +27,7 @@ import { dshHomeDir, packageRoot } from '../host/helper-process';
 import { apply } from '../host/index';
 import { defaultLog, setDefaultLogger } from '../host/log-file';
 import { runCheck, packageVersion } from './check';
-import { createStandaloneAi } from './ai-provider';
+import { createDisabledStandaloneAi, createStandaloneAi } from './ai-provider';
 import { createRequestSecurity } from './request-security';
 import { writeStandaloneRuntime } from './runtime-state';
 import {
@@ -60,7 +60,15 @@ async function run(logger: StandaloneLogger, options: { port: number }): Promise
   // 这样两条退出入口共用同一套收尾（context.dispose → 停 Helper → 关服务 → exit 0）。
   let forwardShutdown: (reason: string) => void = () => {};
   const portRef = { value: options.port };
-  const ai = createStandaloneAi(home, logger);
+  let ai: ReturnType<typeof createStandaloneAi>;
+  try {
+    ai = createStandaloneAi(home, logger);
+  } catch (error) {
+    // 同 src/app/main.ts：一份坏配置不该拖垮整个进程。见 createDisabledStandaloneAi 注释。
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.error(`AI 设置无法安全读取，AI 功能停用（其余功能正常）：${reason}`);
+    ai = createDisabledStandaloneAi(reason);
+  }
   const security = createRequestSecurity();
   const context = createStandaloneContext({
     port: () => portRef.value,
