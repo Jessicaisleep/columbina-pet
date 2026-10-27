@@ -5,7 +5,7 @@ export const settingsPage = `<!doctype html>
 <script src="/standalone-ai/settings.js" defer></script></head><body>
 <main><header><span class="fish" aria-hidden="true">🐾</span><p class="local">独立桌宠 / 本机设置</p>
 <h1>桌宠 AI 设置</h1><p class="intro">配置你的大模型 API 接口，写宠物人设，查看对话历史。<br>所有设置仅保存在本机，支持即时测试连接。</p></header>
-<nav class="tabs" role="tablist"><button id="tab-settings" type="button" role="tab" aria-controls="panel-settings" aria-selected="true" class="tab is-active">模型与人设</button><button id="tab-history" type="button" role="tab" aria-controls="panel-history" aria-selected="false" class="tab">对话历史</button><button id="tab-runs" type="button" role="tab" aria-controls="panel-runs" aria-selected="false" class="tab">助手记录</button></nav>
+<nav class="tabs" role="tablist"><button id="tab-settings" type="button" role="tab" aria-controls="panel-settings" aria-selected="true" class="tab is-active">模型与人设</button><button id="tab-history" type="button" role="tab" aria-controls="panel-history" aria-selected="false" class="tab">对话历史</button><button id="tab-runs" type="button" role="tab" aria-controls="panel-runs" aria-selected="false" class="tab">助手记录</button><button id="tab-backup" type="button" role="tab" aria-controls="panel-backup" aria-selected="false" class="tab">数据备份</button></nav>
 <div id="panel-settings" role="tabpanel" aria-labelledby="tab-settings">
 <form id="settings" aria-describedby="privacy">
 <fieldset><legend>模型连接</legend>
@@ -100,6 +100,24 @@ export const settingsPage = `<!doctype html>
 <ol id="runs-list" class="msgs runs"></ol>
 <div class="test-row"><span id="runs-count" class="hint"></span></div>
 </section></div>
+<div id="panel-backup" role="tabpanel" aria-labelledby="tab-backup" hidden>
+<section class="history">
+<h2>导出备份</h2>
+<p class="hint" id="backup-lead">把<b>全部用户状态</b>收成一个 JSON 文件：宠物配置（列表/位置/大小/动画池/人设）、全局开关、对话记忆。<br>换机器、重装、或者想给别人一份同样的配置时用它。<b>运行日志与助手操作记录不在备份里</b>（那是排查用的，不是你的配置）。</p>
+<label class="check"><input id="backup-include-key" type="checkbox">同时导出 API 密钥（<b>风险：文件里会是明文</b>，只在给自己换机时勾）</label>
+<p class="hint" id="backup-key-warn" hidden>勾了的话，导出的文件里 <code>apiKey</code> 是明文。别把它发给别人、别传到网盘或聊天工具。</p>
+<div class="test-row"><button id="backup-export" type="button">导出到文件</button><span id="backup-export-result" class="test-result" role="status" aria-live="polite"></span></div>
+<p class="hint" id="backup-export-detail"></p>
+
+<h2 class="backup-h2">从备份恢复</h2>
+<p class="hint">先选文件，会先<b>只读预览</b>会改哪些、新增哪些，你确认了才真的写盘。写入前旧文件会自动留一份 <code>.bak-before-import-时间戳</code> 副本，选错了可以拿回来。</p>
+<div class="test-row"><input id="backup-file" class="backup-file" type="file" accept=".json,application/json"><button id="backup-preview" type="button">读取并预览</button><span id="backup-import-result" class="test-result" role="status" aria-live="polite"></span></div>
+<div id="backup-plan" hidden>
+  <p class="hint" id="backup-plan-meta"></p>
+  <ul id="backup-plan-list" class="msgs"></ul>
+  <div class="test-row"><button id="backup-apply" type="button" class="danger">确认恢复（覆盖本机配置）</button><span id="backup-apply-result" class="test-result" role="status" aria-live="polite"></span></div>
+</div>
+</section></div>
 <noscript>需要启用 JavaScript 才能保存设置。请从桌宠菜单打开本页。</noscript></main></body></html>`;
 
 export const settingsStyle = `
@@ -146,6 +164,7 @@ fieldset{padding:0 0 28px;margin:0 0 24px;border:0;border-bottom:1px solid var(-
 .runs .run-reply{font-size:13px;line-height:1.65;background:#f7fbfd;border-radius:5px;padding:7px 10px;margin:6px 0 0;white-space:pre-wrap;word-break:break-word}
 #runs-clear.danger{background:#fff;color:#a13b30;border:1.5px solid #d8a8a2;min-height:38px;padding:6px 18px;font-size:14px;border-radius:6px;cursor:pointer;font-weight:600}
 #runs-clear.danger:hover{background:#fdeceb}
+.backup-h2{margin-top:28px}.backup-file{max-width:320px}
 `;
 
 export const settingsScript = `
@@ -197,25 +216,173 @@ export const settingsScript = `
   const tabSettings = get('tab-settings');
   const tabHistory = get('tab-history');
   const tabRuns = get('tab-runs');
+  const tabBackup = get('tab-backup');
   function showTab(which) {
     const isHistory = which === 'history';
     const isRuns = which === 'runs';
-    const isSettings = !isHistory && !isRuns;
+    const isBackup = which === 'backup';
+    const isSettings = !isHistory && !isRuns && !isBackup;
     tabSettings.classList.toggle('is-active', isSettings);
     tabHistory.classList.toggle('is-active', isHistory);
     tabRuns.classList.toggle('is-active', isRuns);
+    tabBackup.classList.toggle('is-active', isBackup);
     tabSettings.setAttribute('aria-selected', String(isSettings));
     tabHistory.setAttribute('aria-selected', String(isHistory));
     tabRuns.setAttribute('aria-selected', String(isRuns));
+    tabBackup.setAttribute('aria-selected', String(isBackup));
     get('panel-settings').hidden = !isSettings;
     get('panel-history').hidden = !isHistory;
     get('panel-runs').hidden = !isRuns;
+    get('panel-backup').hidden = !isBackup;
     if (isHistory && !historyLoaded) void loadHistory(true);
     if (isRuns) void loadRuns();
   }
   tabSettings.addEventListener('click', () => showTab('settings'));
   tabHistory.addEventListener('click', () => showTab('history'));
   tabRuns.addEventListener('click', () => showTab('runs'));
+  tabBackup.addEventListener('click', () => showTab('backup'));
+
+  // ---------- 数据备份（导出 / 导入）----------
+  // 导出：GET 拿 bundle → Blob 下载。走 petRequest 会按 JSON 解析，这里直接 fetch 保原文。
+  // 导入：两阶段。先 POST dry=1 只算不写 → 展示计划 → 用户点确认才 POST 真导。
+  const backupIncludeKey = get('backup-include-key');
+  const backupKeyWarn = get('backup-key-warn');
+  const backupExportBtn = get('backup-export');
+  const backupExportResult = get('backup-export-result');
+  const backupExportDetail = get('backup-export-detail');
+  const backupFile = get('backup-file');
+  const backupPreviewBtn = get('backup-preview');
+  const backupImportResult = get('backup-import-result');
+  const backupPlan = get('backup-plan');
+  const backupPlanMeta = get('backup-plan-meta');
+  const backupPlanList = get('backup-plan-list');
+  const backupApplyBtn = get('backup-apply');
+  const backupApplyResult = get('backup-apply-result');
+  let pendingBackupText = '';
+
+  backupIncludeKey.addEventListener('change', () => {
+    backupKeyWarn.hidden = !backupIncludeKey.checked;
+  });
+
+  function backupStamp() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  async function petRequestRaw(path, method = 'GET', payload) {
+    const response = await fetch(path, {
+      method, credentials: 'omit', cache: 'no-store',
+      headers: { 'X-DSH-Pet-Token': token, ...(payload ? {'Content-Type': 'application/json'} : {}) },
+      ...(payload ? {body: JSON.stringify(payload)} : {})
+    });
+    if (response.status === 403) throw new Error('打开凭据已失效。请从桌宠菜单重新打开设置。');
+    if (!response.ok) throw new Error('本机接口返回 HTTP ' + response.status);
+    return response.json();
+  }
+
+  backupExportBtn.addEventListener('click', async () => {
+    backupExportBtn.disabled = true;
+    backupExportResult.textContent = '正在收集…';
+    backupExportResult.dataset.error = 'false';
+    backupExportDetail.textContent = '';
+    try {
+      const data = await petRequestRaw('/dsh-pet-7340/portable/export', 'POST', { includeApiKey: backupIncludeKey.checked });
+      if (!data.ok) throw new Error(data.error || '导出失败');
+      const blob = new Blob([JSON.stringify(data.bundle, null, 2)], {type: 'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'dsh-pet-backup-' + backupStamp() + '.json';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      backupExportResult.textContent = '已导出 ' + data.bundle.files.length + ' 个文件';
+      backupExportDetail.textContent = '包含：' + data.bundle.files.map(f => f.path).join('、')
+        + (data.skipped && data.skipped.length ? '\\n跳过（读不出来）：' + data.skipped.join('、') : '');
+    } catch (e) {
+      backupExportResult.textContent = e.message;
+      backupExportResult.dataset.error = 'true';
+    } finally {
+      backupExportBtn.disabled = false;
+    }
+  });
+
+  function resetImportPlan() {
+    pendingBackupText = '';
+    backupPlan.hidden = true;
+    backupPlanList.textContent = '';
+    backupPlanMeta.textContent = '';
+    backupApplyResult.textContent = '';
+  }
+
+  backupPreviewBtn.addEventListener('click', async () => {
+    resetImportPlan();
+    backupImportResult.dataset.error = 'false';
+    const file = backupFile.files && backupFile.files[0];
+    if (!file) { backupImportResult.textContent = '先选一个备份文件。'; backupImportResult.dataset.error = 'true'; return; }
+    backupImportResult.textContent = '读取中…';
+    try {
+      const text = await file.text();
+      const data = await petRequestRaw('/dsh-pet-7340/portable/import', 'POST', { text, dry: true });
+      if (!data.ok) {
+        backupImportResult.textContent = data.message || '这个文件不能导入';
+        backupImportResult.dataset.error = 'true';
+        return;
+      }
+      pendingBackupText = text;
+      const overwrite = data.files.filter(f => f.overwrite).length;
+      const added = data.files.length - overwrite;
+      backupPlanMeta.textContent = '备份导出于 ' + (data.exportedAt || '未知时间')
+        + (data.appVersion ? '（程序 v' + data.appVersion + '）' : '')
+        + ' · ' + data.files.length + ' 个文件：覆盖 ' + overwrite + ' 个，新增 ' + added + ' 个'
+        + (data.includeApiKey ? ' · 含 API 密钥（会一并覆盖本机密钥）' : ' · 不含 API 密钥');
+      for (const f of data.files) {
+        const li = document.createElement('li');
+        li.textContent = (f.overwrite ? '覆盖 ' : '新增 ') + f.path + '（' + f.bytes + ' 字节）';
+        backupPlanList.appendChild(li);
+      }
+      backupPlan.hidden = false;
+      backupImportResult.textContent = '预览完成，确认后再写入。';
+    } catch (e) {
+      backupImportResult.textContent = e.message;
+      backupImportResult.dataset.error = 'true';
+    }
+  });
+
+  backupApplyBtn.addEventListener('click', async () => {
+    if (!pendingBackupText) { backupApplyResult.textContent = '先预览。'; backupApplyResult.dataset.error = 'true'; return; }
+    if (!confirm('确认用这个备份覆盖本机配置？\\n\\n旧文件会留一份 .bak-before-import-时间戳 副本。')) return;
+    backupApplyBtn.disabled = true;
+    backupApplyResult.dataset.error = 'false';
+    backupApplyResult.textContent = '正在写入…';
+    try {
+      const data = await petRequestRaw('/dsh-pet-7340/portable/import', 'POST', { text: pendingBackupText });
+      if (!data.ok) {
+        backupApplyResult.textContent = data.message || '导入失败';
+        backupApplyResult.dataset.error = 'true';
+        return;
+      }
+      backupApplyResult.textContent = '已恢复 ' + data.written.length + ' 个文件'
+        + (data.backups.length ? '，旧文件留了 ' + data.backups.length + ' 份副本' : '')
+        + (data.apiKeyKept ? '；本机 API 密钥保持不变（备份里没有密钥）' : '');
+      backupFile.value = '';
+      resetImportPlanKeepMessage(backupApplyResult.textContent);
+    } catch (e) {
+      backupApplyResult.textContent = e.message;
+      backupApplyResult.dataset.error = 'true';
+    } finally {
+      backupApplyBtn.disabled = false;
+    }
+  });
+
+  // reset 会清掉 backupApplyResult，导入成功后要保住那句提示
+  function resetImportPlanKeepMessage(msg) {
+    pendingBackupText = '';
+    backupPlan.hidden = true;
+    backupPlanList.textContent = '';
+    backupPlanMeta.textContent = '';
+    backupApplyResult.textContent = msg;
+  }
 
   // ---------- 人设卡 ----------
   const petSelect = get('persona-pet');

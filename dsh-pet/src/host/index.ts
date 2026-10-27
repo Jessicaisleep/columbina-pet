@@ -133,6 +133,13 @@ import { MENU_WAIT_MAX_MS, MenuRegistry } from './menu';
 import { decidePosition, decideThrow, positionLeafData } from './motion-cue';
 import { parsePlaybackPath, parseWaitQuery, PlaybackStore } from './playback';
 import { PoseStore, normalizePoseInput } from './pose';
+import {
+  applyBackupImport,
+  collectBackup,
+  planBackupImport,
+  readBackup,
+  BACKUP_MAX_BYTES,
+} from './portable';
 import { SURFACE_TEXT, displayCovers, normalizeSurface, type Surface } from './surface';
 import {
   findPetInstance,
@@ -2187,6 +2194,129 @@ export function apply(ctx: any): void {
           profile: profileNameFrom(PACKAGE_ROOT) ?? '',
         },
       };
+    }
+
+    // 数据备份：导出全部用户状态 / 从备份恢复（设置页「数据备份」卡片）。
+    //
+    // 为什么要这个：换机器、重装、手滑改坏配置、想给别人一份同样的配置时，
+    // 此前只能自己去 data/dsh-pet/ 里翻文件。这里把「哪些文件算用户的全部状态」
+    // 收敛到 ./portable 一处，宿主只负责收发。
+    //
+    // 语义与 /config 那类写操作不同：**这两个路由都不走 configQueue**。
+    //   - 导出纯读，不写任何文件，串行没有意义；
+    //   - 导入虽然写盘，但它是「整份替换」而不是「读-改-写同一个 pets 数组」，
+    //     与 /config 并发时的正确结果本来就只能是「谁后到谁说了算」；
+    //     真要串行反而会和 /config 互相等待造成假死。导入内部是逐文件写，
+    //     且写前留 .bak-before-import-<时间戳> 副本，误操作可回滚。
+    // ⚠ 只收 POST，**故意不用 GET**：standalone 模式的 `publicRead()`
+    // （src/standalone/request-security.ts:17-26）会放行**所有** `GET /dsh-pet-<数字>/…`，
+    // 不要求 X-DSH-Pet-Token。而导出包里含 memory.json（用户的真实对话原文）——
+    // 用一个免令牌的 GET 把它吐出去，等于任何能在本机打开一个网页的进程都能读走聊天记录。
+    // POST 不在 publicRead 的放行范围内，必然过 token 校验，所以这里把 GET 也一起关掉。
+    if (rest === 'portable/export') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        // { includeApiKey:true } —— 默认不收密钥文件
+        let includeApiKey = false;
+        if (body) {
+          try {
+            const parsed = JSON.parse(body) as { includeApiKey?: unknown };
+            if (parsed?.includeApiKey === true) includeApiKey = true;
+          } catch {
+            // 请求体坏掉不阻断导出：按默认（不含密钥）走，调用方能从响应里看出 includeApiKey=false
+          }
+        }
+        const { bundle, skipped } = collectBackup(configPaths, userRoot, {
+          includeApiKey,
+          appVersion: accountClientMetadata().version,
+        });
+        log.info(
+          `[dsh-pet] 导出备份：${bundle.files.length} 个文件，含密钥=${includeApiKey}` +
+            (skipped.length > 0 ? `，跳过 ${skipped.length} 个（${skipped.join(', ')}）` : ''),
+        );
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: true, bundle, skipped },
+          headers: { 'cache-control': 'no-cache, no-store' },
+        };
+      } catch (e) {
+        log.error(`[dsh-pet] 导出备份失败：${e instanceof Error ? e.message : String(e)}`);
+        return { kind: 'json', status: 500, obj: { error: '导出失败，详见日志' } };
+      }
+    }
+
+    // 导入备份：两阶段（?dry=1 只算不写）。
+    //   设置页先 dry 一次给用户看「会覆盖哪几个 / 新增哪几个」，确认后才真导。
+    //   这样「点错文件直接覆盖掉全部配置」这个最贵的误操作没有发生的机会。
+    // 业务失败一律 200 + { ok:false, reason, message }（与 /pet-pinned 同口径）：
+    // 校验失败是**用户选错了文件**这种正常情况，不该用 4xx 让前端当网络错误处理。
+    if (rest === 'portable/import') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      if (typeof body !== 'string' || body.length === 0) {
+        return { kind: 'json', status: 400, obj: { error: 'empty body' } };
+      }
+      if (Buffer.byteLength(body, 'utf8') > BACKUP_MAX_BYTES * 1.3) {
+        return { kind: 'json', status: 413, obj: { error: '备份文件过大' } };
+      }
+      let payload: { text?: unknown; dry?: unknown } | undefined;
+      try {
+        payload = JSON.parse(body) as { text?: unknown; dry?: unknown };
+      } catch {
+        return { kind: 'json', status: 400, obj: { error: 'invalid JSON body' } };
+      }
+      const text = payload?.text;
+      if (typeof text !== 'string') {
+        return { kind: 'json', status: 400, obj: { error: 'text 必须是备份文件的原文' } };
+      }
+      const checked = readBackup(text);
+      if (!checked.ok) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: checked.reason, message: checked.message, file: checked.file },
+        };
+      }
+      const plan = planBackupImport(configPaths, userRoot, checked.bundle);
+      const dry = payload?.dry === true;
+      if (dry) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: {
+            ok: true,
+            dry: true,
+            exportedAt: checked.bundle.exportedAt,
+            appVersion: checked.bundle.appVersion,
+            includeApiKey: checked.bundle.includeApiKey,
+            files: plan,
+          },
+        };
+      }
+      try {
+        const result = applyBackupImport(configPaths, userRoot, checked.bundle);
+        log.info(
+          `[dsh-pet] 导入备份：写入 ${result.written.length} 个文件，` +
+            `留副本 ${result.backups.length} 份` +
+            (result.apiKeyKept ? '，本机密钥保持不变' : ''),
+        );
+        // 配置与记忆都可能变了：重解析桌面宠物（异步，不阻塞响应）。
+        // 记忆/密钥由各自的读取函数每次重读文件，不需要额外通知。
+        void syncDesktop();
+        return {
+          kind: 'json',
+          status: 200,
+          obj: {
+            ok: true,
+            written: result.written,
+            backups: result.backups,
+            apiKeyKept: result.apiKeyKept,
+          },
+        };
+      } catch (e) {
+        log.error(`[dsh-pet] 导入备份失败：${e instanceof Error ? e.message : String(e)}`);
+        return { kind: 'json', status: 500, obj: { error: '导入失败，详见日志' } };
+      }
     }
 
     // 第三方右键菜单（供别的插件注册自己的菜单项）。四个方法：

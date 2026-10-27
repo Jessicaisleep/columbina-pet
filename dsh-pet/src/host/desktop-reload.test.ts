@@ -63,9 +63,15 @@ describe('桌面端「重载配置」—— 菜单 → 宿主重启 Helper', () 
     assert.ok(!/action: 'reload'/.test(clientPet), '浏览器端不得有 reload 菜单项（它会重启整个桌面 Helper）');
   });
 
-  test('syncDesktop 是唯一的重启入口：两个 /config 写接口、/reload 与 /pet-display 都走它', () => {
+  test('syncDesktop 是唯一的重启入口：两个 /config 写接口、/reload、/pet-display 与备份导入都走它', () => {
     const calls = host.match(/void syncDesktop\(/g) ?? [];
-    assert.equal(calls.length, 4, 'PUT /config、POST /config、POST /reload、POST /pet-display 都应走 syncDesktop()');
+    // 2026-10-27 加第 5 处：POST /portable/import（导入备份后配置与记忆都可能变了，
+    // 不重启 Helper 的话桌面上还是旧宠物——这条也要走同一个入口，见 ./portable 头注释）
+    assert.equal(
+      calls.length,
+      5,
+      'PUT /config、POST /config、POST /reload、POST /pet-display、POST /portable/import 都应走 syncDesktop()',
+    );
   });
 
   test('shared 菜单契约放行 reload（桌面壳注入该动作，类型必须包含它）', () => {
