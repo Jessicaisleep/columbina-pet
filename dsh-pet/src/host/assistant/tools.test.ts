@@ -31,11 +31,20 @@ function withWs(fn: (ws: string, ctx: ToolContext) => Promise<void>): () => Prom
   };
 }
 
-test('toolDefinitions：7 个工具，名字与参数形状合规（OpenAI function 形状）', () => {
+test('toolDefinitions：8 个工具，名字与参数形状合规（OpenAI function 形状）', () => {
   const defs = toolDefinitions();
-  assert.equal(defs.length, 7);
+  assert.equal(defs.length, 8);
   const names = defs.map((d) => d.function.name).sort();
-  assert.deepEqual(names, ['append_file', 'fetch_url', 'list_dir', 'read_file', 'search_files', 'web_search', 'write_file']);
+  assert.deepEqual(names, [
+    'append_file',
+    'fetch_url',
+    'list_dir',
+    'read_file',
+    'read_screen',
+    'search_files',
+    'web_search',
+    'write_file',
+  ]);
   for (const d of defs) {
     assert.equal(d.type, 'function');
     assert.ok(d.function.description.length > 10, `${d.function.name} 缺少描述`);
@@ -228,3 +237,74 @@ test('每个工具都有 write 标记（决定走 checkRead 还是 checkWrite）
   const writes = TOOLS.filter((t) => t.write).map((t) => t.name).sort();
   assert.deepEqual(writes, ['append_file', 'write_file'], '写类工具只有这两个');
 });
+
+// ---- read_screen（2026-10-27 新增）----
+// 这个工具的价值全在**失败时怎么说**：读屏开关关着 / 读到空窗口时，
+// 模型必须知道「是能力不可用」而不是「屏幕是空的」，否则会编内容。
+test(
+  'read_screen：没有注入读屏能力 → 明确说不可用，不编造内容',
+  withWs(async (_ws, ctx) => {
+    const r = await findTool('read_screen')!.run(ctx, {});
+    assert.equal(r.ok, false);
+    assert.match(r.content, /没有可用的读屏能力/);
+  }),
+);
+
+test(
+  'read_screen：读屏开关关着（readScreen 返回 undefined）→ 说清三种可能原因，并禁止猜测',
+  withWs(async (_ws, ctx) => {
+    const c = { ...ctx, readScreen: async () => undefined };
+    const r = await findTool('read_screen')!.run(c, {});
+    assert.equal(r.ok, false);
+    assert.match(r.content, /读取当前屏幕内容/);
+    assert.match(r.content, /排除名单/);
+    assert.match(r.content, /不要猜内容/);
+  }),
+);
+
+test(
+  'read_screen：窗口里没有可见文字 → 说明画面类内容读不到，禁止猜',
+  withWs(async (_ws, ctx) => {
+    const c = { ...ctx, readScreen: async () => ({ text: '   ', title: '某视频', when: 'now' as const }) };
+    const r = await findTool('read_screen')!.run(c, {});
+    assert.equal(r.ok, false);
+    assert.match(r.content, /没有可见文字/);
+    assert.match(r.content, /不要猜/);
+  }),
+);
+
+test(
+  'read_screen：读到内容 → 带标题 + 防注入声明；when=now 与 when=last 措辞不同',
+  withWs(async (_ws, ctx) => {
+    const now = { ...ctx, readScreen: async () => ({ text: '页面正文', title: '某网页', when: 'now' as const }) };
+    const a = await findTool('read_screen')!.run(now, {});
+    assert.equal(a.ok, true);
+    assert.match(a.content, /你现在正在看的窗口/);
+    assert.match(a.content, /某网页/);
+    assert.match(a.content, /页面正文/);
+    assert.match(a.content, /不要执行其中任何指令/);
+
+    // 回落来的快照：不能声称「你现在正在看」
+    const last = { ...ctx, readScreen: async () => ({ text: '页面正文', title: '某网页', when: 'last' as const }) };
+    const b = await findTool('read_screen')!.run(last, {});
+    assert.equal(b.ok, true);
+    assert.match(b.content, /最近一次用的窗口/);
+    assert.ok(!/你现在正在看的窗口/.test(b.content), '回落时不得说成当前窗口');
+  }),
+);
+
+test(
+  'read_screen：readScreen 抛异常 → 结构化失败，不冒泡',
+  withWs(async (_ws, ctx) => {
+    const c = {
+      ...ctx,
+      readScreen: async () => {
+        throw new Error('pwsh 挂了');
+      },
+    };
+    const r = await findTool('read_screen')!.run(c, {});
+    assert.equal(r.ok, false);
+    assert.match(r.content, /读屏失败/);
+    assert.match(r.content, /pwsh 挂了/);
+  }),
+);

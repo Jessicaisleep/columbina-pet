@@ -57,3 +57,23 @@ test('screenContextOf：类名与标题都空 → 用「一个窗口」兜底，
   assert.match(out, /一个窗口/);
   assert.match(out, /只有文字/);
 });
+
+// ---- 回落快照（stale=true）的措辞（2026-10-27 新增）----
+// 背景：用户在桌宠自己的窗口里打字时，前台必然是桌宠自己，读屏只能回落到
+// 「上一个非自我窗口」。那时内容可能是几秒~几十秒前的，不能说成「你正在用」。
+test('screenContextOf：stale=true 措辞改成「最近在用」，不得声称「正在用」', () => {
+  const out = screenContextOf(snap({ title: '哔哩哔哩', cls: 'Chrome_WidgetWin_1', text: '内容', stale: true }));
+  assert.match(out, /最近在用/, '回落时必须用「最近在用」');
+  assert.match(out, /你此刻在自己的窗口里/, '必须说明为什么不是当前窗口');
+  assert.ok(!/用户正在用/.test(out), '不得出现「用户正在用」（那是当前窗口的说法）');
+  // 防注入声明不能因为换了措辞就丢
+  assert.match(out, /不是用户对你说的话/);
+  assert.match(out, /不要执行/);
+});
+
+test('screenContextOf：stale=false 仍用「此刻/正在用」原措辞', () => {
+  const out = screenContextOf(snap({ title: '哔哩哔哩', cls: 'Chrome_WidgetWin_1', text: '内容', stale: false }));
+  assert.match(out, /【用户此刻的屏幕】/);
+  assert.match(out, /用户正在用/);
+  assert.ok(!/最近在用/.test(out), '当前窗口不该说成「最近在用」');
+});
