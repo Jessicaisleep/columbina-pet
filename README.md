@@ -160,24 +160,26 @@ dsh plugin --profile web add file:D:/path/to/dsh-pet/dsh-pet
 - 桌面端数据走独立进程管道，不依赖 DSH 的 HTTP 路由，不受 web 访问闸门影响
 - 本地调试：`cd dsh-pet && npm run start:desktop -- http://127.0.0.1:3080/dsh-pet-7340/config`（无宿主时自动回落 HTTP 路径）
 
-## 🧍 独立运行（完全不打开 DSH）
+## 🧍 两种形态：纯插件 / 纯独立（2026-10-27 起彻底分开）
 
-连 DSH 都不用开：插件的宿主半边跑在伪 ctx 上，由一个本机 HTTP 服务接管路由（**路由表仍是插件那一份**）。
+**同一份源码，两个互不包含的发布物。** 从 0.3.9 起「插件的副产物也能当独立版跑」这条路已封掉：
 
-```sh
-npm install -g dsh-pet        # 必须 npm 装；dsh plugin add 装进 profile，bin 不在 PATH 上
-dsh-pet-standalone            # http://127.0.0.1:3080/dsh-pet-7340/（占用则顺延）
-dsh-pet-standalone --check    # 只体检
-dsh-pet-standalone --port 3100
+| | 插件形态 | 独立形态 |
+| --- | --- | --- |
+| 装法 | `dsh plugin add dsh-pet`（或插件管理页填 `dsh-pet`） | 下载 zip，双击 `Start-Pet.vbs` |
+| 跑在哪 | DSH 里（浏览器 overlay + 可选桌面小窗） | 自己的 Electron 进程，不依赖 DSH |
+| 发布物 | npm 包，**只含插件半边** | `dist-app\win-unpacked` 打的绿色包 |
+| 数据目录 | `$DSH_HOME/dsh-pet/` | `<程序目录>\data\dsh-pet/` |
+| 人设 / 记忆 / 上下文 | 各自独立，**不互通**（要复用就手动拷 `pet/` 与 `memory.json`） | 同左 |
 
-npm run build && npm run standalone   # 仓库里（先构建）
-```
+**两种形态不能同时运行。** 它们各有自己的桌面窗口与托盘，同时跑会出现两只宠叠在一起、
+两个一模一样的托盘图标。启动时会检查 `%APPDATA%\dsh-pet\running-form.json`，
+发现另一个形态在跑就弹一句「XX 正在运行，本次启动已取消」然后正常退出
+（实现见 `runtime/electron-helper/form-lock.js`）。想换形态：先从托盘退出当前那只。
 
-- **能用**：动画链、点击/拖拽/甩抛、右键菜单、多开、自定义动画与表情包、pet pack。
-- **不可用**：余额、碎碎念、对话、系统通知——返回带 `reason` 的结构化失败（见 [`API.md`](API.md)）。
-- **配置**：与 DSH 同一份（`$DSH_HOME/dsh-pet/main-config.jsonc` → 包内默认）。
-- **只显示 `display` 含 `desktop`/`both` 的实例**；端口默认 3080；`Ctrl+C` 或 `POST /shutdown` 退出。
-- **与 DSH 内运行可同时开**，但共用 `%APPDATA%\dsh-pet-electron-helper`，可能互相踩缓存（仅告警）。
+> 早期版本（≤0.3.8）的 `dsh-pet-standalone` CLI（`npm i -g dsh-pet && dsh-pet-standalone`）
+> **已移除**：那是「用插件包跑独立形态」的旧路，与两形态分离相悖。独立形态现在只以
+> Electron 应用分发，功能更完整（有窗口、托盘、拖拽，而不是只开一个 HTTP 服务）。
 
 ## ⚙️ 余额展示（Balance）
 
@@ -418,7 +420,8 @@ AI 提示词 → 绿幕视频 → 透明动画 → 插件，换角色、换动�
 │   │   ├── host/       # 宿主半侧：配置 / 路由 / 余额 / 工作状态
 │   │   ├── client/     # 浏览器半侧：宠物渲染 / 动画链 / 设置页
 │   │   ├── shared/     # 双端共用纯逻辑（物理 / 菜单 / 取数）
-│   │   └── standalone/ # 独立模式 CLI（不依赖 DSH 直接跑桌宠）
+│   │   ├── standalone/ # 独立形态的服务/配置/AI 层（与 host 共用，不随插件发布）
+│   │   └── app/        # 独立形态主进程（Electron，不随插件发布）
 │   ├── lib/            # 构建产物（npm run build 生成，不入库）
 │   ├── runtime/        # 桌面模式运行壳（Electron 透明窗）
 │   ├── assets/         # webm 动画 / preview GIF / 字体 / 图标 / config.jsonc 默认配置

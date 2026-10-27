@@ -60,7 +60,14 @@ if (buildTypes.status !== 0) {
 const pkg = JSON.parse(readFileSync(PKG, 'utf8'));
 const keep = [
   'lib',
+  // 【形态分离，2026-10-27】插件发布物不带独立版：这两个产物 + 两个源码目录都要排掉。
+  // lib/app.js（Electron 主进程）与 lib/standalone.js（CLI）只有独立版用，插件永远不加载；
+  // 带上它们等于把「插件的副产物也能当独立版跑」这条路留在包里，与「两种形态彻底分开」相悖。
+  '!lib/app.js',
+  '!lib/standalone.js',
   'src',
+  '!src/app',
+  '!src/standalone',
   'assets/webm',
   'runtime/electron-helper',
   'assets/fonts',

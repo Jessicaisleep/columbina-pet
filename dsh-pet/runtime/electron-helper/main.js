@@ -71,6 +71,9 @@ const { shouldLinearize, resolveForcedScale, resolvePetScale } = require('./dpi-
 // 托盘的平台差异（模板图 / 左键是否自动弹菜单 / Dock）：规则住在模块里，main.js 只接线
 const { trayPlatform } = require('./tray-platform.js');
 const { buildDeskGeometry } = require('./desktop-geometry.js');
+// 跨形态互斥：插件形态（DSH 内 helper）与独立应用（dsh-pet.exe）不许同时跑。两种形态共用本文件，
+// 所以锁只在这里抢一次，口径天然一致；抢不到就弹一句人话然后退出（见 form-lock.js 文件头）。
+const { formLockFile, acquireFormLock, releaseFormLock, conflictMessage } = require('./form-lock.js');
 
 /** Linux 指针提供者：仅在 Linux 创建；查询失败时 get() 返回 null（调用方回退 Electron 原生 API） */
 const linuxPointer = process.platform === 'linux' ? createLinuxPointer() : null;
@@ -117,6 +120,42 @@ if (APP_MODE) app.setPath('userData', path.join(app.getPath('appData'), 'dsh-pet
 const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
 /** 探测进程的输出标记（父进程按它抓值） */
 const DPI_MARK = 'dsh-pet-primary-scale:';
+
+// ---------- 跨形态互斥（插件形态 ⇄ 独立应用） ----------
+//
+// 抢一个标记文件（%APPDATA%\dsh-pet\running-form.json）。另一个形态活着 → 弹窗说明 + 正常退出。
+// 三条边界：
+//   ① DPI 探测子进程要跳过：它不建窗口，抢锁只会把自己和父进程写成两个占位。
+//   ② 写在 ready 之前（同步、只读一两个小文件），失败一律放行——互斥是体验优化，不是硬依赖，
+//      绝不能因为标记文件写不进去就让用户的宠物起不来。
+//   ③ 退出时释放，且只删「确实是自己写的」那条（form-lock.js 里按 pid 校验）。
+const FORM_MODE = APP_MODE ? 'app' : 'plugin';
+const FORM_LOCK = formLockFile(app.getPath('appData'));
+if (!DPI_PROBE) {
+  const claimed = acquireFormLock(FORM_LOCK, { mode: FORM_MODE, pid: process.pid });
+  if (!claimed.ok) {
+    const text = conflictMessage(claimed.other);
+    // 插件形态没有终端可看，必须弹窗；独立应用同理（双击启动的人看不到 stdout）
+    electronApi.dialog.showMessageBoxSync({
+      type: 'warning',
+      title: text.title,
+      message: text.message,
+      detail: text.detail,
+      buttons: ['知道了'],
+      noLink: true,
+    });
+    // exit 0：这是「按预期拒绝启动」，不是崩溃。exit 1 会被启动器当失败再弹一次红线。
+    process.exit(0);
+  }
+  app.on('will-quit', () => {
+    try {
+      releaseFormLock(FORM_LOCK, process.pid);
+    } catch (error) {
+      // 退出路径不抛：删不掉最坏只是一份残留标记，下次启动按 pid 判活自己会清掉
+      process.stderr.write('[dsh-pet helper] 清理形态标记失败: ' + String(error && error.message) + '\n');
+    }
+  });
+}
 
 // ---------- 宿主存活（issue #56）：管道断开 / 父进程消失 → 自己退出 ----------
 //
