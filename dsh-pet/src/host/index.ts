@@ -2872,13 +2872,15 @@ export function apply(ctx: any): void {
           };
         }
         const next = typeof raw === 'string' ? raw.trim() : '';
-        if (next.length > 4000) {
-          return {
-            kind: 'json',
-            status: 200,
-            obj: { ok: false, reason: 'bad-request', message: '人设过长（限 4000 字）' },
-          };
-        }
+        // 人设**不设长度上限**（2026-10-27 用户明确要求）。
+        //
+        // 理由：人设是用户自己的创作，写多长、每次多花多少 token 是他们自己的取舍，
+        // 产品不该替他们定上限。这里原先硬拒 >4000 字，导致用户贴一份完整角色卡
+        // （实测 哥伦比娅.txt 2323 字 / 纳西妲.txt 1935 字，但更长的设定集轻松破万）
+        // 会被静默拒绝。
+        //
+        // 唯一保留的边界是**结构性**的：必须是字符串、非空才写、空串表示删除覆盖。
+        // 真正的兜底交给下游——模型上下文超限时由 provider 报错，那才是准确的位置。 
         // 与 /pet-display 同一条写盘路径：找到目标层 → 整段替换该层 pets（只改目标那只）
         let layerPath: string;
         let layerDir: string;

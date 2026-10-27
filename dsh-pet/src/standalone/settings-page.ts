@@ -24,8 +24,8 @@ export const settingsPage = `<!doctype html>
 <div class="pair"><div><label for="persona-pet">宠物</label><select id="persona-pet" aria-describedby="persona-lead"></select></div>
 <div><label for="persona-count">当前字数</label><input id="persona-count" type="text" readonly tabindex="-1" value="0 字"></div></div>
 <label for="persona">人设（留空 = 沿用所属条目的默认人设）</label>
-<textarea id="persona" rows="12" maxlength="4000" spellcheck="false" placeholder="例：你是哥伦比娅，一位嗓音柔软、说话慢半拍的女仆。喜欢用短句，偶尔冒出一点坏心思，但从不真的刻薄。称呼对方为「主人」。" aria-describedby="persona-hint"></textarea>
-<p id="persona-hint" class="hint">留空保存 = 删除这只宠物自己的覆盖，回落到所属条目的默认人设。上限 4000 字。</p>
+<textarea id="persona" rows="12" spellcheck="false" placeholder="例：你是蓝毛小女仆，一位嗓音柔软、说话慢半拍的女仆。喜欢用短句，偶尔冒出一点坏心思，但从不真的刻薄。称呼对方为「主人」。" aria-describedby="persona-hint"></textarea>
+<p id="persona-hint" class="hint">留空保存 = 删除这只宠物自己的覆盖，回落到所属条目的默认人设。<strong>不设字数上限</strong>——想写多长都行，代价是每次说话都多花相应 token，这个权衡由你自己把握。</p>
 <div class="test-row"><button id="persona-save" type="button">保存人设</button><span id="persona-result" class="test-result" role="status" aria-live="polite"></span></div>
 <details class="preview"><summary>查看最终生效的 system prompt</summary><pre id="persona-preview" class="pre"></pre></details>
 </fieldset>
