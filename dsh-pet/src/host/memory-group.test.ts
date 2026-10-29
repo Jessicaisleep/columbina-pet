@@ -15,12 +15,15 @@ import {
   MAX_MEMBERS,
   activeMembers,
   clampRecentN,
+  groupOf,
   groupSection,
   membersOf,
   messagesOf,
   normalizeScope,
+  ownerMirrorMessage,
   parseSender,
   planMemberEviction,
+  shouldMirrorOwner,
   touchMember,
   userMessageFor,
   type GroupMemory,
@@ -279,4 +282,101 @@ test('userMessageFor:群聊模式没给 name 时不写 senderName 键', () => {
 test('userMessageFor:群聊模式没给 sender → 退回单人形状（不编造身份）', () => {
   const m = userMessageFor('你好', 1000, undefined, 'group');
   assert.deepEqual(m, { role: 'user', content: '你好', ts: 1000 });
+});
+
+// ── parseSender 的 group / groupName（2026-10-30 任务1 新增）────────────
+
+test('parseSender:群号与群名分别解析，不混用', () => {
+  const s = parseSender({ id: 'qq:1001', group: '700123456', groupName: '须弥茶话会' });
+  assert.deepEqual(s, { id: 'qq:1001', group: '700123456', groupName: '须弥茶话会' });
+});
+
+test('parseSender:群号/群名两端空白被裁，空串当没有', () => {
+  assert.deepEqual(parseSender({ id: 'u1', group: '  700  ', groupName: '  ' }), { id: 'u1', group: '700' });
+  assert.deepEqual(parseSender({ id: 'u1', group: '', groupName: '' }), { id: 'u1' });
+});
+
+// ── groupOf：按群分桶（2026-10-30 任务1 新增）───────────────────────────
+
+test('groupOf:同一个群取回同一条记忆流', () => {
+  const entry: { groups?: Record<string, GroupMemory> } = {};
+  const a = groupOf(entry, '700');
+  a.messages.push({ role: 'user', content: '群里的第一句', ts: 1 });
+  const b = groupOf(entry, '700');
+  assert.equal(b, a, '第二次取必须是同一个对象，不是重建');
+  assert.equal(b.messages.length, 1);
+});
+
+test('groupOf:不同群互不干扰（换了群不串味）', () => {
+  const entry: { groups?: Record<string, GroupMemory> } = {};
+  groupOf(entry, '700').messages.push({ role: 'user', content: 'A 群的话', ts: 1 });
+  const g2 = groupOf(entry, '800');
+  assert.equal(g2.messages.length, 0, 'B 群看不到 A 群的话');
+  assert.deepEqual(Object.keys(entry.groups ?? {}).sort(), ['700', '800']);
+});
+
+test('groupOf:结构坏掉时重建为空记忆并报错，不静默炸', () => {
+  const bad = { groups: { '700': [1, 2, 3] as unknown as GroupMemory } };
+  const errs: string[] = [];
+  const g = groupOf(bad, '700', { error: (m) => errs.push(m) });
+  assert.deepEqual(g.messages, []);
+  assert.equal(errs.length, 1, '必须报一条错误——静默吞掉会让用户以为记录全丢了');
+});
+
+test('groupOf:没有 groups 键时自建，不打爆原对象', () => {
+  const entry: { groups?: Record<string, GroupMemory> } = {};
+  const g = groupOf(entry, 'default');
+  assert.ok(entry.groups, 'groups 容器被建出来');
+  assert.ok(entry.groups!['default']);
+  assert.equal(g, entry.groups!['default']);
+});
+
+// ── shouldMirrorOwner：三条件全满足才镜像 ──────────────────────────────
+
+test('shouldMirrorOwner:群聊开 + 记住主人开 + QQ 号对上 → 镜像', () => {
+  const conf = { groupBotEnabled: true, ownerSyncEnabled: true, ownerQq: '10001' };
+  assert.equal(shouldMirrorOwner(conf, '10001'), true);
+  assert.equal(shouldMirrorOwner(conf, ' 10001 '), true, '两端空白不影响判定');
+});
+
+test('shouldMirrorOwner:任一条件不满足都不镜像', () => {
+  const base = { groupBotEnabled: true, ownerSyncEnabled: true, ownerQq: '10001' };
+  assert.equal(shouldMirrorOwner({ ...base, groupBotEnabled: false }, '10001'), false);
+  assert.equal(shouldMirrorOwner({ ...base, ownerSyncEnabled: false }, '10001'), false);
+  assert.equal(shouldMirrorOwner({ ...base, ownerQq: '' }, '10001'), false, '没填 QQ 号不能拿"空"当通配');
+  assert.equal(shouldMirrorOwner(base, '20002'), false, '群里别人的话绝不进单人流');
+  assert.equal(shouldMirrorOwner(base, undefined), false);
+  assert.equal(shouldMirrorOwner({}, '10001'), false, '缺键一律不镜像（默认关）');
+});
+
+test('shouldMirrorOwner:ownerQq 不是字符串时不镜像（不隐式转数字）', () => {
+  const conf = { groupBotEnabled: true, ownerSyncEnabled: true, ownerQq: 10001 };
+  assert.equal(shouldMirrorOwner(conf, '10001'), false);
+});
+
+// ── ownerMirrorMessage：正文必须带群名标注 ─────────────────────────────
+
+test('ownerMirrorMessage:正文前置群名标注（模型只看正文，看不到字段）', () => {
+  const m = ownerMirrorMessage('今天好累', 5000, '须弥茶话会');
+  assert.equal(m.role, 'user');
+  assert.equal(m.content, '（在「须弥茶话会」里说的）今天好累');
+  assert.equal(m.ts, 5000);
+  assert.equal(m.origin, '须弥茶话会');
+});
+
+test('ownerMirrorMessage:没有群名时写"群里"，不写空引号', () => {
+  const m = ownerMirrorMessage('今天好累', 5000, undefined);
+  assert.equal(m.content, '（在群里说的）今天好累');
+  assert.equal(m.origin, 'group');
+});
+
+test('ownerMirrorMessage:不带 sender 字段（这是单人流的消息，不是群消息）', () => {
+  const m = ownerMirrorMessage('今天好累', 5000, '须弥茶话会');
+  assert.equal('sender' in m, false, '带上 sender 会被群聊过滤当成群消息，进不了单人流');
+});
+
+test('ownerMirrorMessage:origin 缺群名时是 "group"（缺键=本窗口正常对话，不能跟它混淆）', () => {
+  const m = ownerMirrorMessage('今天好累', 5000, '  ');
+  assert.equal(m.origin, 'group', '空白群名不能当成名字，但 origin 仍要标出"这条来自群"');
+  assert.equal(m.content, '（在群里说的）今天好累');
 });

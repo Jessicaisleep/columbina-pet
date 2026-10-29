@@ -54,17 +54,20 @@ export const settingsPage = `<!doctype html>
 <div class="test-row"><button id="screen-save" type="button">保存读屏设置</button><span id="screen-result" class="test-result" role="status" aria-live="polite"></span></div>
 </fieldset>
 <fieldset><legend>记忆（它记不记得你）</legend>
-<p class="hint" id="memory-lead">桌宠会把你说的<b>稳定事实</b>（住在哪、养了什么、喜欢什么）记成一张小卡片，每次都带上；往事按关键词回捞。想换成群聊就把模式改为<b>群聊</b>——群里它按人分开记，不会把甲的事安到乙头上。</p>
-<div class="pair"><div><label for="memoryMode">记忆模式</label><select id="memoryMode" aria-describedby="memory-lead mode-hint"><option value="single">单人（一对一对聊）</option><option value="group">群聊（按人分开记）</option></select></div>
-<div><label for="memoryRecallK">每次回捞往事条数</label><input id="memoryRecallK" type="number" min="0" max="50" step="1" value="3" aria-describedby="recall-hint"></div></div>
-<p class="hint" id="recall-hint">0 = 关闭检索。这是<b>上限</b>不是定额：命中几条就回填几条，多数问句只会命中 1~2 条，调大它只在档案很大时才用得上。</p>
-<p class="hint" id="mode-hint">单人模式不区分说话人；群聊模式按下方策略管理群成员。</p>
+<p class="hint" id="memory-lead">桌宠会把你说的<b>稳定事实</b>（住在哪、养了什么、喜欢什么）记成一张小卡片，每次都带上；往事按关键词回捞。</p>
+<label class="check"><input id="groupBotEnabled" type="checkbox" aria-describedby="memory-lead group-lead">启用群聊模式（Q 群机器人）</label>
+<p class="hint" id="group-lead">不勾就是<b>纯单人桌宠</b>：只跟桌面上的你聊，一对一的陪伴。勾上之后，群里来的人按<b>各自分开</b>记，不会把甲的事安到乙头上；桌面端仍然是单人上下文——<b>两个入口互不串味</b>。</p>
 <div id="group-box" hidden>
-<label class="check"><input id="groupMemoryScope" type="radio" name="groupScope" value="everyone" aria-describedby="scope-hint">记得每个人</label>
+<label class="check"><input id="groupMemoryScope" type="radio" name="groupScope" value="everyone" aria-describedby="scope-hint">记得群里每个人</label>
 <label class="check"><input id="groupMemoryScopeRecent" type="radio" name="groupScope" value="recent" aria-describedby="scope-hint">只记得最近说话的 N 个人</label>
 <div class="pair"><div><label for="groupMemoryRecentN">N（1–100）</label><input id="groupMemoryRecentN" type="number" min="1" max="100" step="1" value="10" aria-describedby="scope-hint"></div></div>
 <p class="hint" id="scope-hint">「只记得最近 N 个人」是<b>真的忘掉</b>：第 N+1 个人开口，最久没说话的那位就被移出记忆，下次他再说话宠物确实不认得他。要的是这个语义就别调太大。</p>
+<div class="rule"></div><label class="check"><input id="ownerSyncEnabled" type="checkbox" aria-describedby="owner-hint">记住主人：我在群里的发言也算我的私聊记忆</label>
+<div class="pair"><div><label for="ownerQq">我的 QQ 号</label><input id="ownerQq" type="text" inputmode="numeric" autocomplete="off" placeholder="例如 100012345" aria-describedby="owner-hint"></div></div>
+<p class="hint" id="owner-hint">解决一个具体的痛点：你刚在群里说完话，回到桌面接着聊，它却像没听过。勾上并填对 QQ 号后，<b>只有你本人</b>在群里的发言会被额外记一份到单人记忆里，并自动标注是在哪个群说的；<b>群里别人的话不会进</b>——那不是你和它的私聊。它的群回复也不会被搬进单人记忆，不会伪造桌面上没说过的话。</p>
 </div>
+<div class="pair"><div><label for="memoryRecallK">每次回捞往事条数</label><input id="memoryRecallK" type="number" min="0" max="50" step="1" value="3" aria-describedby="recall-hint"></div></div>
+<p class="hint" id="recall-hint">0 = 关闭检索。这是<b>上限</b>不是定额：命中几条就回填几条，多数问句只会命中 1~2 条，调大它只在档案很大时才用得上。</p>
 <p class="notice" id="memory-warn">记忆全文保存在本机 <code>data/dsh-pet/memory.json</code>，不会因为压缩而删除原文。压缩只是把老对话写成一段摘要，不再每次全文发送。</p>
 <div class="test-row"><button id="memory-save" type="button">保存记忆设置</button><span id="memory-result" class="test-result" role="status" aria-live="polite"></span></div>
 </fieldset>
@@ -143,7 +146,7 @@ form,.tabs,.history{background:var(--paper);border:1px solid var(--line);border-
 .tabs{display:flex;gap:8px;padding:10px 12px;border-radius:10px;margin:0 0 18px;background:#f5fafd}
 .tab{border:0;background:transparent;color:var(--muted);min-height:40px;padding:6px 16px;border-radius:7px;font:600 15px/1.4 inherit;cursor:pointer}
 .tab.is-active{background:var(--blue);color:#fff}.tab:not(.is-active):hover{background:#e3eff7;color:var(--blue)}
-fieldset{padding:0 0 28px;margin:0 0 24px;border:0;border-bottom:1px solid var(--line);min-width:0}legend{font-size:19px;font-weight:700;margin-bottom:18px;padding:0}label{display:block;font-weight:600;font-size:14px;margin:14px 0 6px}input:not([type=checkbox]):not([type=radio]),select,textarea{display:block;width:100%;min-height:44px;border:1px solid #a5bdcb;border-radius:6px;background:#fff;color:var(--ink);padding:9px 12px;font:inherit;font-size:15px}input[type=radio]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}textarea{min-height:220px;resize:vertical;line-height:1.7}input::placeholder,textarea::placeholder{color:#6a7e8b}input[type=checkbox]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}.check{display:flex;align-items:center;gap:10px;min-height:32px;cursor:pointer}.enabled{margin-top:24px}.clear{font-weight:400;color:var(--muted);font-size:13px}.hint{font-size:12px;line-height:1.6;color:var(--muted);margin:7px 0 0}.key-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.key-heading label{margin:0 0 6px}.key-heading .hint{margin:0 0 6px}.notice{font-size:13px;color:#704b13;background:#fff7e7;border-left:3px solid #c18e36;margin:12px 0 16px;padding:12px 14px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:20px}footer{display:flex;align-items:center;justify-content:space-between;gap:18px}footer p{font-size:12px;color:var(--muted);margin:0}button{border:0;border-radius:7px;min-height:44px;padding:10px 20px;background:var(--blue);color:#fff;font:600 15px/1.5 inherit;white-space:nowrap;cursor:pointer}button:hover{background:#0b4e73}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #3a94c4;outline-offset:3px}#status{font-size:13px;min-height:24px;margin:18px 0 0;color:var(--blue)}#status[data-error=true]{color:#a13b30}
+fieldset{padding:0 0 28px;margin:0 0 24px;border:0;border-bottom:1px solid var(--line);min-width:0}legend{font-size:19px;font-weight:700;margin-bottom:18px;padding:0}label{display:block;font-weight:600;font-size:14px;margin:14px 0 6px}input:not([type=checkbox]):not([type=radio]),select,textarea{display:block;width:100%;min-height:44px;border:1px solid #a5bdcb;border-radius:6px;background:#fff;color:var(--ink);padding:9px 12px;font:inherit;font-size:15px}input[type=radio]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}textarea{min-height:220px;resize:vertical;line-height:1.7}input::placeholder,textarea::placeholder{color:#6a7e8b}input[type=checkbox]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}.check{display:flex;align-items:center;gap:10px;min-height:32px;cursor:pointer}.enabled{margin-top:24px}.clear{font-weight:400;color:var(--muted);font-size:13px}.hint{font-size:12px;line-height:1.6;color:var(--muted);margin:7px 0 0}.key-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.key-heading label{margin:0 0 6px}.key-heading .hint{margin:0 0 6px}.notice{font-size:13px;color:#704b13;background:#fff7e7;border-left:3px solid #c18e36;margin:12px 0 16px;padding:12px 14px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:20px}.rule{height:1px;background:var(--line);margin:16px 0 12px}footer{display:flex;align-items:center;justify-content:space-between;gap:18px}footer p{font-size:12px;color:var(--muted);margin:0}button{border:0;border-radius:7px;min-height:44px;padding:10px 20px;background:var(--blue);color:#fff;font:600 15px/1.5 inherit;white-space:nowrap;cursor:pointer}button:hover{background:#0b4e73}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #3a94c4;outline-offset:3px}#status{font-size:13px;min-height:24px;margin:18px 0 0;color:var(--blue)}#status[data-error=true]{color:#a13b30}
 .test-row{display:flex;align-items:center;gap:14px;margin:20px 0 6px;flex-wrap:wrap}#test-btn,#persona-save,#history-load,#history-more{background:#fff;color:var(--blue);border:1.5px solid var(--blue);min-height:38px;padding:6px 18px;font-size:14px;border-radius:6px;cursor:pointer;font-weight:600}#test-btn:hover,#persona-save:hover,#history-load:hover,#history-more:hover{background:#edf5fa}#test-btn:disabled,#persona-save:disabled,#history-load:disabled,#history-more:disabled{opacity:.6;cursor:wait}.test-result{font-size:13px;line-height:1.5;min-height:22px;flex:1 1 200px}.test-success{color:#1a7f37;font-weight:600}.test-error{color:#cf222e}.reply-preview{display:block;color:var(--muted);font-weight:normal;font-size:12px;margin-top:4px;word-break:break-all}
 .preview{margin:18px 0 0}.preview summary{font-size:13px;color:var(--blue);cursor:pointer;font-weight:600}.pre{white-space:pre-wrap;word-break:break-word;font:13px/1.7 "Consolas","Microsoft YaHei UI",monospace;background:#f7fbfd;border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin:10px 0 0;max-height:340px;overflow:auto}
 .history h2{font-size:16px;font-weight:700;margin:22px 0 6px}.memory-card{border:1px solid var(--line);border-radius:10px;padding:14px 18px 6px;background:#f7fbfd;margin:0 0 8px}.memory-card h2{margin-top:4px}.msgs{list-style:none;margin:10px 0 0;padding:0}.msgs li{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:0 0 10px;background:#fff}.msgs li.is-summarized{background:#f6f8f9;border-style:dashed}.msgs li.is-summarized .msg-text{color:#7b8b96}.msg-head{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin:0 0 5px}.msg-role{font-weight:700;color:var(--blue)}.msgs li.is-summarized .msg-role{color:#8ca0ad}.msg-text{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.65}
@@ -700,13 +703,15 @@ export const settingsScript = `
   const netBox = get('assistantNetworkEnabled');
   const assistantSave = get('assistant-save');
   const assistantResult = get('assistant-result');
-  // 记忆设置（2026-10-29）
-  const memMode = get('memoryMode');
+  // 记忆设置（2026-10-29，2026-10-30 改为「群聊是可勾选开关」）
+  const memGroupBot = get('groupBotEnabled');
   const memRecallK = get('memoryRecallK');
   const memGroupBox = get('group-box');
   const memScopeAll = get('groupMemoryScope');
   const memScopeRecent = get('groupMemoryScopeRecent');
   const memRecentN = get('groupMemoryRecentN');
+  const memOwnerSync = get('ownerSyncEnabled');
+  const memOwnerQq = get('ownerQq');
   const memSave = get('memory-save');
   const memResult = get('memory-result');
   const workspaceList = get('workspace-list');
@@ -725,13 +730,20 @@ export const settingsScript = `
       assistantBox.checked = data.assistantEnabled === true;
       permSelect.value = data.assistantPermission || 'readonly';
       netBox.checked = data.assistantNetworkEnabled !== false;
-      // 记忆设置：缺键给默认（single / everyone / 10 / 3），与后端 memoryModeOf 等函数同口径
-      memMode.value = data.memoryMode === 'group' ? 'group' : 'single';
+      // 记忆设置：缺键给默认（群聊关 / everyone / 10 / 3），与后端 memoryModeOf 等函数同口径
+      //
+      // 2026-10-30 起「群聊」不再是单选模式，而是一个开关：默认关 = 纯单人桌宠。
+      // 兼容老配置：以前存过 memoryMode:'group' 的用户，这里当成"开关是开的"，
+      // 否则他们升级后会发现群聊突然不工作（用户看不到 memoryMode 这个键了，没法自己改回来）。
+      const groupOn = data.groupBotEnabled === true || data.memoryMode === 'group';
+      memGroupBot.checked = groupOn;
       memRecallK.value = typeof data.memoryRecallK === 'number' ? data.memoryRecallK : 3;
       const scope = data.groupMemoryScope === 'recent' ? 'recent' : 'everyone';
       memScopeAll.checked = scope === 'everyone';
       memScopeRecent.checked = scope === 'recent';
       memRecentN.value = typeof data.groupMemoryRecentN === 'number' ? data.groupMemoryRecentN : 10;
+      memOwnerSync.checked = data.ownerSyncEnabled === true;
+      memOwnerQq.value = typeof data.ownerQq === 'string' ? data.ownerQq : '';
       syncMemoryVisibility();
       const pets2 = data.pets || [];
       workspaceList.textContent = pets2.length
@@ -760,25 +772,29 @@ export const settingsScript = `
     finally { screenSave.disabled = false; }
   });
   /**
-   * 记忆区块的显示联动：只有选「群聊」才显示成员策略，选「只记得最近 N 个」才允许填 N。
+   * 记忆区块的显示联动（2026-10-30 改造）：
+   *  - 群聊开关关 → 整块成员策略与「记住主人」都不显示（纯单人桌宠，这些控件是纯噪声）；
+   *  - 群聊开 → 显示成员策略；「只记得最近 N 个」档才允许填 N；
+   *  - 「记住主人」的 QQ 输入框只在勾上后才可编辑（没勾时填了也没用，禁用比留个能填的空框更明确）。
    *
-   * 为什么做成联动而不是一直显示：单人模式下「记得 10 个人」这种控件对一个只用单人模式的
-   * 用户是纯噪声，还会让他怀疑"我是不是漏配了什么"。隐藏比禁用更干净（禁用会留下一个灰块）。
+   * 为什么用 hidden 而不是 disabled：隐藏比禁用干净（禁用会留下一块灰控件，用户会怀疑自己漏配了什么）。
    */
   function syncMemoryVisibility() {
-    const isGroup = memMode.value === 'group';
+    const isGroup = memGroupBot.checked;
     memGroupBox.hidden = !isGroup;
     // N 输入框只在 recent 档可编辑：everyone 档下它无意义（改了不起任何作用）
     memRecentN.disabled = !isGroup || !memScopeRecent.checked;
+    memOwnerQq.disabled = !isGroup || !memOwnerSync.checked;
   }
-  memMode.addEventListener('change', syncMemoryVisibility);
+  memGroupBot.addEventListener('change', syncMemoryVisibility);
   memScopeAll.addEventListener('change', syncMemoryVisibility);
   memScopeRecent.addEventListener('change', syncMemoryVisibility);
+  memOwnerSync.addEventListener('change', syncMemoryVisibility);
   memSave.addEventListener('click', async () => {
     memSave.disabled = true;
     note(memResult, '正在保存…');
     try {
-      const isGroup = memMode.value === 'group';
+      const isGroup = memGroupBot.checked;
       const scope = memScopeRecent.checked ? 'recent' : 'everyone';
       // N 只在 group+recent 时有意义；其他情况一律发 10（默认值），避免把上一次的旧值带进去
       const n = isGroup && scope === 'recent' ? Number(memRecentN.value) : 10;
@@ -787,16 +803,29 @@ export const settingsScript = `
       }
       const k = Number(memRecallK.value);
       if (!Number.isFinite(k) || k < 0 || k > 50) throw new Error('回捞条数必须是 0 到 50 之间的整数');
+      // 「记住主人」：勾了就必须填一个像样的 QQ 号——不填等于静默不生效，
+      // 而用户的期望是"我勾了它就该记得"，静默失败是最难自查的那种。
+      const ownerSync = isGroup && memOwnerSync.checked;
+      const ownerQq = memOwnerQq.value.trim();
+      if (ownerSync && !/^\\d{4,15}$/.test(ownerQq)) {
+        throw new Error('勾了「记住主人」就要填 QQ 号（4 到 15 位数字）');
+      }
       const data = await petRequest('/dsh-pet-7340/assistant/settings', 'POST', {
+        groupBotEnabled: isGroup,
+        // 老键同步写一次，让降级回旧版本的用户不会突然失去群聊（存的是等效语义）
         memoryMode: isGroup ? 'group' : 'single',
         groupMemoryScope: scope,
         groupMemoryRecentN: n,
         memoryRecallK: k,
+        ownerSyncEnabled: ownerSync,
+        // 没开群聊/没勾记住主人时清空，避免留下一个"看起来还挂着"的号
+        ownerQq: ownerSync ? ownerQq : '',
       });
       if (!data.ok) throw new Error(data.message || data.reason || '保存失败');
-      const summary = isGroup
-        ? (scope === 'recent' ? '群聊模式，只记得最近 ' + n + ' 个人。' : '群聊模式，记得每个人。')
-        : '单人模式。';
+      const summary = !isGroup
+        ? '纯单人桌宠。'
+        : (scope === 'recent' ? '群聊模式，只记得最近 ' + n + ' 个人。' : '群聊模式，记得群里每个人。')
+          + (ownerSync ? '你在群里的发言也会记进单人记忆。' : '');
       note(memResult, '已保存。' + summary + (k === 0 ? '（往事回捞已关闭）' : '每次回捞 ' + k + ' 条往事。'), 'test-success');
     } catch (error) { note(memResult, error.message, 'test-error'); }
     finally { memSave.disabled = false; }

@@ -171,3 +171,84 @@ describe('调用形状 —— 调用身份与真实失败原因', () => {
     assert.equal(r.ok === false && r.message, '模型未返回文本');
   });
 });
+
+// ============================================================
+// 同轮打标（用户 m09397「一边回对话一边打个标签，其实没啥延时」）
+//
+// 这条路的两个风险不对称：
+//   - 标签丢了：退回词典，检索精度掉一点，**用户无感**；
+//   - 回复被吃：用户看到半句话，**立刻就是事故**。
+// 所以下面钉的全是「标记剥不干净时宁可别动正文」。
+// ============================================================
+describe('generateChat —— 同轮打标 [标:…] 的解析与剥除', () => {
+  /** 造一个直接把指定文本当回复吐出来的 ctx */
+  function textCtx(out: string) {
+    const ctx = {
+      agentDefaultModel: { currentSelection: (): ModelRef => CURRENT },
+      llm: {
+        resolveModelInfo: async () => ({}),
+        stream: () =>
+          (async function* () {
+            yield { type: 'text-delta', index: 0, text: out };
+          })(),
+      },
+    };
+    return { ctx };
+  }
+
+  test('模型按格式附了标签 → 正文剥干净，标签单独返回', async () => {
+    const { ctx } = textCtx('好可爱呀，我也想摸摸它。\n[标:宠物|pos|emotion]');
+    const r = await generateChat(ctx, '人设', [], '今天出门看见一只狗狗好可爱', [], undefined);
+    assert.equal(r.ok, true);
+    assert.equal(r.ok === true && r.text, '好可爱呀，我也想摸摸它。', '标记不得残留在用户可见文本里');
+    assert.deepEqual(r.ok === true && r.tags?.topics, ['宠物']);
+    assert.equal(r.ok === true && r.tags?.mood, 'pos');
+    assert.equal(r.ok === true && r.tags?.kind, 'emotion');
+  });
+
+  test('模型没写标签 → 正文一字不改，tags 为 undefined（词典兜底）', async () => {
+    const { ctx } = textCtx('嗯嗯，我在听。');
+    const r = await generateChat(ctx, '人设', [], '在吗', [], undefined);
+    assert.equal(r.ok === true && r.text, '嗯嗯，我在听。');
+    assert.equal(r.ok === true && r.tags, undefined);
+  });
+
+  test('wantTags=false → 指令不附进正文（省 token 的开关要真的省）', async () => {
+    const seen: string[] = [];
+    const ctx = {
+      agentDefaultModel: { currentSelection: (): ModelRef => CURRENT },
+      llm: {
+        resolveModelInfo: async () => ({}),
+        stream: (o: { messages: Array<{ content: Array<{ text?: string }> }> }) => {
+          seen.push(JSON.stringify(o.messages.at(-1) ?? {}));
+          return (async function* () {
+            yield { type: 'text-delta', index: 0, text: '好。' };
+          })();
+        },
+      },
+    };
+    await generateChat(ctx, '人设', [], '在吗', [], undefined, false);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].includes('[打标]'), false, '关掉打标时不能再附指令');
+  });
+
+  test('wantTags 打开时指令确实附进去了（默认值不能是假的）', async () => {
+    const seen: string[] = [];
+    const ctx = {
+      agentDefaultModel: { currentSelection: (): ModelRef => CURRENT },
+      llm: {
+        resolveModelInfo: async () => ({}),
+        stream: (o: { messages: Array<{ content: Array<{ text?: string }> }> }) => {
+          seen.push(JSON.stringify(o.messages.at(-1) ?? {}));
+          return (async function* () {
+            yield { type: 'text-delta', index: 0, text: '好。' };
+          })();
+        },
+      },
+    };
+    await generateChat(ctx, '人设', [], '在吗', [], undefined);
+    assert.equal(seen[0].includes('[打标]'), true);
+    // 用户原话必须还在（附在末尾，不是替换）
+    assert.equal(seen[0].includes('在吗'), true);
+  });
+});

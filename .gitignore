@@ -73,3 +73,11 @@ userdata/
 # ── 本地实机验收/抓图产物（个人桌面截图，不入仓库）──
 _build/
 desktop_check/
+
+# ── 本地一次性探针（_probe_*.mjs / _tmp_*.mjs 都是验收用的临时脚本，不入仓库）──
+#   _probe_realtag.mjs  用真实模型验证 [标:…] 合规性（读 standalone-ai.json，含密钥）
+#   _probe_lex2.mjs     词表/假朋友 53 项断言
+#   _probe_time.mjs     时间解析断言
+#   _probe_tags.mjs     标签检索三路对照
+dsh-pet/_probe_*.mjs
+dsh-pet/_tmp_*.mjs

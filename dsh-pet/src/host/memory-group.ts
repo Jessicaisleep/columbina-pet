@@ -274,12 +274,28 @@ function factsSectionInner(facts: MemoryFact[]): string {
 }
 
 /**
- * 解析 HTTP body 里的 `sender`：要么是字符串（只给 id），要么是 `{id, name}`。
+ * 群聊发言者 + 所在群（2026-10-30 加 `group`/`groupName`）。
+ *
+ * `group` 是**分桶键**（哪个群），`groupName` 只用于正文里的可读标注
+ * （「（在「XX群」里说的）」）。两者分开是因为：群号会变（换群/迁移）而名字给人看，
+ * 混用一个字段会让「改了群名」变成「认不出这是同一个群」。
+ */
+export interface Sender {
+  id: string;
+  name?: string;
+  /** 群标识（QQ 群号）——记忆按它分桶 */
+  group?: string;
+  /** 群名（可读名字，只用于给模型看的标注） */
+  groupName?: string;
+}
+
+/**
+ * 解析 HTTP body 里的 `sender`：要么是字符串（只给 id），要么是 `{id, name, group, groupName}`。
  *
  * 宽容但**不猜**：id 为空/非字符串就当没带（返回 undefined），由调用侧按单人处理并记日志。
  * 不做「用 name 当 id」的兜底——那样同名的两个人会被并成一份记忆，比不认人更糟。
  */
-export function parseSender(raw: unknown): { id: string; name?: string } | undefined {
+export function parseSender(raw: unknown): Sender | undefined {
   if (typeof raw === 'string') {
     const id = raw.trim();
     return id === '' ? undefined : { id };
@@ -289,7 +305,15 @@ export function parseSender(raw: unknown): { id: string; name?: string } | undef
     const id = typeof o.id === 'string' ? o.id.trim() : '';
     if (id === '') return undefined;
     const name = typeof o.name === 'string' && o.name.trim() !== '' ? o.name.trim() : undefined;
-    return name !== undefined ? { id, name } : { id };
+    const group = typeof o.group === 'string' && o.group.trim() !== '' ? o.group.trim() : undefined;
+    const groupName =
+      typeof o.groupName === 'string' && o.groupName.trim() !== '' ? o.groupName.trim() : undefined;
+    return {
+      id,
+      ...(name !== undefined ? { name } : {}),
+      ...(group !== undefined ? { group } : {}),
+      ...(groupName !== undefined ? { groupName } : {}),
+    };
   }
   return undefined;
 }
@@ -320,3 +344,69 @@ export function userMessageFor(
     ...(name !== undefined ? { senderName: name } : {}),
   };
 }
+
+/**
+ * 取（或新建）一个群的记忆流（2026-10-30，任务1「单人/群聊并存」）。
+ * 为什么要按群分开：用户原话「单人是单人，群聊是群聊，单人是对一个人的陪伴，群聊是Q群机器人」。
+ * 一个群里的聊天不该污染一对一的上下文——否则主人在群里说了句话，回桌面聊时桌宠会
+ * 带上整个群的气氛。所以每个群号一份独立的消息流 + 摘要 + 成员桶。
+ *
+ * 结构坏了（数组/标量/没有 messages 数组）一律按空记忆重建，并记 error——
+ * 静默吞掉会让用户以为「聊天记录全没了」，至少日志里要能查到。
+ */
+export function groupOf(
+  entry: { groups?: Record<string, GroupMemory> },
+  groupId: string,
+  log?: { error: (msg: string) => void },
+): GroupMemory {
+  if (!entry.groups || typeof entry.groups !== 'object' || Array.isArray(entry.groups)) {
+    entry.groups = {};
+  }
+  const bucket = entry.groups;
+  const existing = bucket[groupId];
+  if (existing !== undefined && (!existing || !Array.isArray(existing.messages))) {
+    log?.error(`[dsh-pet] 群记忆结构异常（messages 不是数组）group=${groupId}，按新群处理`);
+  }
+  if (!existing || !Array.isArray(existing.messages)) {
+    bucket[groupId] = { messages: [] };
+  }
+  return bucket[groupId];
+}
+
+/**
+ * 判断这次发言要不要镜像进单人流（2026-10-30，修「主人在群里说完回桌面桌宠不记得」）。
+ *
+ * 三个条件全满足才镜像：① 群机器人开着 ② 主人同步开着 ③ 说话的人就是主人（QQ 号相等）。
+ *
+ * 为什么必须限定「主人」：群里别人说的话进单人流，就等于把陌生人的话当成一对一私聊的
+ * 上下文——那正是用户要分开的东西。只有主人是「同一个人在两处说话」，镜像才成立。
+ */
+export function shouldMirrorOwner(
+  conf: Record<string, unknown>,
+  senderId: string | undefined,
+): boolean {
+  if (conf.groupBotEnabled !== true) return false;
+  if (conf.ownerSyncEnabled !== true) return false;
+  const owner = typeof conf.ownerQq === 'string' ? conf.ownerQq.trim() : '';
+  if (owner === '' || !senderId) return false;
+  return owner === senderId.trim();
+}
+
+/**
+ * 把主人在群里的发言包装成单人流里的一条用户消息。
+ *
+ * 为什么在正文里加「（在「XX群」里说的）」而不是只加一个 `origin` 字段：
+ * 模型只看得到 role + content，字段它看不见。用户的原话要求「这里需要标注是在哪个群里的
+ * 互动」——只有写进正文，桌宠回桌面聊时才会知道「这句话是刚才在群里说的」，而不是把它
+ * 当成桌面上刚说的话。`origin` 仍然写一份给程序看（统计/排查/将来做按群过滤）。
+ */
+export function ownerMirrorMessage(
+  text: string,
+  ts: number,
+  groupName: string | undefined,
+): ChatMemoryMessage {
+  const g = groupName && groupName.trim() !== '' ? groupName.trim() : '';
+  const head = g === '' ? '（在群里说的）' : `（在「${g}」里说的）`;
+  return { role: 'user', content: `${head}${text}`, ts, origin: g === '' ? 'group' : g };
+}
+

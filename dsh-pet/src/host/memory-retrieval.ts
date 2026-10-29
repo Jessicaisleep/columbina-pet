@@ -25,6 +25,9 @@
  * 而「我的」这种到处都有的拿 0 分——不需要维护停用词表，词表会随语料漂移。
  */
 
+import { stampLabel } from './memory-time';
+import { mergeTags, tagOf, tagText, type Kind, type MemoryTags, type Mood } from './memory-tags';
+
 /** 一条可检索的记忆单元（一轮问答 = 1 条；检索命中后整轮回填，只回用户那半会被误读成上下文缺答） */
 export interface RetrievalDoc {
   /** 在 `messages` 里的起始下标（对偶数下标；用来去重与排序） */
@@ -33,12 +36,60 @@ export interface RetrievalDoc {
   ask: string;
   /** 宠物那句（可能为空：生成失败时存在半轮） */
   reply: string;
+  /**
+   * 这轮发生的时间（用户那句的 `ts`）。
+   *
+   * 为什么必须带上（2026-10-30）：记忆文件里的消息一直有 `ts`，但回填给模型时
+   * 只给了正文——模型看到的往事全是"没有时间"的，于是「上周一我们聊了什么」
+   * 这种问题它答不了，还会把三个月前的事说成"刚才"。
+   * 缺这个字段时按"时间未知"渲染（不编造时间）。
+   */
+  ts?: number;
+  /**
+   * AI 补标过的标签（`chat.ts` 的 `aiTags`）。有就以它为准，没有再退回词典现算。
+   * 之所以从 `messages` 一路透传到这里：检索时不该再回头查原始消息数组。
+   */
+  aiTags?: { topics: string[]; mood: Mood; kind: Kind };
 }
 
 /** 命中结果 */
 export interface RetrievalHit {
   doc: RetrievalDoc;
   score: number;
+}
+
+/**
+ * 按时间区间捞往事（2026-10-30 新增）。
+ *
+ * 这是和关键词检索**正交**的一条路：问「上周一我们聊了什么」时，`上周一` 不会出现在
+ * 往事正文里，字面检索必然空手而归；但那个时间窗里的对话是客观存在的，直接按 `ts` 筛就行。
+ *
+ * 三条边界：
+ *  1. 区间左闭右开；
+ *  2. 没有 `ts` 的文档（老数据/迁移前的记录）**不纳入**——不知道时间的条目塞进时间查询，
+ *     等于凭空伪造"它发生在那个时间"；
+ *  3. `limit` 只取**最近**的若干条：同样在这个时间段里，越近的越可能是用户想说的那次。
+ */
+export function searchByTime(
+  docs: ReadonlyArray<RetrievalDoc>,
+  range: { from: number; to: number },
+  limit = 5,
+): RetrievalHit[] {
+  const list = Array.isArray(docs) ? docs : [];
+  const from = Number(range?.from);
+  const to = Number(range?.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return [];
+  const k = Math.max(1, Math.floor(Number(limit) || 5));
+  const hit = list.filter(
+    (d) => d && typeof d.ts === 'number' && Number.isFinite(d.ts) && d.ts >= from && d.ts < to,
+  );
+  // 先按新→旧排序**只为了截断**：同一时间窗里"最近那次"最可能是用户指的那次，
+  // 窗口很长（「去年」= 一整年）时不能把最近的挤掉。
+  hit.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
+  // 截断后再翻回正序：回填段是给模型读的一段"那天发生过什么"，
+  // 倒序会让它按倒放理解（实测踩过：把`算了，我先忙了`排在`天气不错`前面）。
+  const kept = hit.slice(0, k).sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+  return kept.map((doc) => ({ doc, score: 1 }));
 }
 
 /**
@@ -125,7 +176,14 @@ export function buildIndex(docs: RetrievalDoc[]): RetrievalIndex {
 
   for (let i = 0; i < list.length; i++) {
     const d = list[i];
-    const toks = new Set([...tokenize(d.ask), ...tokenize(d.reply)]);
+    // 这里扫的是 `ask + 标签`，不是 `ask + reply`（2026-10-30 改）。
+    //
+    // 两个理由：
+    //  ① 标签要进同一次打分，才能让「问开心的事」命中「好可爱」（原文和标签各贡献一路分）；
+    //  ② 宠物的回复不该参与检索——用户问「我不开心」时，命中的应该是**他自己说的**
+    //     那些不开心的话，而不是宠物安慰他的那句（那句里全是"别难过""会好的"）。
+    //     之前 `tokenize(d.reply)` 会把这类回复也索引进去，实测确实造成过串台。
+    const toks = new Set(tokenize(searchableTextOf(d)));
     for (const t of toks) {
       df.set(t, (df.get(t) ?? 0) + 1);
       const arr = postings.get(t);
@@ -236,21 +294,152 @@ export function search(index: RetrievalIndex, query: string, k: number, minScore
  *   - 明确「不要说根据记录」——陪伴场景里这句话的伤害等同于「我查一下档案」；
  *   - 带上「可能只是部分相关」的提示，避免模型把弱命中当成确定事实到处引用。
  */
-export function recallSection(hits: RetrievalHit[]): string {
+export function recallSection(hits: RetrievalHit[], opts: { now?: Date } = {}): string {
   const list = Array.isArray(hits) ? hits.filter((h) => h && h.doc) : [];
   if (list.length === 0) return '';
+  const now = opts.now instanceof Date ? opts.now : new Date();
 
   const lines = list.map((h) => {
     const ask = h.doc.ask.trim();
     const reply = h.doc.reply.trim();
-    return reply === '' ? '- ' + ask : '- ' + ask + ' → ' + reply;
+    // 时间写进每一行：不写的话「上周一聊了什么」这类问题模型答不了，
+    // 还会把很久以前的事当成"刚才"（用户 2026-10-30 明确提出这一点）。
+    //
+    // 格式用**显式标签**（时间｜主人说｜你说），不用箭头连排：
+    // 用户给的验收场景是「今天下雨，主人说哎呀昨天应该出去玩的，宠物接：对呀你昨天说天气不错」。
+    // 模型要接住这句话，必须一眼看出「天气不错」是**昨天**说的、是**主人**说的。
+    // 光靠 `- （昨天）今天天气不错 → 对呀…` 这种连排，模型容易把时间和说话人弄混。
+    const when = typeof h.doc.ts === 'number' ? stampLabel(h.doc.ts, now) : '';
+    const parts: string[] = [];
+    if (when !== '') parts.push('时间：' + when);
+    parts.push('主人说：' + ask);
+    if (reply !== '') parts.push('你说：' + reply);
+    return '- ' + parts.join(' ｜ ');
   });
 
   return (
     '\n\n【想起的往事】这些是你们以前聊过的内容（此刻不在眼前的对话里）。' +
     '如果和现在的话有关就自然地用上，不要逐条复述，不要说"我记得""根据记录"这类话，' +
-    '也不要提"检索""往事"这些字眼。它们只是可能相关，不确定的部分不要当成事实说死：\n' +
+    '也不要提"检索""往事"这些字眼。它们只是可能相关，不确定的部分不要当成事实说死。\n' +
+    '每条都标了发生时间和当时是谁说的：用户提到过去某天时，你可以像人回忆那样' +
+    '自然地接上那天他说过的话（例如"你昨天不是说天气不错嘛"），这是他真说过的事，' +
+    '放心引用——但别把它说成刚刚发生的事，也别把"你说"的内容安到用户头上：\n' +
     lines.join('\n')
+  );
+}
+
+/**
+ * 「那一天的样子」——把某个时间窗内的对话**整体**取出来，而不是抽样几条。
+ *
+ * 为什么不能用 top-K（2026-10-30 实测踩到的坑，探针可复现）：
+ *   昨天聊了 12 轮，主人今天说「哎呀昨天应该出去玩的」。
+ *   时间窗里按新旧取 3 条，捞出的是「今天赢了三把 / 困了早点睡 / 明天见」——
+ *   **没有那句「今天天气不错」**。宠物手上没有素材，就接不上「对啊你昨天说天气不错」。
+ *   换成 5 条也一样捞不到。
+ *
+ *   根因不是排序，是**抽样本身**：人听到"昨天"时浮起来的不是三条随机的记忆，
+ *   是那一天的大致样子（早上干嘛、中午吃啥、下午开会、晚上打游戏），
+ *   然后才在整体里挑出和眼下话题最搭的那一句。
+ *   把它压成 top-3，等于把"那天的样子"换成"那天的最后三件事"。
+ *
+ * 所以这里返回整段轨迹（按时间正序），只在两种情况下裁：
+ *   - 超过 `max` 条：先用关键词相关度挑，再用「最近的」补齐，最后仍按时间正序展示；
+ *   - 单条正文超过 `clip` 字：截断加省略号。
+ *
+ * 成本：实测 12 轮 ≈ 340 字 ≈ 260 token（1M 窗口的 0.03%）。
+ * 40 条 ≈ 900 token。和时间检索省下的检索误差比，这个代价是划算的。
+ */
+export function dayTrace(
+  docs: ReadonlyArray<RetrievalDoc>,
+  range: { from: number; to: number },
+  opts: { max?: number; clip?: number; query?: string } = {},
+): { lines: RetrievalDoc[]; total: number; truncated: boolean } {
+  const list = Array.isArray(docs) ? docs : [];
+  const from = Number(range?.from);
+  const to = Number(range?.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+    return { lines: [], total: 0, truncated: false };
+  }
+  const max = Math.max(1, Math.floor(Number(opts.max ?? 40)) || 40);
+  const hit = list.filter(
+    (d) => d && typeof d.ts === 'number' && Number.isFinite(d.ts) && d.ts >= from && d.ts < to,
+  );
+  const total = hit.length;
+  if (total === 0) return { lines: [], total: 0, truncated: false };
+  if (total <= max) {
+    return { lines: hit.slice().sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0)), total, truncated: false };
+  }
+
+  // 超限才裁：相关度优先，名额用完后由「离现在最近的」补齐（那天最后聊的更可能在心上）
+  const wanted = new Set<RetrievalDoc>();
+  const query = typeof opts.query === 'string' ? opts.query : '';
+  if (query.trim() !== '') {
+    const relevant = search(buildIndex(hit), query, Math.max(1, Math.floor(max / 2)));
+    for (const r of relevant) if (r.score > 0) wanted.add(r.doc);
+  }
+  for (const d of hit.slice().sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))) {
+    if (wanted.size >= max) break;
+    wanted.add(d);
+  }
+  const lines = [...wanted].sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+  return { lines, total, truncated: true };
+}
+
+/**
+ * 渲染「那一天的样子」。
+ *
+ * 与 `recallSection` 的关键差别：这里**不发号施令**。
+ * 不说"把这些用上"，而是说"这是那天发生过的事，你可以从中挑一句接上"。
+ * 因为用户要的是「对啊你昨天说天气不错」这种自然回应，
+ * 命令式措辞会让模型要么硬塞、要么逐条复述，两种都不像人说话。
+ *
+ * 时间标注按跨度切换：单日给「08:00」，跨多天给「10月29日 08:00」。
+ * 一整段都是"昨天"还每条标"昨天"，读起来像表格，也让模型难把"那天几点"说出来。
+ */
+export function traceSection(
+  lines: ReadonlyArray<RetrievalDoc>,
+  label: string,
+  opts: { now?: Date; clip?: number; total?: number; truncated?: boolean } = {},
+): string {
+  const list = Array.isArray(lines) ? lines.filter((d) => d && typeof d.ts === 'number') : [];
+  if (list.length === 0) return '';
+  // 这里不用 `opts.now`：时刻直接取消息自身的 ts，不依赖"现在几点"，
+  // 这样同一段往事在任何时候渲染出的小时数都一样（可复现、可测）。
+  const clip = Math.max(8, Math.floor(Number(opts.clip ?? 60)) || 60);
+  const stamps = list.map((d) => Number(d.ts));
+  const spanMs = Math.max(...stamps) - Math.min(...stamps);
+  const singleDay = spanMs < 20 * 3_600_000; // 20 小时内都算同一天
+
+  const cut = (s: string): string => {
+    const t = s.trim();
+    if (t.length <= clip) return t;
+    const head = t.slice(0, clip);
+    const p = Math.max(head.lastIndexOf('。'), head.lastIndexOf('，'), head.lastIndexOf('！'));
+    return (p > clip * 0.6 ? head.slice(0, p) : head) + '…';
+  };
+  const clockOf = (ts: number): string => {
+    const d = new Date(ts);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return singleDay ? `${hh}:${mm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hh}:${mm}`;
+  };
+
+  const rows = list.map((d) => {
+    const parts = [clockOf(Number(d.ts)), '主人说：' + cut(d.ask)];
+    if (d.reply.trim() !== '') parts.push('你说：' + cut(d.reply));
+    return '- ' + parts.join(' ｜ ');
+  });
+
+  const tag = typeof label === 'string' && label.trim() !== '' ? label.trim() : '那段时间';
+  const total = Math.floor(Number(opts.total ?? list.length)) || list.length;
+  const more = opts.truncated === true && total > list.length ? `（共 ${total} 轮，这里是节选）` : '';
+  return (
+    `\n\n【那一天的样子·${tag}】${more}这是那段时间里你们说过的话，按时间从头到尾排。` +
+    '主人刚提到了这个时间，你可以像人一样，从里面挑和现在这话题最搭的一句自然接上' +
+    '（比如"对啊你昨天不是说天气不错嘛"）——那是他真说过的事，放心引用。' +
+    '但不要一条条复述，不要提"记录""检索"这类字眼，也别把"你说"的内容安到他头上；' +
+    '和眼下无关的就让它过去，硬提反而怪：\n' +
+    rows.join('\n')
   );
 }
 
@@ -263,7 +452,7 @@ export function recallSection(hits: RetrievalHit[]): string {
  * `start`/`end` 是给调用方排除近期窗口用的**左闭右开**下标区间。
  */
 export function docsOf(
-  messages: ReadonlyArray<{ role: 'user' | 'assistant'; content: string }>,
+  messages: ReadonlyArray<{ role: 'user' | 'assistant'; content: string; ts?: number }>,
   range: { start?: number; end?: number } = {},
 ): RetrievalDoc[] {
   const list = Array.isArray(messages) ? messages : [];
@@ -280,7 +469,146 @@ export function docsOf(
     const reply = a && a.role === 'assistant' ? a.content : '';
     const ask = typeof u.content === 'string' ? u.content : '';
     if (ask.trim() === '' && reply.trim() === '') continue;
-    out.push({ index: i, ask, reply });
+    const ts = typeof u.ts === 'number' && Number.isFinite(u.ts) && u.ts > 0 ? u.ts : undefined;
+    const ai = aiTagsOf(u);
+    out.push({
+      index: i,
+      ask,
+      reply,
+      ...(ts !== undefined ? { ts } : {}),
+      ...(ai !== undefined ? { aiTags: ai } : {}),
+    });
   }
   return out;
+}
+
+/** 从原始消息里读 AI 标签，形状不对就当没有（宁可退回词典，也不信半截数据） */
+function aiTagsOf(msg: { aiTags?: unknown }): RetrievalDoc['aiTags'] | undefined {
+  const raw = (msg as { aiTags?: unknown }).aiTags;
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const o = raw as Record<string, unknown>;
+  if (!Array.isArray(o.topics)) return undefined;
+  const topics: string[] = [];
+  for (const t of o.topics) if (typeof t === 'string' && t.trim() !== '') topics.push(t.trim());
+  const mood = o.mood === 'pos' || o.mood === 'neg' || o.mood === 'neutral' ? o.mood : 'neutral';
+  const kind =
+    o.kind === 'question' || o.kind === 'plan' || o.kind === 'emotion' || o.kind === 'statement'
+      ? o.kind
+      : 'statement';
+  return { topics, mood, kind };
+}
+
+/**
+ * 按标签捞往事（2026-10-30 新增，用户指出「应该是多重分类」之后的第二路）。
+ *
+ * 场景：用户问「上次说的那只狗狗」「最近有什么开心的事」。
+ *   - 前者带"狗狗"，关键词检索能命中原文，没问题；
+ *   - 后者带"开心"，而原文是「好可爱」「赢了三把」——**一个字都不重合**。
+ * 只靠关键词，第二条问句必然空手而归。
+ *
+ * 所以一条记忆在入库时就带了三组标签（见 `./memory-tags`），这里按标签找。
+ * 返回顺序按「最近的优先」——问"最近"的时候，越近越可能是他要的那次。
+ */
+export function searchByTags(
+  docs: ReadonlyArray<RetrievalDoc>,
+  want: { topics?: string[]; mood?: Mood; kind?: string },
+  limit = 5,
+): RetrievalHit[] {
+  const list = Array.isArray(docs) ? docs : [];
+  const topics = Array.isArray(want?.topics) ? want.topics.filter((t) => typeof t === 'string' && t !== '') : [];
+  const mood = want?.mood;
+  const kind = want?.kind;
+  if (topics.length === 0 && mood === undefined && kind === undefined) return [];
+
+  const scored: RetrievalHit[] = [];
+  for (const d of list) {
+    if (!d) continue;
+    const tags = tagsFor(d);
+    let score = 0;
+    // 命中一个主题 +2；命中两个 +5（"狗狗"+"正面"比只命中一个更像用户要找的）
+    let hitTopics = 0;
+    for (const t of topics) if (tags.topics.includes(t)) hitTopics += 1;
+    if (hitTopics === 1) score += 2;
+    else if (hitTopics >= 2) score += 5;
+    if (mood !== undefined && tags.mood === mood) score += 2;
+    if (kind !== undefined && tags.kind === kind) score += 1;
+    if (score > 0) scored.push({ doc: d, score });
+  }
+  if (scored.length === 0) return [];
+  // 同分按时间新的靠前（没有 ts 的排后面，不能假装它是新的）
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.doc.ts ?? 0) - (a.doc.ts ?? 0);
+  });
+  return scored.slice(0, Math.max(1, Math.floor(Number(limit) || 5)));
+}
+
+/**
+ * 从一段用户原话里反推"他可能想找什么类别"。
+ *
+ * 只认**明确的类别说法**，不做泛化：
+ *   - 「开心的事」「高兴的事」→ mood=pos
+ *   - 「烦心事」「难过的事」→ mood=neg
+ *   - 「说过狗狗吗」「关于猫的」→ topics=['宠物']
+ * 没命中任何类别就返回 undefined，让调用方退回普通关键词检索——
+ * **不能因为这句话里有个"事"字就当成查分类**，那会把正常闲聊全变成档案调取。
+ */
+export function wantedTags(text: string): { topics?: string[]; mood?: Mood } | undefined {
+  const s = typeof text === 'string' ? text : '';
+  if (s.trim() === '') return undefined;
+
+  let mood: Mood | undefined;
+  if (/(开心|高兴|快乐|愉快|得意|顺利|好事|幸福|暖)/.test(s)) mood = 'pos';
+  else if (/(烦心|烦|难过|难受|伤心|糟心|不开心|倒霉|不顺|生气|崩溃)/.test(s)) mood = 'neg';
+
+  // 主题：直接用同一套词典反查。这里**必须复用 tagOf 的词典**，
+  // 否则"打标签用的词"和"查标签用的词"会漂移（改了一边忘了另一边）。
+  const topicSet = new Set(tagOf(s).topics);
+  let topics = topicSet.size > 0 ? [...topicSet] : undefined;
+
+  // 只有 theme 没有 mood 时必须**同时**带"翻旧账"的口气，才走标签路。
+  // 否则「今天天气怎么样」也会命中"天气"这个类目，把一堆旧天气记录塞进来——
+  // 那是在问窗外，不是在问我记忆里的事。实测这条不加就误伤。
+  if (topics !== undefined && mood === undefined && !RECALL_HINT.test(s)) topics = undefined;
+
+  if (mood === undefined && topics === undefined) return undefined;
+  return { ...(topics ? { topics } : {}), ...(mood !== undefined ? { mood } : {}) };
+}
+
+/** 「翻旧账」口气：说了这些词才是在问过去，而不是在问现在 */
+const RECALL_HINT = /上次|上回|之前|以前|从前|说过|提过|讲过|聊过|那次|那回|曾经|还记得|记不记得/;
+
+/**
+ * 取（并缓存）一条文档的标签。
+ *
+ * 为什么不存进 `memory.json`：标签是**原文的派生物**，
+ * 存了就得处理"原文改了标签没改"的一致性问题（任务2 要支持改历史原文）。
+ * 运行时算一次、按 `index + ask` 缓存，成本可忽略（词典扫一遍 0.05ms），
+ * 且改词表后立刻全量生效——不用回填数据。
+ */
+const tagCache = new Map<string, MemoryTags>();
+
+function tagsFor(doc: RetrievalDoc): MemoryTags {
+  const key = doc.index + '\u0000' + doc.ask;
+  const hit = tagCache.get(key);
+  if (hit) return hit;
+  // AI 补标过的以 AI 为准，词典只补它判断"拿不准就留空"的那几个字段。
+  const tags = mergeTags(tagOf(doc.ask), doc.aiTags);
+  // 缓存上限：档案几万条时不能让 Map 无限涨，超了就先清空（简单且够用）
+  if (tagCache.size > 20_000) tagCache.clear();
+  tagCache.set(key, tags);
+  return tags;
+}
+
+/**
+ * 把标签拼进检索用的文本。
+ *
+ * 关键设计：不另建一套索引，而是让 `buildIndex` 扫 `ask + tagText(tags)`。
+ * 好处是直接复用已有的 IDF 加权和四道噪声过滤——
+ * 用户问"开心"，"开心"命中标签、"好可爱"命中原文，两路分数在**同一次打分**里融合，
+ * 不需要再做 RRF 之类的事后合并。
+ */
+export function searchableTextOf(doc: RetrievalDoc): string {
+  const tagWords = tagText(tagsFor(doc));
+  return tagWords === '' ? doc.ask : doc.ask + ' ' + tagWords;
 }

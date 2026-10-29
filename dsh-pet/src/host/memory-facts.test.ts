@@ -255,11 +255,25 @@ describe('search：IDF 评分', () => {
     assert.equal(hits[0].doc.ask.includes('杭州'), true);
   });
 
-  test('同义词对不上是已知边界（必须由事实卡兜住，不能靠检索）', () => {
+  test('标签层已经把「宠物」这类近义词接上了（2026-10-30 加了话题标签之后）', () => {
     const idx = buildIndex(docs);
     const hits = search(idx, '我有没有宠物', 3);
-    // 问句里没有「猫」，bigram 天然命中不了 —— 这条断言是**故意的**：
-    // 它把「A 类事实必须常驻」这个设计前提钉在测试里，防止后人误以为检索够用。
+    // 问句里没有「猫」，bigram 本来命不中；现在文档侧索引源是 `ask + tagText(tags)`，
+    // 「我养了一只猫叫团子」带 `宠物` 标签，所以「宠物」这个词能对上。
+    // ——这条不是回退，是标签层把原来钉着的边界**修好了**，旧断言必须跟着改。
+    assert.equal(
+      hits.some((h) => h.doc.ask.includes('团子')),
+      true,
+      '标签层要负责把「宠物」↔「猫」接上',
+    );
+  });
+
+  test('真正的同义边界还在（词表没覆盖的说法仍要靠事实卡兜住）', () => {
+    const idx = buildIndex(docs);
+    const hits = search(idx, '我有没有毛孩子', 3);
+    // 「毛孩子」只 tag 到「家人」，跟「宠物」类目对不上，bigram 也命不中 → 仍然查不到。
+    // 这条把「A 类事实必须常驻」的设计前提继续钉在测试里：**检索永远有缝**，
+    // 缝由 L0 事实卡兜（extractFacts 实测能把「我养了一只猫叫团子」抽成 pet=猫·团子）。
     assert.equal(
       hits.some((h) => h.doc.ask.includes('团子')),
       false,
@@ -309,9 +323,17 @@ describe('search：噪声抑制（真实数据踩到的坑）', () => {
 
   test('只蹭到虚词的档不返回（把「有什么」当话题会污染回填段）', () => {
     const idx = buildIndex(docs);
-    const hits = search(idx, '我有没有宠物', 3);
-    // 这四个字的 bigram 在往事里都没出现 → 必须 0 命中，不能靠「没有」蒙到文件路径那两条
+    // 「我有没有毛孩子」：跟「宠物」类目对不上，bigram 在往事里也没出现
+    // → 必须 0 命中，不能靠「没有」蒙到文件路径那两条
+    const hits = search(idx, '我有没有毛孩子', 3);
     assert.deepEqual(hits, []);
+  });
+
+  test('问「之前说过什么」不返回一堆无关旧档（空查询语义）', () => {
+    const idx = buildIndex(docs);
+    // 这句话只有虚词（之前/说过/什么），没有话题词 → 检索层应当交白卷，
+    // 由上层走「时间窗 / 事实卡」那条路，而不是把整库往事糊上来
+    assert.deepEqual(search(idx, '我之前说过什么来着', 3), []);
   });
 
   test('命中文档过半的 bigram 不作为相关性证据', () => {

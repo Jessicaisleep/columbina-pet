@@ -111,11 +111,18 @@ const GLOBAL_DEFAULT_KEYS = [
   'memoryCompressRounds',
   'memoryKeepRounds',
   'memoryRecallK',
-  // 群聊记忆（2026-10-29）：单人 / 群聊是一套**用户级**选择——同一个人不可能"这只宠物认人、
+  // 群聊记忆（2026-10-30 改结构）：**用户级**选择——同一个人不可能"这只宠物认人、
   // 那只不认人"，也没法按种类分开（群里就一个 bot 实例）。所以放全局默认。
+  //
+  // `memoryMode` 只留作**向后兼容的只读键**：老配置文件里写着 'group' 也不会再切模式
+  // （模式改由 sender 决定）。保留它是为了老配置读取不报错、导入导出不丢字段。
   'memoryMode',
+  // 群聊机器人总开关（默认关）+ 主人绑定三件套
+  'groupBotEnabled',
   'groupMemoryScope',
   'groupMemoryRecentN',
+  'ownerQq',
+  'ownerSyncEnabled',
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
@@ -437,11 +444,18 @@ function topFieldValid(key: string, value: unknown): boolean {
       const n = Number(value);
       return Number.isFinite(n) && n >= 0 && n <= 50;
     }
-    // 群聊记忆三件套（2026-10-29）：模式 / 档位 / N。
+    // 群聊记忆（2026-10-30 改结构）。
     // 与上面几个"非负有限数字"的字段不同，这里**必须逐个取值校验**——因为非法值不能静默
-    // 回落成默认（`memoryMode: 'gruop'` 拼错静默变单人模式，用户会以为"群聊没生效"而不是"我打错了"）。
+    // 回落成默认（`groupMemoryScope: 'recentt'` 拼错静默变 everyone，用户会以为"设置了没用"）。
+    //
+    // `memoryMode` 已**废弃**（保留只读兼容）：模式不再由开关决定，而由**这条消息有没有
+    // sender** 决定——桌面端对话没有 sender → 单人；QQ 群来的一定带 sender → 群聊。
+    // 开关强行指定模式只会制造「主人在桌面说话，却写进了群聊流」这种串味。
     case 'memoryMode':
       return value === 'single' || value === 'group';
+    /** QQ 群机器人总开关，默认关（收到 DSH 从未配过 QQ，开着的默认值会让所有人吓一跳） */
+    case 'groupBotEnabled':
+      return typeof value === 'boolean';
     case 'groupMemoryScope':
       return value === 'everyone' || value === 'recent';
     case 'groupMemoryRecentN': {
@@ -449,6 +463,18 @@ function topFieldValid(key: string, value: unknown): boolean {
       const n = Number(value);
       return Number.isFinite(n) && n >= 1 && n <= 100;
     }
+    /**
+     * 主人绑定（2026-10-30）：把「谁在主人在群里」这件事从猜测变成一条显式配置。
+     *
+     * 三件套一起校验而不是各自放过：只配了 `ownerQq` 没配开关，等于「知道他是主人
+     * 但我不用」；只配了开关没配 QQ，等于「想同步但没有钥匙」。这两种半配置状态
+     * 都应当被明确拒掉，而不是悄悄降级。
+     */
+    case 'ownerQq':
+      // QQ 号在配置里按字符串存（前导零、超 2^53 的长号都不会被数字精度吃掉）
+      return typeof value === 'string' && (value === '' || /^\d{4,15}$/.test(value));
+    case 'ownerSyncEnabled':
+      return typeof value === 'boolean';
     case 'chatImageLimit': {
       // 对话配图张数上限：非负数字（0 = 不限制）；小数按消费者 Math.floor 取整
       const n = Number(value);
@@ -962,6 +988,13 @@ export function saveUserConfig(
   if (gms !== undefined && !topFieldValid('groupMemoryScope', gms)) return null;
   const gmrn = o.groupMemoryRecentN;
   if (gmrn !== undefined && !topFieldValid('groupMemoryRecentN', gmrn)) return null;
+  // 群聊机器人开关 + 主人绑定（2026-10-30）
+  const gbe = o.groupBotEnabled;
+  if (gbe !== undefined && !topFieldValid('groupBotEnabled', gbe)) return null;
+  const oq = o.ownerQq;
+  if (oq !== undefined && !topFieldValid('ownerQq', oq)) return null;
+  const ose = o.ownerSyncEnabled;
+  if (ose !== undefined && !topFieldValid('ownerSyncEnabled', ose)) return null;
   // ---- 读屏 / 助手（2026-10-26 新增）：与上面几个全局字段同一套语义 ----
   // 传了就校验后进白名单，没传则走下面的透传保留（用户手改的值原样不动）。
   const sce = o.screenContextEnabled;
@@ -1003,6 +1036,10 @@ export function saveUserConfig(
   if (mmode !== undefined) outConfig.memoryMode = mmode;
   if (gms !== undefined) outConfig.groupMemoryScope = gms;
   if (gmrn !== undefined) outConfig.groupMemoryRecentN = Number(gmrn);
+  // 群聊机器人开关 + 主人绑定（2026-10-30）：布尔原样，QQ 号存字符串（保住前导零）
+  if (gbe !== undefined) outConfig.groupBotEnabled = gbe;
+  if (oq !== undefined) outConfig.ownerQq = String(oq);
+  if (ose !== undefined) outConfig.ownerSyncEnabled = ose;
   // 读屏与助手：布尔原样存，黑名单做一次去空白/去重/去空串再落盘
   if (sce !== undefined) outConfig.screenContextEnabled = sce;
   if (sep !== undefined) {
@@ -1045,6 +1082,9 @@ export function saveUserConfig(
   if (mmode !== undefined) bodyOwned.add('memoryMode');
   if (gms !== undefined) bodyOwned.add('groupMemoryScope');
   if (gmrn !== undefined) bodyOwned.add('groupMemoryRecentN');
+  if (gbe !== undefined) bodyOwned.add('groupBotEnabled');
+  if (oq !== undefined) bodyOwned.add('ownerQq');
+  if (ose !== undefined) bodyOwned.add('ownerSyncEnabled');
   if (sce !== undefined) bodyOwned.add('screenContextEnabled');
   if (sep !== undefined) bodyOwned.add('screenExcludePatterns');
   if (ae !== undefined) bodyOwned.add('assistantEnabled');

@@ -434,7 +434,12 @@ test('bounded body replay preserves plugin readBody; chunked and stalled inputs 
     port: 0,
     security,
     logger: silent,
-    bodyTimeoutMs: 30,
+    // ⚠️ 这个超时要给得足够宽，否则本用例本身会变成竞态：
+    // 下面第一条 chunked 要先写 1MB+1 字节才越限，30ms 里写不完就会被**超时**先拒（408），
+    // 而断言期望的是**超限**（413）。两个分支都对，但答案取决于机器当时有多快。
+    // 修法：把超时放宽到 500ms，让"超限"这条路径先到；第二条 chunked 永不 end，
+    // 仍然会稳定地撞 500ms 超时拿到 408。这样不依赖竞速。
+    bodyTimeoutMs: 500,
     routes: [
       {
         kind: 'prefix',

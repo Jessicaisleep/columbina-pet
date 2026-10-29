@@ -26,7 +26,7 @@
 
 import type { ChatMemoryMessage } from './chat';
 import type { MemoryFact } from './memory-facts';
-import type { GroupMember } from './memory-group';
+import type { GroupMember, GroupMemory } from './memory-group';
 
 /**
  * memory.json 里一只宠物对应的叶子。
@@ -62,6 +62,23 @@ export interface ChatMemoryEntry {
    * 没有 `sender`，会被当成「不知道是谁说的」，这是诚实的处理，不是丢数据）。
    */
   members?: Record<string, GroupMember>;
+  /**
+   * 按群分开的记忆流（2026-10-30，任务1「单人/群聊并存」）。
+   *
+   * 为什么要和 `messages` 分开存：用户的原话是「单人是单人，群聊是群聊」——一个群里的
+   * 聊天记录不该污染一对一陪伴的上下文，否则主人在群里说了句话，回桌面聊时桌宠会
+   * 带上整个群的气氛。所以**群聊走 `groups[群号]`，单人走 `messages`，两边互不写入**。
+   *
+   * key = 群标识（QQ 群号）。值是独立的 GroupMemory（自己的消息流、摘要、成员桶），
+   * 形状与单人条目一致，压缩/检索那套代码可以直接复用。
+   */
+  groups?: Record<string, GroupMemory>;
+  /**
+   * 主人在群里的发言镜像到单人流的游标（2026-10-30）。
+   *
+   * 只记「镜像到第几条群消息」用于防重复；`ownerSyncEnabled` 关掉时本字段不变。
+   */
+  ownerUpto?: Record<string, number>;
 }
 
 /** 未摘要轮数超过它 → 自动压缩（1 轮 = 1 问 1 答 = 2 条消息） */

@@ -105,6 +105,7 @@ import { listBalanceProviders, queryBalance, registerBalanceProvider } from './b
 import { generateWhisper } from './whisper';
 import { automaticWhisperSchedule, type StandaloneWhisperPolicy } from './whisper-policy';
 import { generateChat, generateMemorySummary } from './chat';
+import type { ChatMemoryMessage } from './chat';
 import {
   buildSummaryUserText,
   compressPolicyOf,
@@ -120,18 +121,24 @@ import {
 import { configuredModel } from './model-selection';
 import { limitPool, pickMeme, readMemePool } from './memes';
 import { extractFacts, factsSection, mergeFacts, pruneFacts } from './memory-facts';
+import { AI_TAG_BATCH, aiTagPrompt, mergeTags, parseAiTags, tagOf } from './memory-tags';
 import {
   clampRecentN,
+  groupOf,
   groupSection,
   membersOf,
   normalizeScope,
+  ownerMirrorMessage,
   parseSender,
   planMemberEviction,
+  shouldMirrorOwner,
   touchMember,
   userMessageFor,
   type GroupScope,
+  type Sender,
 } from './memory-group';
-import { buildIndex, docsOf, recallSection, search } from './memory-retrieval';
+import { buildIndex, dayTrace, docsOf, recallSection, search, searchByTags, traceSection, wantedTags } from './memory-retrieval';
+import { looksLikeRecall, parseTimeRange } from './memory-time';
 import {
   decideBroadcast,
   decideBubbleClear,
@@ -1156,6 +1163,122 @@ export function apply(ctx: any): void {
   // userMessageFor 在 ./memory-group（纯函数，便于单测）
 
   /**
+   * AI 补标（**补路**，不是主路）：把还没被模型看过的消息**攒成批**送去打标签（2026-10-30）。
+   *
+   * 分工在 `memory-tags.ts` 顶部写清楚了，这里只说落点：
+   *   - 主路是**同轮搭车**——模型在回复末尾附 `[标:…]`，host 剥掉后直接写进这条消息的 `aiTags`；
+   *   - 本函数只兜**历史消息**：加这个功能之前攒下的老消息永远不会有标记，
+   *     以及某次模型没遵守格式（`[标:||]` 或干脆没写）的那些。
+   *   - `pendingTagTargets` 按「没有 `aiTags` 键」筛，所以同轮已经打过标的**不会被重复补**。
+   *
+   * 为什么还留着后台这条：模型没配好/离线/被 ACL 挡住的机器上它直接跳过，
+   * 而词典那条路（同步、0.05ms、永远可用）仍然在每次检索时实时算，谁也不会因为 AI 不可用而失忆。
+   *
+   *   - 每轮对话结束**不等它**（`void` 调用），失败只 warn，用户完全感觉不到；
+   *   - 一次最多 `AI_TAG_BATCH` 条，一次云端往返摊到 20 条上；
+   *   - 打过的写进消息的 `aiTags` 并落盘，**补过就不重补**（下次直接跳过）。
+   *
+   * 这里刻意不加锁：两轮对话并发进来可能各补一批，最坏是同一批被打两次标签，
+   * 结果一样（幂等覆盖），比加锁让聊天排队划算得多。
+   */
+  const aiTagQueue: Array<{
+    entry: ChatMemoryEntry;
+    /** 补标成功后由调用方负责落盘（它才知道 entryKey / petId） */
+    persist: (tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>) => Promise<void>;
+  }> = [];
+  let aiTagRunning = false;
+
+  const pendingTagTargets = (entry: ChatMemoryEntry): Array<{ msg: ChatMemoryMessage; at: number }> => {
+    const out: Array<{ msg: ChatMemoryMessage; at: number }> = [];
+    const list = Array.isArray(entry.messages) ? entry.messages : [];
+    for (const m of list) {
+      if (!m || m.role !== 'user') continue;
+      if (typeof m.content !== 'string' || m.content.trim() === '') continue;
+      const has = (m as { aiTags?: unknown }).aiTags;
+      if (typeof has === 'object' && has !== null) continue;
+      out.push({ msg: m, at: typeof m.ts === 'number' ? m.ts : 0 });
+    }
+    return out;
+  };
+
+  const runAiTagging = async (): Promise<void> => {
+    if (aiTagRunning) return;
+    const svc = optionalService('standaloneAi') as
+      | { isReady?: () => boolean; stream?: (options: unknown) => AsyncIterable<{ type: string; text?: string }> }
+      | undefined;
+    if (!svc || typeof svc.stream !== 'function' || typeof svc.isReady !== 'function') return;
+    try {
+      if (!svc.isReady()) return;
+    } catch {
+      return;
+    }
+    aiTagRunning = true;
+    try {
+      while (aiTagQueue.length > 0) {
+        const job = aiTagQueue.shift();
+        if (!job) break;
+        const targets = pendingTagTargets(job.entry).slice(0, AI_TAG_BATCH);
+        if (targets.length === 0) continue;
+        const texts = targets.map((t) => t.msg.content);
+        let raw = '';
+        try {
+          const stream = svc.stream({
+            messages: [{ role: 'user', content: aiTagPrompt(texts) }],
+          });
+          for await (const chunk of stream) {
+            if (chunk && chunk.type === 'text' && typeof chunk.text === 'string') raw += chunk.text;
+          }
+        } catch (e) {
+          log.warn('[dsh-pet] AI 补标请求失败（本轮跳过，下次再试）：' + (e instanceof Error ? e.message : String(e)));
+          continue;
+        }
+        const parsed = parseAiTags(raw, texts.length);
+        const at = Date.now();
+        const done: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }> = [];
+        parsed.forEach((tags, i) => {
+          if (!tags) return;
+          // 兜底：模型只给了 topics、mood/kind 留空时，用词典那套补上
+          const merged = mergeTags(tagOf(targets[i].msg.content), tags);
+          const value = { topics: merged.topics, mood: merged.mood, kind: merged.kind, at };
+          targets[i].msg.aiTags = value;
+          done.push({ content: targets[i].msg.content, ts: targets[i].at, aiTags: value });
+        });
+        if (done.length === 0) continue;
+        log.info(`[dsh-pet] AI 补标 ${done.length} 条（词典标签已升级，之后不再重复）`);
+        // 落盘交给调用方：它知道 entryKey/petId，也只有它能安全地再读一次文件
+        try {
+          await job.persist(done);
+        } catch (e) {
+          // 落盘失败不算致命：内存里的标签本次会话仍然生效，下次会重新补
+          log.warn('[dsh-pet] 补标落盘失败（内存里仍生效）：' + (e instanceof Error ? e.message : String(e)));
+        }
+      }
+    } finally {
+      aiTagRunning = false;
+    }
+  };
+
+  /**
+   * 排队让 AI 补标。**绝不抛异常、绝不阻塞调用方**。
+   *
+   * `persist` 由调用方给：补标那条链跑在后台，跑完时它已经不在 `withMemoryLock` 里了，
+   * 必须自己再读-改-写一次（否则会把期间新增的消息覆盖掉）。
+   */
+  const scheduleAiTagging = (
+    entry: ChatMemoryEntry,
+    persist: (tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>) => Promise<void>,
+  ): void => {
+    try {
+      if (pendingTagTargets(entry).length === 0) return;
+      aiTagQueue.push({ entry, persist });
+      // `void` + 内部 try/catch：补标失败不能影响聊天
+      void runAiTagging();
+    } catch (e) {
+      log.warn('[dsh-pet] 补标排队异常（已忽略）：' + (e instanceof Error ? e.message : String(e)));
+    }
+  };
+
+  /**
    * 群聊模式下记一次发言：更新成员桶 + 淘汰超出策略的人。
    *
    * 单人模式**完全不执行**（连 `members` 键都不建）——否则单人用户的 memory.json 里会
@@ -1167,12 +1290,12 @@ export function apply(ctx: any): void {
   const recordGroupSpeaker = (
     entry: ChatMemoryEntry,
     conf: Record<string, unknown>,
-    mode: 'single' | 'group',
+    isGroup: boolean,
     sender: { id: string; name?: string } | undefined,
     text: string,
     now: number,
   ): void => {
-    if (mode !== 'group' || !sender || !sender.id) return;
+    if (!isGroup || !sender || !sender.id) return;
     try {
       const group = entry as unknown as Parameters<typeof touchMember>[0];
       touchMember(group, sender.id, sender.name, text, now);
@@ -1193,6 +1316,49 @@ export function apply(ctx: any): void {
   };
 
   // parseSender / userMessageFor 都在 ./memory-group（纯函数，便于单测）
+
+  /**
+   * 主人在群里说的话，镜像一份进**单人流**（2026-10-30 任务1）。
+   *
+   * 要解决的原始痛点（用户原话）：「主人刚在群里和桌宠说话，再回来，从桌面和桌宠对话时，
+   * 桌宠不记得主人在群里说了什么」。群里那份记录在 `entry.groups[群号]` 里，桌面端读的是
+   * `entry.messages`——两份互不写入，不镜像就必然「回来就不认」。
+   *
+   * 三个边界：
+   *  1. **只镜像主人自己的话**（`shouldMirrorOwner` 比对 `ownerQq`）。群里别人说的话进单人流，
+   *     就等于把陌生人的话当成一对一私聊的上下文——那正是要分开的东西。
+   *  2. **不镜像宠物的回复**：单人流里如果只有主人的问句没有答句，成轮切分时它会被当成
+   *     「半轮」保留（`docsOf` 支持半轮），检索仍能命中，而不会伪造一段宠物在桌面上没说过的话。
+   *  3. **正文前置群名标注**（用户要求「这里需要标注是在哪个群里的互动」）：模型只看
+   *     role+content，字段它看不见，所以必须在正文里写「（在「XX群」里说的）」。
+   *
+   * 失败只 warn 不冒泡——镜像属记忆增强，不能让它拖垮这次回复。
+   */
+  const mirrorOwnerIfNeeded = (
+    entry: ChatMemoryEntry,
+    conf: Record<string, unknown>,
+    sender: { id: string; name?: string; group?: string; groupName?: string } | undefined,
+    text: string,
+    now: number,
+  ): void => {
+    if (!sender || !sender.id) return;
+    if (!shouldMirrorOwner(conf, sender.id)) return;
+    try {
+      const gid = String(sender.group ?? '').trim() || 'default';
+      const gname = typeof sender.groupName === 'string' ? sender.groupName : undefined;
+      entry.messages.push(ownerMirrorMessage(text, now, gname));
+      // 刻意**不**把这条的话抽进单人流的 L0 事实卡。
+      // 理由（2026-10-30 用户定）：L0 是"不问你我也知道"的那一层，把群里的只言片语直接
+      // 抬进常驻卡，会让桌宠在没有上下文的情况下突然"知道"一堆事，反而怪。
+      // 只留一条带群名标注 + 时间戳的原始记录，需要时由 L3 检索按关键词捞回来——
+      // 这样"记得"是有出处的，而不是凭空长出来的常识。
+      // 游标记到「这个群的流里第几条」，仅作排查线索（不做去重键——同一句话用户真的可能说两遍）
+      entry.ownerUpto = { ...(entry.ownerUpto ?? {}), [gid]: now };
+      log.info(`[dsh-pet] 主人群内发言已镜像进单人流 group=${gid}（${text.length} 字）`);
+    } catch (e) {
+      log.warn('[dsh-pet] 主人发言镜像异常（已忽略）：' + (e instanceof Error ? e.message : String(e)));
+    }
+  };
 
   /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：   *  每只宠物独立生成（人设 = 它自己的 whisperPrompt，没写回落到所属条目）。生成成功就写进 S 的 pets.<id>.say——
    *  碎碎念 / 命令气泡 / 对话回复在前端本来就是**同一条展示链路**（同一个 triggerWhisper、
@@ -1337,7 +1503,7 @@ export function apply(ctx: any): void {
      * 在两个模式下会走出不同的记忆形状，排查起来是灾难）。
      * 群聊模式下 `id` 必填（缺了就没有分桶的依据，只能按单人处理并记日志）。
      */
-    sender?: { id: string; name?: string },
+    sender?: Sender,
   ): Promise<
     | { ok: true; text: string; image?: string }
     | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
@@ -1354,6 +1520,20 @@ export function apply(ctx: any): void {
       // 记忆**先读**：system 要拼「长期记忆」段（摘要常驻提示词），所以读盘必须排在拼装之前。
       const mem = await readMemory();
       const entry = memoryEntryOf(mem, found.entry, petId);
+      /**
+       * 模式判定（2026-10-30 任务1）：**由「这条消息有没有 sender」决定，不看配置开关**。
+       *
+       * 用户的原话把两个入口说得很清楚：桌宠对话框 = 单人陪伴，QQ 群 = 群机器人。
+       * 用配置开关强行指定模式会制造「主人在桌面说话却写进群聊流」这种串味，而这正是要修的 bug。
+       * 带 sender 的请求物理上就来自群里（NapCat/OneBot 一定会给 QQ 号），不带的就是桌面端。
+       */
+      const isGroup = !!(sender && sender.id);
+      /** 群标识：请求里带 `group` 就用它，否则归到 `default` 桶（本地自测/没传群号时不会散成一堆） */
+      const groupId = isGroup ? String(sender?.group ?? '').trim() || 'default' : '';
+      // 群记忆与单人记忆**分两份存**：`entry.groups[群号]` vs `entry.messages`，互不写入。
+      const group = isGroup ? groupOf(entry, groupId, log) : undefined;
+      /** 本轮真正读写的记忆流：群聊 = 那个群的，单人 = 本人的 */
+      const target: ChatMemoryEntry = group ?? entry;
       // 人设：实例级 whisperPrompt 优先，没写回落所属条目（与碎碎念同一拼装）。
       // 末尾追加长期记忆段——`memorySection` 在摘要为空时返回空串，拼出来的 system 与改造前**逐字一致**，
       // 所以没压缩过的宠物行为不变。
@@ -1364,41 +1544,101 @@ export function apply(ctx: any): void {
       // 事实卡（L0，2026-10-29）：常驻、永不压缩。放在摘要**之前**——
       // 摘要是「往事叙述」（有损），事实卡是「确定的事」（按键覆盖），重要度更高，位置也更靠前。
       // 缺键（旧数据）→ `factsSection([])` 返回空串，拼出来的 system 与改造前逐字一致。
-      const facts = Array.isArray(entry.facts) ? entry.facts : [];
+      const facts = Array.isArray(target.facts) ? target.facts : [];
       const baseSystem =
-        petSystemPrompt(found) + factsSection(facts) + memorySection(entry.summary ?? '');
+        petSystemPrompt(found) + factsSection(facts) + memorySection(target.summary ?? '');
       // 检索回填（L3，2026-10-29）：只从**既不在摘要、也不在近期窗口**的那段里捞。
       // 那段正是旧框架的「黑洞」（实测真实数据 28 条 / 61% 完全不可见）。
       // k 来自 `memoryRecallK`（0 = 关闭）；关闭时整段不参与，system 与原来逐字一致。
+      //
+      // 时间维度（2026-10-30）：用户问「上周一我们聊了什么」时，`上周一` 这三个字
+      // 不会出现在往事正文里，字面检索必然空手而归。所以先解析问句里的时间说法：
+      //   命中时间区间 → **按 ts 筛**（这条路的召回归时间管，不靠关键词）；
+      //   没命中时间说法 → 走原来的关键词检索（一个字都不变）。
+      // 两条路不叠加：时间查询已经限定了范围，再叠关键词排序会把"那天聊的其他事"全滤掉，
+      // 而用户问的恰恰是"那天我们聊了什么"——他要的是那天的全貌，不是那天的某个话题。
       const recallK = recallCount(found.conf);
       const recallText = ((): string => {
         if (recallK <= 0) return '';
-        const summarized = summarizedOf(entry);
-        const windowStart = Math.max(summarized, entry.messages.length - rounds * 2);
-        const docs = docsOf(entry.messages, { start: summarized, end: windowStart });
+        const summarized = summarizedOf(target);
+        const windowStart = Math.max(summarized, target.messages.length - rounds * 2);
+        const docs = docsOf(target.messages, { start: summarized, end: windowStart });
         if (docs.length === 0) return '';
-        return recallSection(search(buildIndex(docs), text, recallK));
+        // `now` 这个变量在下面几行才声明，这里只能用当前时间
+        //（差值在毫秒级，对"昨天/上周"这种日粒度没有影响）。
+        const nowDate = new Date();
+        // 时间维度（2026-10-30，用户反复追问后定稿）：
+        //
+        // 用户给的场景：「今天下雨，主人说"哎呀昨天应该出去玩的"，
+        //               宠物该接"对啊你昨天说天气不错"」。
+        //
+        // 我第一版写错了两次，两次都是同一个毛病——**替模型决定它该看见什么**：
+        //   ① 先写成「像在问才给」→ 那句不是提问，宠物手上空的，接不上；
+        //   ② 再写成「时间筛 + top-3」→ 昨天聊了 12 轮，捞回的是
+        //      「今天赢了三把/困了早点睡/明天见」，**"天气不错"被挤掉了**（探针 _probe_scene.mjs 可复现）。
+        //
+        // 人要接上那句话，靠的不是"最近三条记忆"，是**那一天的样子**：
+        // 早上干嘛、中午吃啥、下午开会、晚上打游戏——然后从里面挑出和"出去玩"最搭的那句天气。
+        // 所以现在改成：时间词一出现，就把那天**整段**给它（按时间正序），挑哪句是模型的事。
+        //
+        // 这是"【日期】分类"这个说法落到代码上的样子：时间负责圈定范围，相关度在范围**之内**起作用。
+        // 之前理解成"时间 or 关键词二选一"是错的。
+        const span = parseTimeRange(text, nowDate);
+        // 只对**过去**的时间翻档案：「今天」的事就在眼前（近期窗口已覆盖），再翻只会重复。
+        // 留 60 秒余量，避免"刚刚/刚才"这种贴着当下说的词被当成未来。
+        const isPast = span ? span.to <= nowDate.getTime() + 60_000 : false;
+        if (span && isPast) {
+          const trace = dayTrace(docs, span, { max: 40, clip: 60, query: text });
+          if (trace.lines.length > 0) {
+            return traceSection(trace.lines, span.label, {
+              now: nowDate,
+              clip: 60,
+              total: trace.total,
+              truncated: trace.truncated,
+            });
+          }
+          // 那段时间一条都没有：只在**明确在问**时说出来。
+          // 顺口提一句的场合说了反而奇怪——"昨天应该出去玩的"不能回一句
+          // "那段时间没有记录"，那是机器的说法，不是人的。
+          if (looksLikeRecall(text)) {
+            return `\n\n【时间检索】用户提到了「${span.label}」，但那段时间里没有更早的聊天记录可查（可能在近期对话里，或那时候还没聊过）。不要编造那段时间发生过什么。`;
+          }
+          return '';
+        }
+        // 第三路：按**类别**找（2026-10-30，用户指出「应该是多重分类」之后加的）。
+        //
+        // 用户的原话：「'今天天气不错'这句话，在人类大脑中，即是昨天说的话，也是天气类表述。
+        // 而另一句，比如'今天出门看见一只狗狗好可爱'，即是日期相关，也是狗狗这个类别里，
+        // '好可爱'还是一个正面情感类别里」。
+        //
+        // 这句话点出前一版的漏洞：我只做了「时间」这一个维度。
+        // 于是问「最近有什么开心的事」时——原文里根本没有"开心"两个字
+        //（是"好可爱""赢了""不错"），关键词检索必然空手；
+        // 而这句话里也没有任何时间词，时间那一路也不会触发。
+        //
+        // 现在：先看这句话有没有明说类别（开心/烦心/狗狗…），有就先走标签路；
+        // 走不通再退回关键词。**不能因为有个"事"字就当查档案**——那会把闲聊变成背诵。
+        const wanted = wantedTags(text);
+        if (wanted) {
+          const byTag = searchByTags(docs, wanted, recallK);
+          if (byTag.length > 0) {
+            return recallSection(byTag, { now: nowDate }).replace(
+              '【想起的往事】',
+              `【想起的往事·${[wanted.mood === 'pos' ? '开心的' : wanted.mood === 'neg' ? '烦心的' : '', ...(wanted.topics ?? [])].filter((s) => s !== '').join('·')}】`,
+            );
+          }
+        }
+        return recallSection(search(buildIndex(docs), text, recallK), { now: nowDate });
       })();
-      // 群聊段（L0'，2026-10-29）：单人模式**一个字也不加**（`groupSection` 只在 group 模式被调，
-      // 此时拼出来的 system 与改造前逐字一致）。
+      // 群聊段（L0'，2026-10-29）：单人模式**一个字也不加**。
       //
       // 位置很有讲究：放在「事实卡 + 摘要」之后、读屏之前。理由是它在语义上属于"关于人的记忆"，
       // 与上面两段连成一串；而读屏是"此刻环境"，属于另一个维度，夹在中间会让模型误以为
       // 「现在跟你说话的是张三」也是屏幕读出来的。
-      const mode = memoryModeOf(found.conf);
       const gpol = groupPolicyOf(found.conf);
       let groupText = '';
-      if (mode === 'group') {
-        // 没有 sender 就不分桶（例如手写 HTTP 调用没带 sender）：按单人处理，
-        // 但要留下日志——否则用户会以为"群聊开着，怎么还是不分人"，却查不到任何线索。
-        if (sender && sender.id) {
-          groupText = groupSection(entry, gpol.scope, gpol.recentN, sender);
-        } else {
-          log.warn(
-            `[dsh-pet] memoryMode=group 但这次请求没带 sender（pet=${petId}），本条按单人处理、不分桶`,
-          );
-          groupText = groupSection(entry, gpol.scope, gpol.recentN);
-        }
+      if (group) {
+        groupText = groupSection(group, gpol.scope, gpol.recentN, sender);
       }
       const system =
         (chatScreen === '' ? baseSystem + groupText : baseSystem + groupText + '\n' + chatScreen) + recallText;
@@ -1411,7 +1651,7 @@ export function apply(ctx: any): void {
       // rounds = 0（用户关掉历史）→ 空历史；否则截尾部 rounds 轮（1 轮 = 1 问 1 答）。
       // 不能写 slice(-rounds * 2)：-0 在 JS 里 === 0，slice(-0) 返回整个数组而不是空。
       // 已摘要的那部分**本来就不该进上下文**（它们的内容已由摘要承载），从 summarized 之后开始截。
-      const live = entry.messages.slice(summarizedOf(entry));
+      const live = target.messages.slice(summarizedOf(target));
       const list = sliceMemoryRounds(live, rounds);
       const acfg = assistantConfigOf(found.conf);
 
@@ -1482,15 +1722,31 @@ export function apply(ctx: any): void {
         }
         // 成功：记忆存正文（动作明细不进对话历史，避免把工具日志当聊天记录读回去）
         const now2 = Date.now();
-        entry.messages.push(userMessageFor(text, now2, sender, mode));
-        entry.messages.push({ role: 'assistant', content: outcome.text, ts: now2 });
+        target.messages.push(userMessageFor(text, now2, sender, isGroup ? 'group' : 'single'));
+        target.messages.push({ role: 'assistant', content: outcome.text, ts: now2 });
         // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）
-        learnFacts(entry, text, now2);
+        learnFacts(target, text, now2);
         // 群聊成员桶（同位置：与消息一次落盘）
-        recordGroupSpeaker(entry, found.conf, mode, sender, text, now2);
+        recordGroupSpeaker(target, found.conf, isGroup, sender, text, now2);
+        // 主人群内发言镜像进单人流（2026-10-30 任务1）
+        mirrorOwnerIfNeeded(entry, found.conf, sender, text, now2);
         await writeMemory(mem);
+        // AI 补标排队（不阻塞本轮回复；补完自己再读-改-写一次落盘）
+        scheduleAiTagging(target, async (tagged) => {
+          await withMemoryLock(async () => {
+            const fresh = await readMemory();
+            const e2 = memoryEntryOf(fresh, found.entry, petId);
+            for (const t of tagged) {
+              const msg = e2.messages.find(
+                (m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts,
+              );
+              if (msg) msg.aiTags = t.aiTags;
+            }
+            await writeMemory(fresh);
+          });
+        });
         try {
-          await compressMemory(mem, entry, found.conf);
+          await compressMemory(mem, target, found.conf);
         } catch (e) {
           log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
         }
@@ -1507,20 +1763,41 @@ export function apply(ctx: any): void {
       const generated = await generateChat(ctx, system, list, text, pool, configuredModel(found.conf, 'chatModel'));
       if (!generated.ok) return generated;
       const now = Date.now();
-      entry.messages.push(userMessageFor(text, now, sender, mode));
+      const userMsg = userMessageFor(text, now, sender, isGroup ? 'group' : 'single');
+      // 同轮搭车（用户 m09397/m09441 定的主路）：模型在回复末尾附了 `[标:…]`，host 已解析并剥除，
+      // 这里直接把它焊在这条 user 消息上——**零额外往返**，也不必再排队后台补标。
+      // 落盘形状与后台补标完全一致（`aiTags` + `at`），检索侧一视同仁。
+      if (generated.tags) userMsg.aiTags = { ...generated.tags, at: now };
+      target.messages.push(userMsg);
       // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
-      entry.messages.push({ role: 'assistant', content: generated.text, ts: now });
+      target.messages.push({ role: 'assistant', content: generated.text, ts: now });
       // 事实卡增量更新（同助手分支：在 writeMemory 之前，一次落盘）
-      learnFacts(entry, text, now);
+      learnFacts(target, text, now);
       // 群聊成员桶（同助手分支：与消息一次落盘）
-      recordGroupSpeaker(entry, found.conf, mode, sender, text, now);
+      recordGroupSpeaker(target, found.conf, isGroup, sender, text, now);
+      // 主人群内发言镜像进单人流（2026-10-30 任务1）
+      mirrorOwnerIfNeeded(entry, found.conf, sender, text, now);
       await writeMemory(mem);
+      // AI 补标排队（与助手分支同一套：后台批量，失败不影响回复）
+      scheduleAiTagging(target, async (tagged) => {
+        await withMemoryLock(async () => {
+          const fresh = await readMemory();
+          const e2 = memoryEntryOf(fresh, found.entry, petId);
+          for (const t of tagged) {
+            const msg = e2.messages.find(
+              (m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts,
+            );
+            if (msg) msg.aiTags = t.aiTags;
+          }
+          await writeMemory(fresh);
+        });
+      });
       // 自动压缩：**回复已经写盘并且已经拿到文本**，压缩放在最后且失败不冒泡——
       // 摘要只是长期记忆的优化，绝不能让"这次回复"因为压缩失败而失败（用户会看到一句话都发不出去）。
       // 放在这里而不是对话开头：本轮的新消息已经落盘，压缩后 `summarized` 推进的位置把本轮也考虑进去，
       // 下一轮就能直接读新摘要。
       try {
-        await compressMemory(mem, entry, found.conf);
+        await compressMemory(mem, target, found.conf);
       } catch (e) {
         log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
       }
@@ -3461,6 +3738,12 @@ export function apply(ctx: any): void {
             groupMemoryRecentN: clampRecentN(mainNow.groupMemoryRecentN),
             memoryRecallK: recallCount(mainNow),
             chatMemoryRounds: memoryRounds(mainNow),
+            // 群聊机器人开关（2026-10-30 任务1）：默认单人，群聊是可选开关。
+            // 「记住主人」两件套只在 groupBotEnabled 打开时才有意义，但这里照实返回，
+            // 设置页自己决定禁用态——不在这里替用户抹掉他已保存的值。
+            groupBotEnabled: mainNow.groupBotEnabled === true,
+            ownerQq: typeof mainNow.ownerQq === 'string' ? mainNow.ownerQq : '',
+            ownerSyncEnabled: mainNow.ownerSyncEnabled === true,
             workspaceRoot: assistantWorkspace,
             pets,
             /** 读屏能力是否可用（pwsh 找不到时为 false，设置页据此禁用开关并说明原因） */
@@ -3505,6 +3788,10 @@ export function apply(ctx: any): void {
         'groupMemoryRecentN',
         'memoryRecallK',
         'chatMemoryRounds',
+        // 群聊机器人（2026-10-30 任务1）：body 里显式给了才写，undefined 跳过（PATCH 语义）。
+        'groupBotEnabled',
+        'ownerQq',
+        'ownerSyncEnabled',
       ]) {
         if (patch[key] === undefined) continue;
         next[key] = patch[key];

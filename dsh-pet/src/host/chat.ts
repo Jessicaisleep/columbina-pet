@@ -31,11 +31,12 @@ import { PET_CALL_IDENTITY, noTextReason } from './llm-call';
 import { supportsReasoningOff } from './llm-reasoning';
 import { defaultLog } from './log-file';
 import { extractChatImage, memeCatalog, type MemeEntry } from './memes';
+import { extractAiTags, tagInstruction, type MemoryTags } from './memory-tags';
 import { modelCandidates, modelLabel, type ModelRef } from './model-selection';
 
 /** 生成失败原因（与 shared/whisper.ts 的 WhisperState 失败分支同构） */
 export type ChatGenerateResult =
-  | { ok: true; text: string; image?: string }
+  | { ok: true; text: string; image?: string; tags?: MemoryTags }
   | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string };
 
 /** 记忆中的一条消息（与 shared/chat.ts 的 ChatMessage 同构）
@@ -50,6 +51,31 @@ export interface ChatMemoryMessage {
   ts: number;
   sender?: string;
   senderName?: string;
+  /**
+   * 这条消息的来源标注（2026-10-30）：缺键 = 本窗口/单人正常对话。
+   *
+   * 目前只有一种取值来源：主人在 QQ 群里说的话被**镜像**进单人流时，写上群名（没有群名写
+   * `'group'`）。用途是排查和统计（「这句话到底是从群里来的还是桌面上说的」），
+   * 模型看到的是正文里那句「（在「XX群」里说的）」，不是这个字段。
+   */
+  origin?: string;
+  /**
+   * 模型打的标签（2026-10-30，用户质问「打标签不交给 AI？」之后加的）。
+   *
+   * 留空 = 只有词典标签可用（`memory-tags.ts` 现场算，不落盘）。
+   * 有值 = AI 补标过，**以 AI 为准**：`topics` 会替换词典结果，`mood`/`kind` 也覆盖。
+   *
+   * 为什么不直接不存：AI 调用是异步的、可能失败、可能几个月后才补上，
+   * 存下来才能"补过就不重补"。而词典那条路永远是现算的，
+   * 所以即使这个字段一直是空的，检索也不会退化成完全捞不到。
+   */
+  aiTags?: {
+    topics: string[];
+    mood: 'pos' | 'neg' | 'neutral';
+    kind: 'statement' | 'question' | 'plan' | 'emotion';
+    /** 打标时间（用来判断要不要按新词表重标） */
+    at: number;
+  };
 }
 
 /** 单次生成超时（ms）：对话等 LLM 回复，60s 足够 */
@@ -81,6 +107,7 @@ export async function generateChat(
   userText: string,
   pool: MemeEntry[] = [],
   preferred?: ModelRef,
+  wantTags = true,
 ): Promise<ChatGenerateResult> {
   // 候选链：配置的模型优先 → 当前对话的模型兜底（chatModel 留空时链上只有后者，与旧版逐字一致）
   const candidates = modelCandidates(ctx, preferred);
@@ -96,7 +123,7 @@ export async function generateChat(
   // 兜底文案与失败分支同源，避免两处字面量漂移
   let last: ChatGenerateResult = { ok: false, reason: 'generate-error', message: noTextReason(undefined) };
   for (const [i, sel] of candidates.entries()) {
-    const result = await generateWith(ctx, llm, sel, system, history, userText, pool);
+    const result = await generateWith(ctx, llm, sel, system, history, userText, pool, wantTags);
     if (result.ok) return result;
     last = result;
     // 回落要留痕：配的模型没生效时能在日志里看到原因（否则"我明明配了 A，怎么还是用 B"没法查）
@@ -210,6 +237,7 @@ async function generateWith(
   history: ChatMemoryMessage[],
   userText: string,
   pool: MemeEntry[],
+  wantTags: boolean,
 ): Promise<ChatGenerateResult> {
   // 历史 → dsh-llm 消息：user 经 createUserMessage（plugin 来源），assistant 经 createAssistantMessage
   const historyMessages = history.map((m) =>
@@ -231,6 +259,11 @@ async function generateWith(
   const supportsOff = await supportsReasoningOff(ctx, sel.provider, sel.model);
   // 配图：池非空才把清单与指令附进 user 正文（空池 = 关闭配图，正文与旧行为逐字一致）
   const wantImage = pool.length > 0;
+  // 打标指令：与配图指令同一位置（紧邻回答处，模型最容易遵守）。
+  // 两条指令互不干扰——配图要求模型挑图，打标要求它描述用户那句话，是两件事。
+  let userBody = userText;
+  if (wantImage) userBody += imageInstruction(pool);
+  if (wantTags) userBody += tagInstruction();
   const options = {
     provider: sel.provider,
     model: sel.model,
@@ -239,7 +272,7 @@ async function generateWith(
     messages: [
       ...historyMessages,
       createUserMessage({
-        content: [{ type: 'text', text: wantImage ? userText + imageInstruction(pool) : userText }],
+        content: [{ type: 'text', text: userBody }],
         source: { kind: 'user' },
       }),
     ],
@@ -271,8 +304,31 @@ async function generateWith(
     .join('')
     .trim();
   if (!text) return { ok: false, reason: 'generate-error', message: noTextReason(assembler.finish) };
-  // 配图解析：命中池内才采纳并剥离标记；未选/幻觉名称 → 原样返回纯文本
-  if (!wantImage) return { ok: true, text };
-  const picked = extractChatImage(text, pool);
-  return picked.image ? { ok: true, text: picked.text, image: picked.image } : { ok: true, text: picked.text };
+  // 末尾标记解析：打标 `[标:…]` 与配图 `[图:…]` 都在结尾，谁在前由模型决定，
+  // 所以**先剥一个再看另一个是否露到结尾**（最多两轮必然收敛）。
+  // 两条都容错：解析失败一律原样保留正文，绝不吞回复（配图那条已验证过的口径）。
+  let body = text;
+  let image: string | undefined;
+  let tags: MemoryTags | undefined;
+  for (let round = 0; round < 3; round++) {
+    let changed = false;
+    if (wantTags) {
+      const t = extractAiTags(body);
+      if (t.text !== body) {
+        body = t.text;
+        changed = true;
+      }
+      if (t.tags) tags = t.tags;
+    }
+    if (wantImage) {
+      const picked = extractChatImage(body, pool);
+      if (picked.text !== body) {
+        body = picked.text;
+        changed = true;
+      }
+      if (picked.image) image = picked.image;
+    }
+    if (!changed) break;
+  }
+  return { ok: true, text: body, ...(image ? { image } : {}), ...(tags ? { tags } : {}) };
 }
