@@ -150,6 +150,8 @@ fieldset{padding:0 0 28px;margin:0 0 24px;border:0;border-bottom:1px solid var(-
 .test-row{display:flex;align-items:center;gap:14px;margin:20px 0 6px;flex-wrap:wrap}#test-btn,#persona-save,#history-load,#history-more{background:#fff;color:var(--blue);border:1.5px solid var(--blue);min-height:38px;padding:6px 18px;font-size:14px;border-radius:6px;cursor:pointer;font-weight:600}#test-btn:hover,#persona-save:hover,#history-load:hover,#history-more:hover{background:#edf5fa}#test-btn:disabled,#persona-save:disabled,#history-load:disabled,#history-more:disabled{opacity:.6;cursor:wait}.test-result{font-size:13px;line-height:1.5;min-height:22px;flex:1 1 200px}.test-success{color:#1a7f37;font-weight:600}.test-error{color:#cf222e}.reply-preview{display:block;color:var(--muted);font-weight:normal;font-size:12px;margin-top:4px;word-break:break-all}
 .preview{margin:18px 0 0}.preview summary{font-size:13px;color:var(--blue);cursor:pointer;font-weight:600}.pre{white-space:pre-wrap;word-break:break-word;font:13px/1.7 "Consolas","Microsoft YaHei UI",monospace;background:#f7fbfd;border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin:10px 0 0;max-height:340px;overflow:auto}
 .history h2{font-size:16px;font-weight:700;margin:22px 0 6px}.memory-card{border:1px solid var(--line);border-radius:10px;padding:14px 18px 6px;background:#f7fbfd;margin:0 0 8px}.memory-card h2{margin-top:4px}.msgs{list-style:none;margin:10px 0 0;padding:0}.msgs li{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:0 0 10px;background:#fff}.msgs li.is-summarized{background:#f6f8f9;border-style:dashed}.msgs li.is-summarized .msg-text{color:#7b8b96}.msg-head{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin:0 0 5px}.msg-role{font-weight:700;color:var(--blue)}.msgs li.is-summarized .msg-role{color:#8ca0ad}.msg-text{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.65}
+.msg-ops{display:flex;gap:8px;margin:8px 0 0;flex-wrap:wrap}.msg-ops button{min-height:30px;padding:4px 14px;font-size:13px;background:#fff;color:var(--blue);border:1.5px solid var(--blue);border-radius:6px}.msg-ops button:hover{background:#edf5fa}.msg-ops button.danger{color:#cf222e;border-color:#e2a3a0}.msg-ops button.danger:hover{background:#fdf0ef}.msg-ops .op-note{font-size:12px;color:var(--muted);align-self:center}
+.msg-edit{display:block;width:100%;min-height:88px;border:1px solid #a5bdcb;border-radius:6px;padding:8px 10px;font:14px/1.65 inherit;resize:vertical}
 @media(max-width:560px){main{margin:24px auto;padding:0 14px 24px}header{padding:0 8px 24px}h1{font-size:28px}form,.tabs,.history{padding:24px 20px 16px}.pair{grid-template-columns:1fr;gap:0}footer{align-items:stretch;flex-direction:column}button{width:100%}.fish{margin-bottom:18px}.tab{width:auto}}
 .cando{background:#f7fbfd;border:1px solid var(--line);border-radius:8px;padding:12px 16px 6px;margin:12px 0 4px}
 .cando-title{font-size:14px;font-weight:700;margin:0 0 8px;color:var(--blue)}
@@ -475,6 +477,8 @@ export const settingsScript = `
     for (const row of rows) {
       const li = document.createElement('li');
       if (row.summarized) li.className = 'is-summarized';
+      // data-index = 这条在 entry.messages 里的绝对下标，改/删都靠它定位（内容可重复、可被改，只有下标稳定）
+      li.dataset.index = String(row.index);
       const head = document.createElement('p');
       head.className = 'msg-head';
       const role = document.createElement('span');
@@ -486,9 +490,135 @@ export const settingsScript = `
       const text = document.createElement('p');
       text.className = 'msg-text';
       text.textContent = row.content;
-      li.append(head, text);
+      li.append(head, text, buildOps(row, li, text));
       historyList.appendChild(li);
     }
+  }
+
+  /**
+   * 每条历史消息下面那排「改 / 删」按钮。
+   *
+   * 两条口径写死在这里：
+   *  1. 改完/删完**都以服务端回执为准**（回执里的 total / summarized / memory），不靠前端自己算——
+   *     尤其是「已压缩」那条，删掉后摘要会被重写、游标会退一格，前端算不出来。
+   *  2. 已压缩的条目要点明「会顺带重写摘要」，因为那是一次真实的云端调用、可能要等几秒，
+   *     用户得知道自己在等什么；摘要没改写成功时服务端**整体不保存**，这里要把原因原样转达。
+   *  （注意：这一段是模板字符串里的正文，注释里不能出现反引号，否则会提前截断整页脚本。）
+   */
+  function buildOps(row, li, textEl) {
+    const ops = document.createElement('p');
+    ops.className = 'msg-ops';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.textContent = '改';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'danger';
+    del.textContent = '删';
+    ops.append(edit, del);
+
+    edit.addEventListener('click', () => {
+      if (li.querySelector('.msg-edit')) return;  // 已经在编辑中
+      textEl.hidden = true;
+      edit.disabled = true;
+      del.disabled = true;
+      const box = document.createElement('textarea');
+      box.className = 'msg-edit';
+      box.value = row.content;
+      const bar = document.createElement('p');
+      bar.className = 'msg-ops';
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.textContent = '保存';
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.textContent = '取消';
+      const hint = document.createElement('span');
+      hint.className = 'op-note';
+      if (row.summarized) hint.textContent = '这条已压进摘要，保存后会顺带重写摘要';
+      bar.append(save, cancel, hint);
+      li.append(box, bar);
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
+
+      function close() {
+        box.remove(); bar.remove();
+        textEl.hidden = false;
+        edit.disabled = false;
+        del.disabled = false;
+      }
+      cancel.addEventListener('click', close);
+      save.addEventListener('click', async () => {
+        const next = box.value.trim();
+        if (!next) { historyMessage('内容不能为空；不想保留这条就用「删」。', 'test-error'); return; }
+        if (next === row.content) { close(); return; }
+        save.disabled = true; cancel.disabled = true;
+        historyMessage('正在保存…');
+        try {
+          const r = await petRequest('/dsh-pet-7340/chat/history', 'POST', {
+            pet: historyPet.value, index: row.index, content: next,
+          });
+          if (!r.ok) throw new Error(r.message || r.reason || '保存失败');
+          row.content = next;
+          textEl.textContent = next;
+          close();
+          applyMemory(r);
+          historyMessage(
+            (r.covered ? '已保存；这条在摘要覆盖区内，摘要' + (r.summaryRewritten ? '已重写。' : '未变。') : '已保存。'),
+            'test-success',
+          );
+        } catch (error) {
+          save.disabled = false; cancel.disabled = false;
+          historyMessage(error.message, 'test-error');
+        }
+      });
+    });
+
+    del.addEventListener('click', async () => {
+      // 注意：这里整段是模板字符串里的正文，换行必须写成反斜杠 n 的转义形式；
+      // 直接写真换行会把下面那行字符串字面量物理截断，页面脚本立刻 SyntaxError（settings.test.ts 会抓到）。
+      const why = row.summarized
+        ? '确认删除这条？\\n\\n它已经压进摘要了，删掉后摘要会被重写（可能要等几秒）。'
+        : '确认删除这条？此操作不可撤销。';
+      if (!window.confirm(why)) return;
+      edit.disabled = true; del.disabled = true;
+      historyMessage('正在删除…');
+      try {
+        const r = await petRequest(
+          '/dsh-pet-7340/chat/history?pet=' + encodeURIComponent(historyPet.value) + '&index=' + row.index,
+          'DELETE',
+        );
+        if (!r.ok) throw new Error(r.message || r.reason || '删除失败');
+        // 删掉之后**后面所有条目的绝对下标都退一格**，DOM 上的 data-index 也就全错了。
+        // 与其在 DOM 上做偏移，不如按本地账本整体重画一遍——改/删都只发生在用户点按钮的这一刻，重画没有副作用。
+        historyRows = historyRows.filter(x => x.index !== row.index);
+        historyTotal = Number(r.total) || Math.max(0, historyTotal - 1);
+        historyOffset = historyRows.length;
+        renderRows(historyRows, false);
+        historyMore.disabled = historyRows.length >= historyTotal;
+        applyMemory(r);
+        historyMessage(
+          (r.covered ? '已删除；这条在摘要覆盖区内，摘要' + (r.summaryRewritten ? '已重写。' : '未变。') : '已删除。') +
+            '现在共 ' + historyTotal + ' 条，已显示 ' + historyRows.length + ' 条。',
+          'test-success',
+        );
+      } catch (error) {
+        edit.disabled = false; del.disabled = false;
+        historyMessage(error.message, 'test-error');
+      }
+    });
+
+    return ops;
+  }
+
+  /** 服务端回执里的 memory 概览 → 摘要与计数（改/删之后它可能已经变了） */
+  function applyMemory(r) {
+    const mem = (r && r.memory) || {};
+    if (typeof mem.summary === 'string') memorySummary.textContent = mem.summary || '（还没有生成过摘要）';
+    if (mem.total != null) historyTotal = Number(mem.total) || historyTotal;
+    memoryMeta.textContent = '已压缩 ' + (mem.summarized || 0) + ' / ' + (mem.total || 0) + ' 条' +
+      (mem.summaryTs ? ' · 摘要生成于 ' + fmtTime(mem.summaryTs) : '') +
+      (Number.isFinite(mem.pendingRounds) ? ' · 待压缩 ' + mem.pendingRounds + ' 轮' : '');
   }
   async function loadHistory(reset) {
     if (!historyPet.value) return;

@@ -836,6 +836,87 @@ describe('/work-status —— 外部写入工作状态', () => {
   });
 });
 
+describe('chat/history 改与删 —— 参数级校验排在读盘之前（2026-10-30 任务2）', () => {
+  // 与 /pet-pinned、/pet-display 同一处境：本文件用源码形态的 apply()，包内 assets 不可达，
+  // readAllConfig 必抛 → 凡是走到读配置的分支都落 generate-error。所以这里只钉**读盘之前**
+  // 那几道：方法、JSON、index 类型。写盘、游标回退、摘要重写由 memory-summary.test.ts 覆盖。
+  test('PUT → 405（只有 GET / POST / DELETE 三种）', async () => {
+    const r = await call('/dsh-pet-7340/chat/history?pet=main', 'PUT', '{}');
+    assert.equal(r.status, 405);
+  });
+
+  test('POST 请求体不是合法 JSON → 400（协议层错误，不落成 ok:false）', async () => {
+    const r = await call('/dsh-pet-7340/chat/history?pet=main', 'POST', '{ 不是 json');
+    assert.equal(r.status, 400);
+    assert.equal((JSON.parse(r.body) as { reason: string }).reason, 'bad-json');
+  });
+
+  test('index 缺失 / 负数 / 非整数 / 非数字 → 200 + bad-index（比 generate-error 更早）', async () => {
+    const bads: unknown[] = [undefined, -1, 1.5, 'abc', null, ''];
+    for (const bad of bads) {
+      const r = await call('/dsh-pet-7340/chat/history?pet=main', 'POST', JSON.stringify({ index: bad, content: 'x' }));
+      assert.equal(r.status, 200, `index=${String(bad)} 业务失败走 200`);
+      const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+      assert.equal(body.ok, false, `index=${String(bad)}`);
+      // 关键：不是 generate-error —— 证明这道校验抢在读配置之前
+      assert.equal(body.reason, 'bad-index', `index=${String(bad)} 应是 bad-index`);
+    }
+  });
+
+  test('DELETE 的 index 从 query 取（webServer 只给 PUT/POST 读 body）', async () => {
+    // 带一个合法 index 才会往下走；本文件读不到配置 → 走内部错误分支（500 + internal）。
+    // 断言 500 而不是 bad-index，恰好证明 query 里的 index 被认下来了、它没在参数层被拒。
+    const r = await call('/dsh-pet-7340/chat/history?pet=main&index=0', 'DELETE');
+    assert.equal(r.status, 500);
+    const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, 'internal', '读不到配置 = 内部错误，不该伪装成参数错误');
+  });
+
+  test('DELETE 不给 index → bad-index（不猜默认值，绝不静默删第一条）', async () => {
+    const r = await call('/dsh-pet-7340/chat/history?pet=main', 'DELETE');
+    assert.equal(r.status, 200);
+    const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, 'bad-index');
+  });
+
+  test('POST 的 pet 可以写在 body 里（2026-10-30 实机联调抓到的缺陷）', async () => {
+    // 设置页 petRequest 把 pet 放在**请求体**里，而 requirePet 只查 URLSearchParams。
+    // 修复前这一定回 pet-required —— 上一行那组测试全都带着 `?pet=main`，所以一层都测不到。
+    // 断言 500+internal（走读配置）而不是 200+pet-required，恰好证明 body 里的 pet 被认了。
+    const r = await call('/dsh-pet-7340/chat/history', 'POST', JSON.stringify({ pet: 'main', index: 0, content: 'x' }));
+    assert.equal(r.status, 500);
+    const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+    assert.equal(body.reason, 'internal', 'body 里的 pet 必须被认下来；回 pet-required 说明又漏了');
+  });
+
+  test('body 与 query 都给 pet 时以 query 为准（可用 URL 覆盖 body 调试）', async () => {
+    const r = await call(
+      '/dsh-pet-7340/chat/history?pet=main',
+      'POST',
+      JSON.stringify({ pet: '另一个人', index: 0, content: 'x' }),
+    );
+    // 走到读配置说明 pet 校验过了；若 query 被 body 覆盖，'另一个人' 在配置里不存在 → unknown-pet。
+    // 本文件读不到配置，两种都落 internal，故改从日志面不可判——这里只钉住"不会因为 body 的
+    // 奇怪值在参数层被拒"，真正的优先级由 mergedPetParams 的实现（先查 query 非空则原样返回）保证。
+    assert.equal(r.status, 500);
+  });
+
+  test('body 里 pet 缺失/空串 → 仍是 pet-required（口径不因合并而放宽）', async () => {
+    for (const bodyPet of ['', '   ', undefined, null, 42]) {
+      const r = await call(
+        '/dsh-pet-7340/chat/history',
+        'POST',
+        JSON.stringify({ pet: bodyPet, index: 0, content: 'x' }),
+      );
+      assert.equal(r.status, 200, `pet=${String(bodyPet)}`);
+      const body = JSON.parse(r.body) as { ok: boolean; reason: string };
+      assert.equal(body.reason, 'pet-required', `pet=${String(bodyPet)} 应是 pet-required`);
+    }
+  });
+});
+
 describe('对外 Cordis 服务 —— 第三方注册余额查询', () => {
   interface BalanceApi {
     register: (def: { id: string; fetch: (ctx: { provider: string }) => Promise<unknown> }) => () => void;

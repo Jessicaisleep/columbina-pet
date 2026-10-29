@@ -107,13 +107,16 @@ import { automaticWhisperSchedule, type StandaloneWhisperPolicy } from './whispe
 import { generateChat, generateMemorySummary } from './chat';
 import type { ChatMemoryMessage } from './chat';
 import {
+  buildSummaryPatchUserText,
   buildSummaryUserText,
   compressPolicyOf,
   memorySection,
   normalizeSummary,
   overviewOf,
   planCompression,
+  SUMMARY_PATCH_SYSTEM_PROMPT,
   SUMMARY_SYSTEM_PROMPT,
+  summarizedAfterChange,
   summarizedOf,
   type ChatMemoryEntry,
   type MemoryOverview,
@@ -855,6 +858,22 @@ export function apply(ctx: any): void {
   };
 
   /**
+   * 把「body 里的 pet」并进 query 参数，供 `requirePet` 统一读取。
+   *
+   * 为什么需要：`requirePet` 的入参就是 `URLSearchParams`（9 条路由共用，改签名会波及全部），
+   * 但 POST 请求把 pet 放 body 更自然（`/chat/history` 的改= POST{pet,index,content}）。
+   * 这里只做一次只读合并，**query 优先**：两处都给时以 URL 为准，便于用 URL 覆盖 body 调试。
+   * body 里的 pet 不是字符串/为空时不动，留给 `requirePet` 报 `pet-required`（口径唯一）。
+   */
+  const mergedPetParams = (params: URLSearchParams, bodyPet: unknown): URLSearchParams => {
+    if (typeof bodyPet !== 'string' || bodyPet.trim() === '') return params;
+    if (String(params.get('pet') ?? '').trim() !== '') return params;
+    const merged = new URLSearchParams(params);
+    merged.set('pet', bodyPet.trim());
+    return merged;
+  };
+
+  /**
    * 路由层的 pet 参数解析（`/lock`、`/lock/release`、`/whisper`、`/chat` 用——这四条没有独立决策层；
    * `/anim`、`/broadcast`、`/bubble/clear`、`/position`、`/throw` 的同一套校验住在各自的决策模块里，
    * 口径与这里逐字一致）：**必填**且必须真实存在。
@@ -1161,6 +1180,35 @@ export function apply(ctx: any): void {
   };
 
   // userMessageFor 在 ./memory-group（纯函数，便于单测）
+
+  /**
+   * 从**整段消息流**重建事实卡（2026-10-30 任务2）。
+   *
+   * 为什么改/删一条消息要整段重算，而不是「把这条的事实扣掉」：
+   *   事实卡是按 `kind|key` **覆盖**得来的（`mergeFacts`），覆盖后原始出处就丢了——
+   *   想扣掉「city=杭州」这一条，程序根本无从知道它是被后来哪句话覆盖的。
+   *   而规则抽取是纯字符串匹配、不调模型、40 条量级下几毫秒就跑完，
+   *   **重算一遍是唯一能保证「事实卡与原文一致」的做法**。
+   *
+   * 只吃 user 消息：宠物自己说的话不产生关于用户的事实（与 `learnFacts` 的调用点一致）。
+   * 时间戳按消息自己的 `ts`，取不到的退到 `now`——不能让整批事实的 lastTs 变成 1970。
+   */
+  const rebuildFactsFrom = (
+    list: ChatMemoryMessage[],
+    now: number = Date.now(),
+  ): { facts: ReturnType<typeof mergeFacts>['facts']; upto: number } => {
+    let acc: ReturnType<typeof mergeFacts>['facts'] = [];
+    for (const m of Array.isArray(list) ? list : []) {
+      if (!m || m.role !== 'user') continue;
+      const text = typeof m.content === 'string' ? m.content : '';
+      if (text.trim() === '') continue;
+      const at = typeof m.ts === 'number' && Number.isFinite(m.ts) && m.ts > 0 ? m.ts : now;
+      const extracted = extractFacts(text);
+      if (extracted.length === 0) continue;
+      acc = mergeFacts(acc, extracted, at).facts;
+    }
+    return { facts: acc, upto: Array.isArray(list) ? list.length : 0 };
+  };
 
   /**
    * AI 补标（**补路**，不是主路）：把还没被模型看过的消息**攒成批**送去打标签（2026-10-30）。
@@ -3664,6 +3712,174 @@ export function apply(ctx: any): void {
     //   这里给**全量**原始消息 + 那段摘要本身，供设置页的「对话历史」页对照查看。
     //   只读，不改任何状态；分页用 ?limit=（默认 200，上限 2000）+ ?offset=。
     if (rest === 'chat/history') {
+      // 改一条 / 删一条（2026-10-30 任务2）：
+      //   POST   —— { pet, index, content } 改第 index 条的正文
+      //   DELETE —— ?pet=&index= 删第 index 条（DELETE 不带 body，见 webServer 只给 PUT/POST 收 body）
+      //
+      // 为什么两个都要 `index` 而不是内容：同一条消息的正文可能被用户改得面目全非，
+      // 按内容匹配会改错行；下标是这条历史唯一的稳定身份（GET 也会一并返回它）。
+      //
+      // **已被摘要覆盖的那条**（index < summarized）改/删后必须**重写摘要**——
+      // 那段原文早已不在上下文里，摘要就是它唯一的载体；只改文件里的原文而不动摘要，
+      // 等于桌上留下一份改过的档案、模型脑子里还是旧的，下次它会照着旧事说。
+      // 未覆盖的那部分直接在窗口里，改完下一轮就生效，不需要重写摘要。
+      if (method === 'POST' || method === 'DELETE') {
+        // 参数级校验全部排在读配置之前——与 /surface、/?rounds= 同一套短路顺序：
+        // 请求本身就是坏的，就不该去碰磁盘（也让这一层能在"配置不可达"的环境里被单测钉住）。
+        let payload: { index?: unknown; content?: unknown; pet?: unknown } = {};
+        if (method === 'POST') {
+          try {
+            payload = (JSON.parse(body ?? 'null') as typeof payload | null) ?? {};
+          } catch {
+            return { kind: 'json', status: 400, obj: { ok: false, reason: 'bad-json', message: '请求体不是合法 JSON' } };
+          }
+        }
+        const rawIndex = method === 'DELETE' ? url.searchParams.get('index') : payload.index;
+        // 必须先挡 null / undefined / 空串：`Number(null) === 0`、`Number('') === 0`，
+        // 直接转成数字的话「DELETE 忘带 index」会**静默删掉第一条**——这是能毁记忆的默认值，绝不能有。
+        const missingIndex =
+          rawIndex === null || rawIndex === undefined || (typeof rawIndex === 'string' && rawIndex.trim() === '');
+        const indexRaw = missingIndex ? NaN : Number(rawIndex);
+        if (!Number.isInteger(indexRaw) || indexRaw < 0) {
+          return {
+            kind: 'json',
+            status: 200,
+            obj: { ok: false, reason: 'bad-index', message: 'index 必须是 ≥0 的整数（必填）' },
+          };
+        }
+        try {
+          // pet 既可以从 query 给（DELETE 只能这样给），也可以从 JSON body 给（POST 的自然写法）。
+          // 设置页 `petRequest` 把 pet 放进 body，而 `requirePet` 只查 URLSearchParams ——
+          // 2026-10-30 实机联调时这里每次都回 `pet-required`：单测只测了参数级校验、没测过
+          // "设置页真的发出去的那个请求"，于是两端各自自洽、接起来必坏。合并一次成本为零。
+          //
+          // cfg 传**惰性**（`() => readAllConfig(...)`）：与 `requirePet` 文档里那条"pet 空串时
+          // 不必碰磁盘"一致。原先这里先 `readAllConfig` 再 `() => cfg`，等于把惰性作废——
+          // 配置坏了连 `pet-required` 都报不出来，只剩一个 `internal`。
+          const who = requirePet(mergedPetParams(url.searchParams, payload.pet), () => readAllConfig(configPaths));
+          if (!who.ok) return who.res;
+          const petId = who.petId;
+          // 显式标注联合类型：不标的话 TS 会把各分支的返回值合成一个宽联合，
+          // `out.ok` 收窄不到 false 分支上（报 `Property 'reason' does not exist on type 'never'`）。
+          type HistoryChangeResult =
+            | { ok: true; covered: boolean; summaryRewritten: boolean; [k: string]: unknown }
+            | { ok: false; reason: string; message?: string };
+          const out: HistoryChangeResult = await withMemoryLock(async () => {
+            // 锁内重读：进锁前排的队可能等了几十秒，期间这只宠物可能被删、记忆可能刚被压缩
+            const cfgNow = readAllConfig(configPaths);
+            const foundNow = findPetInstance(cfgNow, who.petId);
+            if (!foundNow) {
+              return { ok: false as const, reason: 'unknown-pet', message: '没有这只桌宠：' + who.petId };
+            }
+            const mem = await readMemory();
+            const entry = memoryEntryOf(mem, foundNow.entry, who.petId);
+            const list = entry.messages;
+            const total = list.length;
+            if (indexRaw >= total) {
+              return { ok: false as const, reason: 'out-of-range', message: `index 超出范围（共 ${total} 条）` };
+            }
+            const before = summarizedOf(entry);
+            const target = list[indexRaw];
+            const oldContent = typeof target.content === 'string' ? target.content : '';
+            const covered = indexRaw < before;
+
+            let newContent = oldContent;
+            if (method === 'POST') {
+              if (typeof payload.content !== 'string') {
+                return { ok: false as const, reason: 'bad-request', message: 'content 必须是字符串' };
+              }
+              newContent = payload.content.trim();
+              if (newContent === '') {
+                // 改空 = 没有意义（保存一条空白消息只会让模型看到一行空气），引导用户用删除
+                return { ok: false as const, reason: 'empty-content', message: '内容不能为空；不想保留这条就用删除' };
+              }
+              if (newContent === oldContent) {
+                // 没改就别触发摘要重写（一次云端调用换个一模一样的结果是纯浪费）
+                return {
+                  ok: true as const,
+                  index: indexRaw,
+                  total,
+                  summarized: before,
+                  covered,
+                  summaryRewritten: false,
+                  memory: overviewOf(entry),
+                };
+              }
+              list[indexRaw] = { ...target, content: newContent };
+            } else {
+              list.splice(indexRaw, 1);
+              entry.summarized = summarizedAfterChange(before, list.length, indexRaw, 'delete');
+            }
+
+            // 覆盖区变了 → 摘要必须跟着改（模型失败就**不落盘**，见下面的分支）
+            let summaryRewritten = false;
+            let summaryReason: string | undefined;
+            if (covered && typeof entry.summary === 'string' && entry.summary.trim() !== '') {
+              const userText = buildSummaryPatchUserText(entry.summary, {
+                kind: method === 'POST' ? 'edit' : 'delete',
+                oldText: oldContent,
+                newText: newContent,
+              });
+              const result = await generateMemorySummary(
+                ctx,
+                SUMMARY_PATCH_SYSTEM_PROMPT,
+                userText,
+                configuredModel(foundNow.conf, 'chatModel'),
+              );
+              const patched = result.ok ? normalizeSummary(result.text) : '';
+              if (patched) {
+                entry.summary = patched;
+                entry.summaryTs = Date.now();
+                summaryRewritten = true;
+              } else {
+                // **失败不写盘**：原文已经改了、摘要却没改，模型会照着旧摘要说一件已经不存在的事。
+                // 这和压缩失败时不推进游标是同一条原则——宁可这次操作报错，也不要留下自相矛盾的记忆。
+                summaryReason = result.ok ? 'empty-summary' : result.reason;
+                return {
+                  ok: false as const,
+                  reason: 'summary-rewrite-failed',
+                  message:
+                    '这条已经压进摘要里了，但摘要没能改写（' +
+                    (summaryReason ?? 'unknown') +
+                    '）。为避免"原文改了、记忆没改"，本次没有保存。',
+                };
+              }
+            }
+
+            // 事实卡是从原文派生的，原文变了就必须重算——否则「我住在杭州」被改成「我住在成都」后，
+            // L0 事实卡还写着杭州，而 L0 是**常驻**的，比摘要更容易被模型当真。
+            const rebuilt = rebuildFactsFrom(list);
+            entry.facts = pruneFacts(rebuilt.facts);
+            entry.factsUpto = rebuilt.upto;
+
+            await writeMemory(mem);
+            return {
+              ok: true as const,
+              index: indexRaw,
+              total: list.length,
+              summarized: summarizedOf(entry),
+              covered,
+              summaryRewritten,
+              memory: overviewOf(entry),
+            };
+          });
+          if (out.ok) {
+            log.info(
+              `[dsh-pet] 历史消息${method === 'POST' ? '已修改' : '已删除'} pet=${petId} index=${indexRaw}` +
+                (out.covered ? `（在摘要覆盖区内，摘要${out.summaryRewritten ? '已重写' : '未变'}）` : ''),
+            );
+          } else {
+            log.warn(`[dsh-pet] 历史消息${method === 'POST' ? '修改' : '删除'}失败 pet=${petId}：${out.message ?? out.reason}`);
+          }
+          return { kind: 'json', status: 200, obj: out, headers: { 'cache-control': 'no-cache, no-store' } };
+        } catch (e) {
+          return {
+            kind: 'json',
+            status: 500,
+            obj: { ok: false, reason: 'internal', message: e instanceof Error ? e.message : String(e) },
+          };
+        }
+      }
       if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
       try {
         const cfg = readAllConfig(configPaths);
@@ -3692,6 +3908,10 @@ export function apply(ctx: any): void {
             offset,
             limit,
             messages: all.slice(offset, offset + limit).map((m, i) => ({
+              // index = 这条消息在 entry.messages 里的**绝对下标**（2026-10-30 任务2）。
+              // 改/删都靠它定位：`content` 可能被用户改过、也可能重复（连说两句「嗯」），
+              // 只有下标是稳定身份。注意是 `offset + i`，不是 `i`——分页时两者不等。
+              index: offset + i,
               role: String(m.role ?? ''),
               content: String(m.content ?? ''),
               ts: typeof m.ts === 'number' ? m.ts : undefined,

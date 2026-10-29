@@ -294,6 +294,83 @@ export interface MemoryOverview {
   pendingRounds: number;
 }
 
+/**
+ * 单条历史消息被改/删之后，`summarized` 应该落在哪（纯计算，2026-10-30 任务2）。
+ *
+ * 规则只有一个：**删掉一条已被摘要覆盖的消息，游标必须跟着退一格**。
+ *   - 不退 → `messages[0..summarized)` 里少了一条，但游标还说"这些都被摘要吃掉了"，
+ *     下一条本来该进上下文的原文会被永久跳过（静默丢记忆，和压缩失败时推进游标是同一个病）；
+ *   - 改（edit）不移动游标：条数没变，覆盖范围没变——只是摘要内容要重写，那是另一个函数的事。
+ *
+ * 越界一律夹到 `[0, total]`：`index` 来自 HTTP 参数，可能被手改成任意值。
+ */
+export function summarizedAfterChange(
+  summarized: number,
+  total: number,
+  index: number,
+  op: 'edit' | 'delete',
+): number {
+  const n = Math.max(0, Math.floor(Number(summarized) || 0));
+  const len = Math.max(0, Math.floor(Number(total) || 0));
+  const at = Math.floor(Number(index));
+  if (!Number.isFinite(at)) return Math.min(n, len);
+  const next = op === 'delete' && at >= 0 && at < n ? n - 1 : n;
+  return Math.min(Math.max(0, next), len);
+}
+
+/** 摘要补丁提示词（system）：只改受影响的那一条，其余原样保留 */
+export const SUMMARY_PATCH_SYSTEM_PROMPT = [
+  '你是一个对话记忆整理员。用户手工修改了一段**已经压缩进摘要**的原始对话，你要据此更新那份摘要。',
+  '',
+  '要求：',
+  '1. 只改动与这次修改直接相关的那部分说法；**其余内容原样保留**，不要重写、不要润色、不要重新组织。',
+  '2. 用第三人称陈述（例如「用户喜欢下雨天」「用户提过下周三要考试」），不要写成对话，不要用第一人称。',
+  '3. 不要编造：新内容里没提到的就不要补；删掉的内容如果还有别的记录支撑，就保留。',
+  '4. 只输出更新后的摘要正文：不要标题、不要分点符号、不要任何解释，也不要提到"改动""删除"这些字眼。',
+  '5. **改写后的新内容如果本身就是值得长期记住的事**（身份、住址、家人宠物、明确的喜好或厌恶、约定好的安排），' +
+    '哪怕现有摘要里原本压根没提过，也要补进摘要——这段原文已经被压缩掉了，摘要不写下来它就彻底没了。',
+  '6. 反过来，纯寒暄、一次性动作、情绪发泄不补。',
+].join('\n');
+
+/** 摘要补丁里引用的原文截断长度：只给模型看"改了哪句"，不需要整段全文 */
+const PATCH_CLIP = 300;
+
+function clipText(text: unknown, max: number = PATCH_CLIP): string {
+  const s = typeof text === 'string' ? text.trim() : '';
+  return s.length <= max ? s : s.slice(0, max) + '…';
+}
+
+/**
+ * 拼出「摘要补丁」的 user 正文（纯逻辑，便于单测）。
+ *
+ * 为什么不重新压缩一遍覆盖区：覆盖区可能有几百条消息，重新摘要既贵又**有损**——
+ * 模型会顺手把不相关的旧结论改掉/丢掉。用户只改了一条，摘要就只该动那一条。
+ */
+export function buildSummaryPatchUserText(
+  prevSummary: string,
+  change: { kind: 'edit' | 'delete'; oldText: string; newText?: string },
+): string {
+  const parts: string[] = ['【现有摘要】', typeof prevSummary === 'string' ? prevSummary.trim() : '', ''];
+  parts.push('【要反映的改动】用户在回顾对话记录时，手工处理了一条已经被摘要覆盖的原始消息：');
+  if (change.kind === 'edit') {
+    parts.push('原内容：' + clipText(change.oldText));
+    parts.push('改成：' + clipText(change.newText));
+    parts.push('');
+    parts.push(
+      '请把摘要里受这条内容影响的说法改正过来。**如果改出来的新内容里有值得长期记住的事' +
+        '（身份、住址、家人宠物、喜好、约定），而摘要里还没有，就补进去**；' +
+        '完全不涉及长期信息时，原样返回现有摘要。',
+    );
+  } else {
+    parts.push('被删除的内容：' + clipText(change.oldText));
+    parts.push('');
+    parts.push('请去掉摘要里**只能由这条内容支撑**的说法；其余内容一个字都不要动。');
+  }
+  parts.push('');
+  parts.push('只输出更新后的摘要正文。');
+  return parts.join('\n');
+}
+
 /** 汇总一只宠物的记忆状态（GET /chat 与手动压缩回执共用） */
 export function overviewOf(entry: ChatMemoryEntry): MemoryOverview {
   const messages = Array.isArray(entry.messages) ? entry.messages : [];
