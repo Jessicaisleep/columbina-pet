@@ -121,7 +121,7 @@ import {
 import { configuredModel } from './model-selection';
 import { limitPool, pickMeme, readMemePool } from './memes';
 import { extractFacts, factsSection, mergeFacts, pruneFacts } from './memory-facts';
-import { AI_TAG_BATCH, aiTagPrompt, mergeTags, parseAiTags, tagOf } from './memory-tags';
+import { AI_TAG_BATCH, aiTagPrompt, extractAiTags, mergeTags, parseAiTags, tagInstruction, tagOf } from './memory-tags';
 import {
   clampRecentN,
   groupOf,
@@ -1673,7 +1673,12 @@ export function apply(ctx: any): void {
           llm: assistantLlm(),
           system: assistantSystem,
           history: list.map((m) => ({ role: m.role, content: m.content })),
-          userText: text,
+          // 同轮搭车（2026-10-30 补齐助手分支）：与普通对话完全同一套标记，
+          // 指令挂在**用户这条**上——模型对「这句话在讲什么」的理解在这一步最完整，
+          // 等它跑完 8 步工具循环再单独问一遍，上下文已经被工具结果冲淡了。
+          // 注意：中间步骤的「边想边做」话术不进记忆（见 loop.ts 顶部注释），
+          // 所以只有最后一轮纯文本会带标记，正好就是我们要剥的那一句。
+          userText: text + tagInstruction(),
           toolCtx: toolContextOf(petWorkspace, found.conf),
           log: (level, message) => (level === 'warn' ? log.warn(message) : log.info(message)),
         });
@@ -1722,8 +1727,13 @@ export function apply(ctx: any): void {
         }
         // 成功：记忆存正文（动作明细不进对话历史，避免把工具日志当聊天记录读回去）
         const now2 = Date.now();
-        target.messages.push(userMessageFor(text, now2, sender, isGroup ? 'group' : 'single'));
-        target.messages.push({ role: 'assistant', content: outcome.text, ts: now2 });
+        // 同轮搭车：助手最后那句也可能带 `[标:…]`，与普通对话同一套剥除口径
+        // （解析失败一律原样返回，绝不吞掉回复——见 memory-tags.ts 的 extractAiTags）。
+        const said = extractAiTags(outcome.text);
+        const userMsg2 = userMessageFor(text, now2, sender, isGroup ? 'group' : 'single');
+        if (said.tags) userMsg2.aiTags = { ...said.tags, at: now2 };
+        target.messages.push(userMsg2);
+        target.messages.push({ role: 'assistant', content: said.text, ts: now2 });
         // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）
         learnFacts(target, text, now2);
         // 群聊成员桶（同位置：与消息一次落盘）
@@ -1750,13 +1760,15 @@ export function apply(ctx: any): void {
         } catch (e) {
           log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
         }
-        state.writePet(petId, 'say', { text: outcome.text });
+        // 用户看到的、记进历史的、写进操作记录的，一律是**剥掉标记的正文**
+        // （标记只给记忆库用，露出 `[标:…]` 就是没做完）
+        state.writePet(petId, 'say', { text: said.text });
         log.info(
           `[dsh-pet] 助手完成 pet=${petId}，${outcome.steps.length} 步动作：` +
             outcome.steps.map((s) => s.name + (s.ok ? '✓' : '✗')).join(' '),
         );
-        record('ok', outcome.text);
-        return { ok: true as const, text: outcome.text };
+        record('ok', said.text);
+        return { ok: true as const, text: said.text };
       }
 
       // 模型：条目配置的 chatModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
