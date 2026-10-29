@@ -110,6 +110,12 @@ const GLOBAL_DEFAULT_KEYS = [
   'memoryCompressEnabled',
   'memoryCompressRounds',
   'memoryKeepRounds',
+  'memoryRecallK',
+  // 群聊记忆（2026-10-29）：单人 / 群聊是一套**用户级**选择——同一个人不可能"这只宠物认人、
+  // 那只不认人"，也没法按种类分开（群里就一个 bot 实例）。所以放全局默认。
+  'memoryMode',
+  'groupMemoryScope',
+  'groupMemoryRecentN',
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
@@ -417,6 +423,32 @@ function topFieldValid(key: string, value: unknown): boolean {
     }
     case 'memoryCompressEnabled':
       return typeof value === 'boolean';
+    case 'memoryRecallK': {
+      // 每次对话回填几条往事（0 = 关闭检索）。
+      //
+      // 上限 50 的依据（2026-10-30 实测，不是拍脑袋）：
+      // - **成本不是瓶颈**：本机真实对话每轮平均 79 字 ≈ 53 token，K=50 才 2,632 token
+      //   = 1M 窗口的 0.26%。而 K=10 是 526 token（0.053%），差别可以忽略。
+      // - **真正的瓶颈是检索精度**：现在有四道过滤（df 过半不采信 / 只蹭虚词不算 /
+      //   唯一专名单锚点 / minScore 0.5），在 14 轮真实往事上 K=3、10、50 返回的结果
+      //   **完全一样**（每问 1~2 条）——K 只是个上限，正常问句根本撞不到。
+      //   调大它只会在往事量变大后多捞几条低分尾部，那才是会稀释注意力的东西。
+      // - 卡 50 而不是无限：再多就是"把整个档案全塞进去"，那等于取消检索。
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= 50;
+    }
+    // 群聊记忆三件套（2026-10-29）：模式 / 档位 / N。
+    // 与上面几个"非负有限数字"的字段不同，这里**必须逐个取值校验**——因为非法值不能静默
+    // 回落成默认（`memoryMode: 'gruop'` 拼错静默变单人模式，用户会以为"群聊没生效"而不是"我打错了"）。
+    case 'memoryMode':
+      return value === 'single' || value === 'group';
+    case 'groupMemoryScope':
+      return value === 'everyone' || value === 'recent';
+    case 'groupMemoryRecentN': {
+      // 与 memory-group 的 clampRecentN 同一区间：设置页滑杆、手改配置、HTTP 参数三处同口径
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 1 && n <= 100;
+    }
     case 'chatImageLimit': {
       // 对话配图张数上限：非负数字（0 = 不限制）；小数按消费者 Math.floor 取整
       const n = Number(value);
@@ -920,6 +952,16 @@ export function saveUserConfig(
   if (mcr !== undefined && !topFieldValid('memoryCompressRounds', mcr)) return null;
   const mkr = o.memoryKeepRounds;
   if (mkr !== undefined && !topFieldValid('memoryKeepRounds', mkr)) return null;
+  // 检索回填条数与群聊记忆三件套（2026-10-29）：与上面几个同语义——传了就校验后进白名单。
+  // 校验复用读取侧 topFieldValid，读写同一份规则。
+  const mrk = o.memoryRecallK;
+  if (mrk !== undefined && !topFieldValid('memoryRecallK', mrk)) return null;
+  const mmode = o.memoryMode;
+  if (mmode !== undefined && !topFieldValid('memoryMode', mmode)) return null;
+  const gms = o.groupMemoryScope;
+  if (gms !== undefined && !topFieldValid('groupMemoryScope', gms)) return null;
+  const gmrn = o.groupMemoryRecentN;
+  if (gmrn !== undefined && !topFieldValid('groupMemoryRecentN', gmrn)) return null;
   // ---- 读屏 / 助手（2026-10-26 新增）：与上面几个全局字段同一套语义 ----
   // 传了就校验后进白名单，没传则走下面的透传保留（用户手改的值原样不动）。
   const sce = o.screenContextEnabled;
@@ -956,6 +998,11 @@ export function saveUserConfig(
   if (mce !== undefined) outConfig.memoryCompressEnabled = mce;
   if (mcr !== undefined) outConfig.memoryCompressRounds = Number(mcr);
   if (mkr !== undefined) outConfig.memoryKeepRounds = Number(mkr);
+  // 检索回填条数 + 群聊三件套：数字归一化落盘，两个枚举原样存
+  if (mrk !== undefined) outConfig.memoryRecallK = Number(mrk);
+  if (mmode !== undefined) outConfig.memoryMode = mmode;
+  if (gms !== undefined) outConfig.groupMemoryScope = gms;
+  if (gmrn !== undefined) outConfig.groupMemoryRecentN = Number(gmrn);
   // 读屏与助手：布尔原样存，黑名单做一次去空白/去重/去空串再落盘
   if (sce !== undefined) outConfig.screenContextEnabled = sce;
   if (sep !== undefined) {
@@ -994,6 +1041,10 @@ export function saveUserConfig(
   if (mce !== undefined) bodyOwned.add('memoryCompressEnabled');
   if (mcr !== undefined) bodyOwned.add('memoryCompressRounds');
   if (mkr !== undefined) bodyOwned.add('memoryKeepRounds');
+  if (mrk !== undefined) bodyOwned.add('memoryRecallK');
+  if (mmode !== undefined) bodyOwned.add('memoryMode');
+  if (gms !== undefined) bodyOwned.add('groupMemoryScope');
+  if (gmrn !== undefined) bodyOwned.add('groupMemoryRecentN');
   if (sce !== undefined) bodyOwned.add('screenContextEnabled');
   if (sep !== undefined) bodyOwned.add('screenExcludePatterns');
   if (ae !== undefined) bodyOwned.add('assistantEnabled');

@@ -43,11 +43,21 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { ID_FORBIDDEN, type ConfigPaths } from './config';
+import { migrateMemoryFile } from './memory-migrate';
 
 /** 备份包标识（导入时用来认出「这确实是我们的备份」） */
 export const BACKUP_FORMAT = 'dsh-pet-backup';
-/** 当前支持的备份格式版本。导入时 version > 本值 → 拒绝（未来版本可能改了语义）。 */
-export const BACKUP_VERSION = 1;
+/**
+ * 当前支持的备份格式版本。
+ *
+ * - v1（2026-10-27）：宠物配置 + 全局开关 + 对话记忆（`memory.json` 原文照抄）
+ * - v2（2026-10-29）：`memory.json` 在**导出时**按新记忆框架补齐（事实卡 `facts`、
+ *   群聊成员桶 `members`、迁移标记 `factsUpto`）；导入 v1 包时自动升级（见 `applyBackupImport`）
+ *
+ * 导入侧判据是 `version > BACKUP_VERSION` 才拒。v1 包永远能导入，且会被就地升级——
+ * 这是用户明确要求的「旧版本数据导入时内容自动按新框架归位」。
+ */
+export const BACKUP_VERSION = 2;
 /**
  * 整包上限（按 UTF-8 字节算）。
  *
@@ -171,13 +181,15 @@ export function collectBackup(
   const files: BackupFile[] = [];
   const skipped: string[] = [];
 
-  const push = (rel: string, abs: string): void => {
+  const push = (rel: string, abs: string, transform?: (text: string) => string): void => {
     if (files.length >= MAX_FILES) {
       skipped.push(rel);
       return;
     }
     try {
-      const text = readFileSync(abs, 'utf8');
+      const raw = readFileSync(abs, 'utf8');
+      // 转换（如记忆升级）不改变"这个文件存不存在"，失败退回原文
+      const text = transform ? transform(raw) : raw;
       if (Buffer.byteLength(text, 'utf8') > MAX_FILE_BYTES) {
         skipped.push(rel);
         return;
@@ -187,6 +199,26 @@ export function collectBackup(
       skipped.push(rel);
     }
   };
+
+  /**
+   * 把 memory.json 原文升级到新框架（v2）。
+   *
+   * 三件事：把历史消息里的稳定事实回填成事实卡、给老条目补 `factsUpto` 标记、
+   * 群聊分桶结构原样保留（`migrateMemoryFile` 递归到每个有 `messages` 的叶子）。
+   *
+   * 幂等：已经有 `facts` 数组的条目原样不动，所以导出 → 导入 → 再导出不会越滚越大。
+   * 失败返回原文（绝不因为升级失败而让备份里少一个记忆文件）。
+   */
+  function upgradeMemoryText(text: string): string {
+    try {
+      const raw: unknown = JSON.parse(text);
+      const result = migrateMemoryFile(raw, Date.now());
+      if (!result.migrated) return text;
+      return JSON.stringify(result.value, null, 2);
+    } catch {
+      return text;
+    }
+  }
 
   // 主配置：优先 .jsonc；老用户可能还停在 .json（迁移前的形态）
   if (existsSync(paths.userFile)) push('main-config.jsonc', paths.userFile);
@@ -204,7 +236,11 @@ export function collectBackup(
   }
 
   const memoryPath = join(userRoot, 'memory.json');
-  if (existsSync(memoryPath)) push('memory.json', memoryPath);
+  if (existsSync(memoryPath)) {
+    // 导出即升级（v2，2026-10-29）：把旧记忆就地补成新框架（事实卡 + 群聊成员桶 + 迁移标记）。
+    // 失败就照原文导出——备份的价值在于「能救多少救多少」，不该因为升级失败而丢掉整个记忆文件。
+    push('memory.json', memoryPath, (text) => upgradeMemoryText(text));
+  }
 
   const includeApiKey = options.includeApiKey === true;
   if (includeApiKey) {
@@ -452,12 +488,16 @@ export interface BackupApplyResult {
   backups: string[];
   /** 清掉的 API 密钥残留（导入的包不含密钥、但本机原有密钥文件时，见下方说明） */
   apiKeyKept: boolean;
+  /** `memory.json` 是否在导入时被升级到新记忆框架（v1 包 → v2 形状） */
+  memoryUpgraded: boolean;
+  /** 升级时回填的事实卡条数（0 表示没有可回填的） */
+  factsAdded: number;
 }
 
 /**
  * 执行导入：逐个写盘。
  *
- * ## 两处刻意的设计
+ * ## 三处刻意的设计
  *
  * 1. **写前先留副本**：已存在的目标文件复制成 `<名>.bak-before-import-<yyyyMMdd-HHmmss>`。
  *    导入是破坏性操作，用户手滑选错包时这是唯一的退路。副本名不匹配
@@ -466,6 +506,12 @@ export interface BackupApplyResult {
  * 2. **不含密钥的包不删本机密钥**：如果备份包 `includeApiKey === false` 且本机已有
  *    `standalone-ai.json`，**保持原样**。理由：用户的直觉是「导入配置」而不是「清空我的密钥」，
  *    静默删掉密钥会让碎碎念/对话突然全挂且完全不知道为什么。
+ *
+ * 3. **旧包自动归位（v2，2026-10-29）**：`memory.json` 在**写盘前**过一遍
+ *    `migrateMemoryFile`。v1 包里没有 `facts`/`factsUpto`，导入后新框架会认为「这些历史
+ *    从没学过事实」，于是那 28 条黑洞里的事实（住哪、养什么）永远回不来——用户明确要求
+ *    「旧版本数据导入时内容自动按新版本框架归位」，就是这一步。
+ *    **必须在 sha256 校验之后做**：校验对的是原文，就地改文本会让校验先失败。
  */
 export function applyBackupImport(
   paths: ConfigPaths,
@@ -473,7 +519,8 @@ export function applyBackupImport(
   bundle: BackupBundle,
   options: { now?: Date } = {},
 ): BackupApplyResult {
-  const stamp = (options.now ?? new Date())
+  const now = options.now ?? new Date();
+  const stamp = now
     .toISOString()
     .replace(/[-:]/g, '')
     .replace(/\..*$/, '')
@@ -481,6 +528,8 @@ export function applyBackupImport(
   const written: BackupApplyResult['written'] = [];
   const backups: string[] = [];
   const hasApiKeyFile = bundle.files.some((f) => f.path === 'standalone-ai.json');
+  let memoryUpgraded = false;
+  let factsAdded = 0;
 
   for (const f of bundle.files) {
     const absolute = f.path.startsWith('pet/')
@@ -497,9 +546,57 @@ export function applyBackupImport(
         // 复制失败不阻断导入（可能是只读），但会在 backups 里缺这一条——调用方展示数量即可
       }
     }
-    writeFileSync(absolute, f.text, 'utf8');
-    written.push({ path: f.path, bytes: Buffer.byteLength(f.text, 'utf8'), overwrite: existed });
+    let text = f.text;
+    if (f.path === 'memory.json') {
+      const up = upgradeMemoryForImport(text, now.getTime());
+      text = up.text;
+      if (up.upgraded) {
+        memoryUpgraded = true;
+        factsAdded += up.factsAdded;
+      }
+    }
+    writeFileSync(absolute, text, 'utf8');
+    written.push({ path: f.path, bytes: Buffer.byteLength(text, 'utf8'), overwrite: existed });
   }
 
-  return { written, backups, apiKeyKept: !hasApiKeyFile && existsSync(join(userRoot, 'standalone-ai.json')) };
+  return {
+    written,
+    backups,
+    apiKeyKept: !hasApiKeyFile && existsSync(join(userRoot, 'standalone-ai.json')),
+    memoryUpgraded,
+    factsAdded,
+  };
+}
+
+/**
+ * 导入干跑时的记忆升级预览：告诉用户「这一步会回填几条事实」，但一个字都不写盘。
+ *
+ * 没有 `memory.json`、或已经是新形状时返回 `undefined`（设置页据此不显示那一行）。
+ */
+export function previewMemoryUpgrade(text: string): { willUpgrade: boolean; factsAdded: number } | undefined {
+  try {
+    const raw: unknown = JSON.parse(text);
+    const result = migrateMemoryFile(raw, Date.now());
+    if (!result.migrated) return undefined;
+    return { willUpgrade: true, factsAdded: result.factsAdded };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 导入时的记忆升级：旧形状 → 新框架。
+ *
+ * 失败/不是合法 JSON 时原样返回（校验阶段已经保证能 parse，这里只是兜底）。
+ * 幂等：已经有 `facts` 的条目不动，所以 v2 包再导入一次也是零变化。
+ */
+function upgradeMemoryForImport(text: string, now: number): { text: string; upgraded: boolean; factsAdded: number } {
+  try {
+    const raw: unknown = JSON.parse(text);
+    const result = migrateMemoryFile(raw, now);
+    if (!result.migrated) return { text, upgraded: false, factsAdded: 0 };
+    return { text: JSON.stringify(result.value, null, 2), upgraded: true, factsAdded: result.factsAdded };
+  } catch {
+    return { text, upgraded: false, factsAdded: 0 };
+  }
 }

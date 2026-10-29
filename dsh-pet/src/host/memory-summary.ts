@@ -25,6 +25,8 @@
  */
 
 import type { ChatMemoryMessage } from './chat';
+import type { MemoryFact } from './memory-facts';
+import type { GroupMember } from './memory-group';
 
 /**
  * memory.json 里一只宠物对应的叶子。
@@ -41,6 +43,25 @@ export interface ChatMemoryEntry {
   summary?: string;
   /** 摘要生成时刻（ms） */
   summaryTs?: number;
+  /**
+   * L0 稳定事实卡（见 `./memory-facts`）。
+   *
+   * 与 `summary` 的分工：摘要 = 往事的**叙述**（有损、会被重写）；事实卡 = **结构化事实**
+   * （按 key 覆盖、永不压缩、不参与 `summarized` 游标）。
+   * 缺键 = 旧数据（还没有回填过），由 `./memory-migrate` 补上。
+   */
+  facts?: MemoryFact[];
+  /** 事实卡已经回填到第几条消息（迁移标记，防止重复回填） */
+  factsUpto?: number;
+  /**
+   * 群聊成员桶（`memoryMode: 'group'` 才有；见 `./memory-group`）。
+   *
+   * 为什么和单人模式共用同一个条目类型而不是另起一套：两种模式的**消息流形状完全一样**
+   * （都是 `messages` + 摘要游标），差别只在「要不要按人分桶」。共用同一个类型意味着
+   * 切换模式不需要迁移数据结构——单人模式积累的消息，切到群聊后仍在那条流里（只是老消息
+   * 没有 `sender`，会被当成「不知道是谁说的」，这是诚实的处理，不是丢数据）。
+   */
+  members?: Record<string, GroupMember>;
 }
 
 /** 未摘要轮数超过它 → 自动压缩（1 轮 = 1 问 1 答 = 2 条消息） */

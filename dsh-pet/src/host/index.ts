@@ -119,6 +119,19 @@ import {
 } from './memory-summary';
 import { configuredModel } from './model-selection';
 import { limitPool, pickMeme, readMemePool } from './memes';
+import { extractFacts, factsSection, mergeFacts, pruneFacts } from './memory-facts';
+import {
+  clampRecentN,
+  groupSection,
+  membersOf,
+  normalizeScope,
+  parseSender,
+  planMemberEviction,
+  touchMember,
+  userMessageFor,
+  type GroupScope,
+} from './memory-group';
+import { buildIndex, docsOf, recallSection, search } from './memory-retrieval';
 import {
   decideBroadcast,
   decideBubbleClear,
@@ -137,6 +150,7 @@ import {
   applyBackupImport,
   collectBackup,
   planBackupImport,
+  previewMemoryUpgrade,
   readBackup,
   BACKUP_MAX_BYTES,
 } from './portable';
@@ -1085,8 +1099,102 @@ export function apply(ctx: any): void {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 5;
   };
 
-  /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：
-   *  每只宠物独立生成（人设 = 它自己的 whisperPrompt，没写回落到所属条目）。生成成功就写进 S 的 pets.<id>.say——
+  /**
+   * 每次对话最多回填几条往事（0 = 关闭检索）。
+   *
+   * 默认 3：实测 `recall@3` 才把「我家的猫」这类问法兜住（单条 top-1 会漏同义词），
+   * 而 3 轮原文约 300 token，对 1M 窗口是可忽略的成本。
+   * 上限 10：再多就会让回填段长过近期窗口，模型会分不清「往事」和「刚说的」。
+   */
+  const recallCount = (conf: Record<string, unknown>): number => {
+    const v = Number(conf.memoryRecallK);
+    // 上限 50：与 config.ts 的 topFieldValid 同口径。成本不是瓶颈（K=50 ≈ 2,632 token
+    // = 1M 的 0.26%），真正限制在检索精度；卡 50 是为了不让它退化成"整个档案全塞进去"。
+    return Number.isFinite(v) && v >= 0 ? Math.min(50, Math.floor(v)) : 3;
+  };
+
+  /**
+   * 记忆模式（2026-10-29）：`single`（一对一，老行为）/ `group`（群聊，按人分桶）。
+   *
+   * 默认 `single`：存量部署全是单人模式，改默认值等于把所有人的老记忆重新解释一遍。
+   * 非法值回落 `single` 并在配置校验层已告警（`topFieldValid`），这里不再重复报。
+   */
+  const memoryModeOf = (conf: Record<string, unknown>): 'single' | 'group' =>
+    conf.memoryMode === 'group' ? 'group' : 'single';
+
+  /** 群聊两档策略与 N（`groupMemoryScope` / `groupMemoryRecentN`）；单人模式不读它们 */
+  const groupPolicyOf = (conf: Record<string, unknown>): { scope: GroupScope; recentN: number } => ({
+    scope: normalizeScope(conf.groupMemoryScope),
+    recentN: clampRecentN(conf.groupMemoryRecentN),
+  });
+
+  /**
+   * 从本轮用户输入里抽取稳定事实，并进事实卡（L0）。
+   *
+   * 三个刻意的选择：
+   *   1. **只抽用户说的话**，不抽宠物那半：宠物的自称「我叫哥伦比娅」会被 name 规则
+   *      抽成「用户叫哥伦比娅」——这个坑在迁移真实数据时必须避开，日常增量同理。
+   *   2. **失败不冒泡**：抽取是纯函数、几乎不会抛，但一旦抛了也绝不能让这次回复失败。
+   *   3. **超限时淘汰偏好类**（`pruneFacts`）：身份类事实少了就是「不认得我」。
+   *
+   * 返回值无意义（原地改 entry）；纯副作用集中在这里，`writeMemory` 之前调用即可。
+   */
+  const learnFacts = (entry: ChatMemoryEntry, userText: string, now: number): void => {
+    try {
+      const extracted = extractFacts(userText);
+      if (extracted.length === 0) return;
+      const existing = Array.isArray(entry.facts) ? entry.facts : [];
+      const merged = mergeFacts(existing, extracted, now);
+      if (!merged.changed) return;
+      entry.facts = pruneFacts(merged.facts);
+      entry.factsUpto = entry.messages.length;
+    } catch (e) {
+      log.warn('[dsh-pet] 事实抽取异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
+    }
+  };
+
+  // userMessageFor 在 ./memory-group（纯函数，便于单测）
+
+  /**
+   * 群聊模式下记一次发言：更新成员桶 + 淘汰超出策略的人。
+   *
+   * 单人模式**完全不执行**（连 `members` 键都不建）——否则单人用户的 memory.json 里会
+   * 多出一个空对象，导入导出与备份对比全都要跟着变。
+   *
+   * 淘汰必须排在 `touchMember` **之后**：新发言改变了「最近说话」的排序，
+   * 先淘汰会把刚说话的人当成最久没说话的那个。
+   */
+  const recordGroupSpeaker = (
+    entry: ChatMemoryEntry,
+    conf: Record<string, unknown>,
+    mode: 'single' | 'group',
+    sender: { id: string; name?: string } | undefined,
+    text: string,
+    now: number,
+  ): void => {
+    if (mode !== 'group' || !sender || !sender.id) return;
+    try {
+      const group = entry as unknown as Parameters<typeof touchMember>[0];
+      touchMember(group, sender.id, sender.name, text, now);
+      const { scope, recentN } = groupPolicyOf(conf);
+      const evicted = planMemberEviction(group, scope, recentN);
+      if (evicted.length > 0) {
+        const members = membersOf(group);
+        for (const id of evicted) delete members[id];
+        log.info(
+          `[dsh-pet] 群聊记忆淘汰 ${evicted.length} 人（scope=${scope} n=${recentN}）：` +
+            evicted.slice(0, 5).join(',') +
+            (evicted.length > 5 ? ' …' : ''),
+        );
+      }
+    } catch (e) {
+      log.warn('[dsh-pet] 群聊成员更新异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
+    }
+  };
+
+  // parseSender / userMessageFor 都在 ./memory-group（纯函数，便于单测）
+
+  /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：   *  每只宠物独立生成（人设 = 它自己的 whisperPrompt，没写回落到所属条目）。生成成功就写进 S 的 pets.<id>.say——
    *  碎碎念 / 命令气泡 / 对话回复在前端本来就是**同一条展示链路**（同一个 triggerWhisper、
    *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"周期内不重复"由
    *  调度侧的 lastWhisperAt 保证，不再需要一份 whisperCache（多端共享也由 S 天然保证）。
@@ -1223,6 +1331,13 @@ export function apply(ctx: any): void {
   const chatWithPet = async (
     petId: string,
     text: string,
+    /**
+     * 群聊发言者（2026-10-29）。`memoryMode: 'single'` 时**完全不看**它——
+     * 单人模式没有「谁在说话」这个维度，传了也不该改变任何行为（否则同一次对话
+     * 在两个模式下会走出不同的记忆形状，排查起来是灾难）。
+     * 群聊模式下 `id` 必填（缺了就没有分桶的依据，只能按单人处理并记日志）。
+     */
+    sender?: { id: string; name?: string },
   ): Promise<
     | { ok: true; text: string; image?: string }
     | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
@@ -1246,8 +1361,47 @@ export function apply(ctx: any): void {
       // 于是「问它屏幕上有什么」永远答不上来；设置页文案却写着「碎碎念和回答都能接上」。
       // 失败返回空串 -> system 与原来逐字一致，绝不因读屏失败而改变对话行为。
       const chatScreen = await screenSection(found.conf);
-      const baseSystem = petSystemPrompt(found) + memorySection(entry.summary ?? '');
-      const system = chatScreen === '' ? baseSystem : baseSystem + '\n' + chatScreen;
+      // 事实卡（L0，2026-10-29）：常驻、永不压缩。放在摘要**之前**——
+      // 摘要是「往事叙述」（有损），事实卡是「确定的事」（按键覆盖），重要度更高，位置也更靠前。
+      // 缺键（旧数据）→ `factsSection([])` 返回空串，拼出来的 system 与改造前逐字一致。
+      const facts = Array.isArray(entry.facts) ? entry.facts : [];
+      const baseSystem =
+        petSystemPrompt(found) + factsSection(facts) + memorySection(entry.summary ?? '');
+      // 检索回填（L3，2026-10-29）：只从**既不在摘要、也不在近期窗口**的那段里捞。
+      // 那段正是旧框架的「黑洞」（实测真实数据 28 条 / 61% 完全不可见）。
+      // k 来自 `memoryRecallK`（0 = 关闭）；关闭时整段不参与，system 与原来逐字一致。
+      const recallK = recallCount(found.conf);
+      const recallText = ((): string => {
+        if (recallK <= 0) return '';
+        const summarized = summarizedOf(entry);
+        const windowStart = Math.max(summarized, entry.messages.length - rounds * 2);
+        const docs = docsOf(entry.messages, { start: summarized, end: windowStart });
+        if (docs.length === 0) return '';
+        return recallSection(search(buildIndex(docs), text, recallK));
+      })();
+      // 群聊段（L0'，2026-10-29）：单人模式**一个字也不加**（`groupSection` 只在 group 模式被调，
+      // 此时拼出来的 system 与改造前逐字一致）。
+      //
+      // 位置很有讲究：放在「事实卡 + 摘要」之后、读屏之前。理由是它在语义上属于"关于人的记忆"，
+      // 与上面两段连成一串；而读屏是"此刻环境"，属于另一个维度，夹在中间会让模型误以为
+      // 「现在跟你说话的是张三」也是屏幕读出来的。
+      const mode = memoryModeOf(found.conf);
+      const gpol = groupPolicyOf(found.conf);
+      let groupText = '';
+      if (mode === 'group') {
+        // 没有 sender 就不分桶（例如手写 HTTP 调用没带 sender）：按单人处理，
+        // 但要留下日志——否则用户会以为"群聊开着，怎么还是不分人"，却查不到任何线索。
+        if (sender && sender.id) {
+          groupText = groupSection(entry, gpol.scope, gpol.recentN, sender);
+        } else {
+          log.warn(
+            `[dsh-pet] memoryMode=group 但这次请求没带 sender（pet=${petId}），本条按单人处理、不分桶`,
+          );
+          groupText = groupSection(entry, gpol.scope, gpol.recentN);
+        }
+      }
+      const system =
+        (chatScreen === '' ? baseSystem + groupText : baseSystem + groupText + '\n' + chatScreen) + recallText;
       // 配图：开关关闭 → 空池（指令与解析都不介入，与旧行为逐字一致）；目录链按所属条目取。
       // 张数上限（chatImageLimit，0 = 不限制）：整张清单每条消息都要附，截断后费用上限可控。
       const pool =
@@ -1328,8 +1482,12 @@ export function apply(ctx: any): void {
         }
         // 成功：记忆存正文（动作明细不进对话历史，避免把工具日志当聊天记录读回去）
         const now2 = Date.now();
-        entry.messages.push({ role: 'user', content: text, ts: now2 });
+        entry.messages.push(userMessageFor(text, now2, sender, mode));
         entry.messages.push({ role: 'assistant', content: outcome.text, ts: now2 });
+        // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）
+        learnFacts(entry, text, now2);
+        // 群聊成员桶（同位置：与消息一次落盘）
+        recordGroupSpeaker(entry, found.conf, mode, sender, text, now2);
         await writeMemory(mem);
         try {
           await compressMemory(mem, entry, found.conf);
@@ -1349,9 +1507,13 @@ export function apply(ctx: any): void {
       const generated = await generateChat(ctx, system, list, text, pool, configuredModel(found.conf, 'chatModel'));
       if (!generated.ok) return generated;
       const now = Date.now();
-      entry.messages.push({ role: 'user', content: text, ts: now });
+      entry.messages.push(userMessageFor(text, now, sender, mode));
       // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
       entry.messages.push({ role: 'assistant', content: generated.text, ts: now });
+      // 事实卡增量更新（同助手分支：在 writeMemory 之前，一次落盘）
+      learnFacts(entry, text, now);
+      // 群聊成员桶（同助手分支：与消息一次落盘）
+      recordGroupSpeaker(entry, found.conf, mode, sender, text, now);
       await writeMemory(mem);
       // 自动压缩：**回复已经写盘并且已经拿到文本**，压缩放在最后且失败不冒泡——
       // 摘要只是长期记忆的优化，绝不能让"这次回复"因为压缩失败而失败（用户会看到一句话都发不出去）。
@@ -2280,16 +2442,21 @@ export function apply(ctx: any): void {
       const plan = planBackupImport(configPaths, userRoot, checked.bundle);
       const dry = payload?.dry === true;
       if (dry) {
+        // 干跑时也算一遍「旧记忆会被升级成什么」，让用户确认前就知道这一步会发生
+        const memFile = checked.bundle.files.find((f) => f.path === 'memory.json');
+        const memPlan = memFile === undefined ? undefined : previewMemoryUpgrade(memFile.text);
         return {
           kind: 'json',
           status: 200,
           obj: {
             ok: true,
             dry: true,
+            version: checked.bundle.version,
             exportedAt: checked.bundle.exportedAt,
             appVersion: checked.bundle.appVersion,
             includeApiKey: checked.bundle.includeApiKey,
             files: plan,
+            memory: memPlan,
           },
         };
       }
@@ -2298,7 +2465,8 @@ export function apply(ctx: any): void {
         log.info(
           `[dsh-pet] 导入备份：写入 ${result.written.length} 个文件，` +
             `留副本 ${result.backups.length} 份` +
-            (result.apiKeyKept ? '，本机密钥保持不变' : ''),
+            (result.apiKeyKept ? '，本机密钥保持不变' : '') +
+            (result.memoryUpgraded ? `，记忆已按新框架归位（回填 ${result.factsAdded} 条事实）` : ''),
         );
         // 配置与记忆都可能变了：重解析桌面宠物（异步，不阻塞响应）。
         // 记忆/密钥由各自的读取函数每次重读文件，不需要额外通知。
@@ -2308,9 +2476,12 @@ export function apply(ctx: any): void {
           status: 200,
           obj: {
             ok: true,
+            version: checked.bundle.version,
             written: result.written,
             backups: result.backups,
             apiKeyKept: result.apiKeyKept,
+            memoryUpgraded: result.memoryUpgraded,
+            factsAdded: result.factsAdded,
           },
         };
       } catch (e) {
@@ -3283,6 +3454,13 @@ export function apply(ctx: any): void {
               ? mainNow.assistantPermission
               : 'readonly',
             assistantNetworkEnabled: mainNow.assistantNetworkEnabled !== false,
+            // 记忆设置（2026-10-29）：与上面几个同一接口，省一条路由。
+            // 缺键回默认（single / everyone / 10 / 3），设置页直接照抄进控件。
+            memoryMode: memoryModeOf(mainNow),
+            groupMemoryScope: normalizeScope(mainNow.groupMemoryScope),
+            groupMemoryRecentN: clampRecentN(mainNow.groupMemoryRecentN),
+            memoryRecallK: recallCount(mainNow),
+            chatMemoryRounds: memoryRounds(mainNow),
             workspaceRoot: assistantWorkspace,
             pets,
             /** 读屏能力是否可用（pwsh 找不到时为 false，设置页据此禁用开关并说明原因） */
@@ -3320,6 +3498,13 @@ export function apply(ctx: any): void {
         'assistantEnabled',
         'assistantPermission',
         'assistantNetworkEnabled',
+        // 记忆设置（2026-10-29）：走同一条白名单。saveUserConfig 内部还会再过一次
+        // topFieldValid，非法值在那一层被拒（返回 null → bad-request），这里不重复校验。
+        'memoryMode',
+        'groupMemoryScope',
+        'groupMemoryRecentN',
+        'memoryRecallK',
+        'chatMemoryRounds',
       ]) {
         if (patch[key] === undefined) continue;
         next[key] = patch[key];
@@ -3505,7 +3690,10 @@ export function apply(ctx: any): void {
               obj: { ok: false, reason: 'bad-request', message: '消息过长（限 2000 字）' },
             };
           }
-          const result = await chatWithPet(petId, text);
+          // 群聊发言者（2026-10-29）：`sender` 可以是字符串（id）或 `{id, name}`。
+          // 解错就当成没带（单人模式本来就不看它；群聊模式按单人处理并记日志，不猜身份）。
+          const sender = parseSender(parsed.sender);
+          const result = await chatWithPet(petId, text, sender);
           return { kind: 'json', status: 200, obj: result };
         }
       } catch (e) {
@@ -4059,7 +4247,9 @@ export function apply(ctx: any): void {
             return { kind: 'success', text: '已让桌宠碎碎念一句' };
           }
           if (text.length > 2000) return { kind: 'error', text: '消息过长（限 2000 字）' };
-          void chatWithPet(petId, text).then((r) => {
+          // 群聊模式下这条命令也得有个发言者，否则它会被当成「不知道谁说的」塞进共享流，
+          // 把真正那个人的上下文冲掉。用固定 id `local`——它确实是另一个"人"（本机键盘前面的那位）。
+          void chatWithPet(petId, text, { id: 'local' }).then((r) => {
             if (!r.ok) {
               log.warn('[dsh-pet] 对话失败 reason=' + r.reason + (r.message ? ' ' + r.message : ''));
             }

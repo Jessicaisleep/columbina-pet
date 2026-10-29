@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,7 @@ import {
   collectBackup,
   isAllowedBackupPath,
   planBackupImport,
+  previewMemoryUpgrade,
   readBackup,
   validateBackup,
 } from './portable.ts';
@@ -332,4 +334,166 @@ test('collectBackup：pet/ 里前缀超长的配置文件被跳过而不是让�
   } finally {
     f.cleanup();
   }
+});
+
+// ── v2：旧记忆在导出/导入时按新框架归位 ──────────────────────────────
+
+/** 造一份 v1 形状的 memory.json（没有 facts / factsUpto / members） */
+function legacyMemory(): string {
+  const mk = (msgs: Array<{ role: string; content: string; ts: number }>) => ({
+    messages: msgs,
+    summarized: 0,
+    summary: '',
+  });
+  return JSON.stringify(
+    {
+      pet: {
+        nahida1: mk([
+          { role: 'user', content: '记住我住在杭州。', ts: 1000 },
+          { role: 'assistant', content: '好的，杭州。', ts: 1001 },
+          { role: 'user', content: '我养了一只猫叫团子。', ts: 1002 },
+          { role: 'assistant', content: '团子真可爱。', ts: 1003 },
+        ]),
+      },
+    },
+    null,
+    2,
+  );
+}
+
+test('collectBackup：导出的 memory.json 已按新框架补事实卡（v2 形状）', () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.userRoot, 'memory.json'), legacyMemory(), 'utf8');
+    const { bundle } = collectBackup(f.paths, f.userRoot);
+    const mem = bundle.files.find((x) => x.path === 'memory.json');
+    assert.ok(mem !== undefined);
+    const parsed = JSON.parse(mem.text) as Record<string, Record<string, Record<string, unknown>>>;
+    const entry = parsed.pet.nahida1;
+    assert.ok(Array.isArray(entry.facts), '导出物里应该有 facts 数组');
+    const facts = entry.facts as Array<{ kind: string; key: string; value: string }>;
+    assert.deepEqual(
+      facts.map((x) => `${x.kind}|${x.key}=${x.value}`).sort(),
+      ['identity|city=杭州', 'identity|pet=猫·团子'],
+    );
+    assert.equal(entry.factsUpto, 4, '迁移标记应为消息条数');
+    assert.equal(bundle.version, BACKUP_VERSION);
+    assert.equal(BACKUP_VERSION, 2, '导出物升到 v2');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('collectBackup：已经是新框架的 memory.json 导出时原样不动（幂等）', () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.userRoot, 'memory.json'), legacyMemory(), 'utf8');
+    const first = collectBackup(f.paths, f.userRoot).bundle.files.find((x) => x.path === 'memory.json');
+    assert.ok(first !== undefined);
+    // 把升级后的文本写回磁盘，再导出一次：应当逐字节一致
+    writeFileSync(join(f.userRoot, 'memory.json'), first.text, 'utf8');
+    const second = collectBackup(f.paths, f.userRoot).bundle.files.find((x) => x.path === 'memory.json');
+    assert.ok(second !== undefined);
+    assert.equal(second.text, first.text, '第二次导出不应再改一个字');
+    assert.equal(second.sha256, first.sha256);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('collectBackup：memory.json 不是合法 JSON 时照原文导出（备份不该因升级失败少个文件）', () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.userRoot, 'memory.json'), 'not json at all', 'utf8');
+    const { bundle } = collectBackup(f.paths, f.userRoot);
+    const mem = bundle.files.find((x) => x.path === 'memory.json');
+    assert.ok(mem !== undefined, '文件仍然在包里');
+    assert.equal(mem.text, 'not json at all', '原文照抄，不因升级失败丢内容');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('applyBackupImport：导入 v1 老包时记忆自动归位，并报出回填条数', () => {
+  const f = fixture();
+  try {
+    // 手工拼一个 v1 包（version:1，memory 是旧形状），模拟老用户手里的备份
+    const files = [
+      { path: 'memory.json', text: legacyMemory() },
+      { path: 'pet/nahida-config.json', text: '{"pets":[{"id":"nahida1","name":"纳西妲"}]}' },
+    ].map((x) => ({ ...x, sha256: createHash('sha256').update(x.text, 'utf8').digest('hex') }));
+    const bundle = {
+      format: BACKUP_FORMAT,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      appVersion: '0.3.8',
+      includeApiKey: false,
+      files,
+      sha256: '',
+    } as unknown as Parameters<typeof applyBackupImport>[2];
+
+    const result = applyBackupImport(f.paths, f.userRoot, bundle, {
+      now: new Date('2026-10-30T00:00:00Z'),
+    });
+    assert.equal(result.memoryUpgraded, true);
+    assert.equal(result.factsAdded, 2);
+
+    const onDisk = JSON.parse(readFileSync(join(f.userRoot, 'memory.json'), 'utf8')) as Record<
+      string,
+      Record<string, Record<string, unknown>>
+    >;
+    const entry = onDisk.pet.nahida1;
+    assert.ok(Array.isArray(entry.facts), '落盘的记忆应当已是新框架');
+    assert.equal((entry.facts as unknown[]).length, 2);
+    assert.equal(entry.factsUpto, 4);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('applyBackupImport：导入已是 v2 的包时不重复回填、factsAdded 为 0', () => {
+  const f = fixture();
+  try {
+    // 先导一次 v1 让磁盘变成 v2 形状，再把这个 v2 文本原样当新包导进来
+    const first = [
+      { path: 'memory.json', text: legacyMemory() },
+    ].map((x) => ({ ...x, sha256: createHash('sha256').update(x.text, 'utf8').digest('hex') }));
+    applyBackupImport(f.paths, f.userRoot, {
+      format: BACKUP_FORMAT,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      appVersion: '',
+      includeApiKey: false,
+      files: first,
+      sha256: '',
+    } as unknown as Parameters<typeof applyBackupImport>[2]);
+
+    const upgraded = readFileSync(join(f.userRoot, 'memory.json'), 'utf8');
+    const second = [{ path: 'memory.json', text: upgraded }].map((x) => ({
+      ...x,
+      sha256: createHash('sha256').update(x.text, 'utf8').digest('hex'),
+    }));
+    const result = applyBackupImport(f.paths, f.userRoot, {
+      format: BACKUP_FORMAT,
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      appVersion: '',
+      includeApiKey: false,
+      files: second,
+      sha256: '',
+    } as unknown as Parameters<typeof applyBackupImport>[2]);
+
+    assert.equal(result.memoryUpgraded, false, 'v2 已经是新形状，不该再升级');
+    assert.equal(result.factsAdded, 0);
+    assert.equal(readFileSync(join(f.userRoot, 'memory.json'), 'utf8'), upgraded);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('previewMemoryUpgrade：干跑只算不写，v1 记忆报出会回填几条', () => {
+  const p = previewMemoryUpgrade(legacyMemory());
+  assert.deepEqual(p, { willUpgrade: true, factsAdded: 2 });
+  assert.equal(previewMemoryUpgrade('{"pet":{}}'), undefined, '没有可迁移的叶子 → 不给这一行');
+  assert.equal(previewMemoryUpgrade('not json'), undefined);
 });

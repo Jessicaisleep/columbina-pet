@@ -38,11 +38,18 @@ export type ChatGenerateResult =
   | { ok: true; text: string; image?: string }
   | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string };
 
-/** 记忆中的一条消息（与 shared/chat.ts 的 ChatMessage 同构） */
+/** 记忆中的一条消息（与 shared/chat.ts 的 ChatMessage 同构）
+ *
+ *  `sender` / `senderName`（2026-10-29 新增，群聊用）：**谁说的**。
+ *  单人模式缺省不写（保持老文件的形状，`deepEqual` 断言与 /chat 消费端都不用改）；
+ *  群聊模式下 user 消息必带 `sender`，assistant 消息不带（宠物就是宠物自己）。
+ *  这两个字段只作**归属标记**，不参与送给模型的内容——模型看到的仍是 role+content。 */
 export interface ChatMemoryMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: number;
+  sender?: string;
+  senderName?: string;
 }
 
 /** 单次生成超时（ms）：对话等 LLM 回复，60s 足够 */
