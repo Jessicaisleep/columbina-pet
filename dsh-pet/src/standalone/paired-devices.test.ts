@@ -80,7 +80,10 @@ test('upsert 空 id 直接忽略（不给"匿名设备"留口子）', () => {
 
 test('removeDevice 只删指定 id', () => {
   const list = [device('a', 1), device('b', 2)];
-  assert.deepEqual(removeDevice(list, 'a').map((d) => d.id), ['b']);
+  assert.deepEqual(
+    removeDevice(list, 'a').map((d) => d.id),
+    ['b'],
+  );
 });
 
 test('parseDevices：坏 JSON / 坏条目一律丢，不抛异常（脏数据不能让用户被永久只读）', () => {
@@ -98,17 +101,26 @@ test('parseDevices：坏 JSON / 坏条目一律丢，不抛异常（脏数据不
       ],
     }),
   );
-  assert.deepEqual(list.map((d) => d.id), ['ok', 'bad-nums']);
+  assert.deepEqual(
+    list.map((d) => d.id),
+    ['ok', 'bad-nums'],
+  );
   assert.equal(list[1].pairedAt, 0, '非法时间回落成 0，不是 NaN');
   assert.equal(list[1].lastSeenAt, 0);
 });
 
 test('parseTable：devices 与 revoked 一起读出来；顶层数组老格式仍兼容', () => {
   const table = parseTable(JSON.stringify({ devices: [{ id: 'a' }], revoked: ['gone', '', 5] }));
-  assert.deepEqual(table.devices.map((d) => d.id), ['a']);
+  assert.deepEqual(
+    table.devices.map((d) => d.id),
+    ['a'],
+  );
   assert.deepEqual(table.revoked, ['gone']);
   const legacy = parseTable(JSON.stringify([{ id: 'old' }]));
-  assert.deepEqual(legacy.devices.map((d) => d.id), ['old']);
+  assert.deepEqual(
+    legacy.devices.map((d) => d.id),
+    ['old'],
+  );
   assert.deepEqual(legacy.revoked, []);
 });
 
@@ -124,14 +136,23 @@ test('落盘：register → touch 生效、未登记的 id 不写、删除后进
   assert.deepEqual((await readTable(home)).devices, [], '文件不存在 = 空表');
 
   const t1 = await registerDevice(home, { id: 'a', name: 'Pixel', at: 10_000 });
-  assert.deepEqual(t1.devices.map((d) => d.id), ['a']);
+  assert.deepEqual(
+    t1.devices.map((d) => d.id),
+    ['a'],
+  );
   // 真的写进了磁盘（否则重启后「谁配过」就丢了 → 电脑会永远可写）
   const onDisk = JSON.parse(await readFile(pairedDevicesPath(home), 'utf8')) as { devices: { id: string }[] };
-  assert.deepEqual(onDisk.devices.map((d) => d.id), ['a']);
+  assert.deepEqual(
+    onDisk.devices.map((d) => d.id),
+    ['a'],
+  );
 
   // 未登记的 id 不写（否则拿到令牌的人能往表里塞设备，把电脑钉成只读）
   const t2 = await touchDevice(home, { id: 'intruder', at: 20_000 });
-  assert.deepEqual(t2.devices.map((d) => d.id), ['a']);
+  assert.deepEqual(
+    t2.devices.map((d) => d.id),
+    ['a'],
+  );
 
   // 心跳：默认 15 秒内不写（省盘），过了就写
   const t3 = await touchDevice(home, { id: 'a', at: 20_000 });
@@ -154,7 +175,10 @@ test('重新配对同一台会把它从 revoked 里放出来（删错了能救�
   assert.equal(isRevoked(dropped, 'a'), true);
   const again = await registerDevice(home, { id: 'a', at: 2000 });
   assert.equal(isRevoked(again, 'a'), false);
-  assert.deepEqual(again.devices.map((d) => d.id), ['a']);
+  assert.deepEqual(
+    again.devices.map((d) => d.id),
+    ['a'],
+  );
 });
 
 test('坏文件不阻断任何事（读表失败 = 空表 = 电脑可写）', async () => {

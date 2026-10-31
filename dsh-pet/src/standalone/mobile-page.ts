@@ -228,8 +228,8 @@ export const mobileScript = `'use strict';
   function askAI(text){
     var c=aiConf();
     // 结尾的斜杠去掉再拼路径。这里**不能写正则字面量**：这段代码长在本文件的模板字符串里，
-    // 正则里的 \/ 会被模板字符串当作转义吃掉，产出 /+$/ —— 浏览器直接 SyntaxError，
-    // 整段脚本不执行（页面看着正常，实际一个按钮都没接上）。
+    // 正则里转义的斜杠会被模板字符串吃掉，产出一个坏掉的正则 —— 浏览器直接 SyntaxError，
+    // 整段脚本不执行（页面看着正常，实际一个按钮都没接上）。用循环比正则稳。
     var u=String(c.url||'');
     while(u.slice(-1)==='/')u=u.slice(0,-1);
     return fetch(u+'/chat/completions',{method:'POST',
@@ -261,8 +261,8 @@ export const mobileScript = `'use strict';
     try{n=localStorage.getItem(LS_DEVNAME)||''}catch(e){}
     if(!n){
       var ua=navigator.userAgent||'';
-      // 注意：本段在模板字符串里，正则里的反斜杠要写两份（\\) 才会原样产出 \)
-      // —— 只写一份会被模板字符串吃成 )，产出一个**非法正则**，整段脚本直接 SyntaxError。
+      // 注意：本段在模板字符串里，正则里的反斜杠要写两份，才会原样产出一个反斜杠加右括号
+      // —— 只写一份会被模板字符串吃掉，产出一个**非法正则**，整段脚本直接 SyntaxError。
       var m=ua.match(/Android[^;]*;([^)]+)\\)/);
       n=((m&&m[1])||'手机').trim().slice(0,40);
       try{localStorage.setItem(LS_DEVNAME,n)}catch(e){}

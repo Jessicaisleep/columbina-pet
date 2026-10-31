@@ -300,9 +300,7 @@ export function makeBalanceBubble(rt: {
  * assetRoot：**只在 image 形态下有意义**——素材根（= 该宠物的条目 key），决定图片去哪个表情包
  *        目录链取（种类独占 pet/<名>-memes/ → 用户目录 → 包内），与动画素材同一套归属语义。
  */
-export function makeWhisperBubble(rt: {
-  h: typeof jsx;
-}): (props: {
+export function makeWhisperBubble(rt: { h: typeof jsx }): (props: {
   text: string;
   image?: string;
   url?: string;

@@ -1593,9 +1593,7 @@ class PetSprite {
   inputBusy() {
     // 可点的余额气泡是第四个来源：它同样长在窗口里、同样靠窗口级 click 触发，而它悬在宠物头顶的
     // 余量区——那一块平时是穿透的，正需要借 busy + 控件矩形把它"圈"出来（见 syncInputRegions）。
-    return (
-      this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable() || this.whisperCalling()
-    );
+    return this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable() || this.whisperCalling();
   }
 
   /**

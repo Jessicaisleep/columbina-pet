@@ -122,10 +122,12 @@ export function phoneTakeover(list: PairedDevice[], now: number, graceMs: number
 /** 给用户看的接管说明（电脑端界面与日志共用同一句，别各写一套） */
 export function takeoverReason(minutesAgo?: number): string {
   const tail =
-    minutesAgo === undefined
-      ? ''
-      : `（最后一次连上是 ${minutesAgo <= 0 ? '刚刚' : minutesAgo + ' 分钟前'}）`;
-  return '手机不在同一网络，现在由手机那边接着记对话' + tail + '。电脑这边先不写，免得两边对不上；手机回到这个网络就自动恢复。';
+    minutesAgo === undefined ? '' : `（最后一次连上是 ${minutesAgo <= 0 ? '刚刚' : minutesAgo + ' 分钟前'}）`;
+  return (
+    '手机不在同一网络，现在由手机那边接着记对话' +
+    tail +
+    '。电脑这边先不写，免得两边对不上；手机回到这个网络就自动恢复。'
+  );
 }
 
 /**

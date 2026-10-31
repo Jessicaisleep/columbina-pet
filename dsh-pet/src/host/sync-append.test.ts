@@ -24,8 +24,14 @@ test('空流追加两条：按 ts 排序进入末尾，返回 added=2', () => {
   assert.equal(r.added, 2);
   assert.equal(r.skipped, 0);
   assert.equal(r.dropped, 0);
-  assert.deepEqual(e.messages.map((m) => m.content), ['第一句', '第二句']);
-  assert.deepEqual(e.messages.map((m) => m.id), ['a', 'b']);
+  assert.deepEqual(
+    e.messages.map((m) => m.content),
+    ['第一句', '第二句'],
+  );
+  assert.deepEqual(
+    e.messages.map((m) => m.id),
+    ['a', 'b'],
+  );
 });
 
 test('★ 按编号去重：同一条传两遍只进一条（重试幂等）', () => {
@@ -45,7 +51,10 @@ test('★ 只追加：已有消息的顺序与内容一个字都不动', () => {
     { role: 'assistant', content: '电脑上的旧回答', ts: 200, id: 'old-2' },
   ]);
   appendMessages(e, [{ id: 'new-1', role: 'user', content: '手机上的新话', ts: 300 }]);
-  assert.deepEqual(e.messages.map((m) => m.content), ['电脑上的旧话', '电脑上的旧回答', '手机上的新话']);
+  assert.deepEqual(
+    e.messages.map((m) => m.content),
+    ['电脑上的旧话', '电脑上的旧回答', '手机上的新话'],
+  );
 });
 
 test('★ 派生状态绝不动（摘要/事实卡/进度只有电脑能写）', () => {
@@ -54,7 +63,7 @@ test('★ 派生状态绝不动（摘要/事实卡/进度只有电脑能写）',
     summary: '电脑算出来的摘要',
     summarized: 1,
     summaryTs: 12_345,
-    facts: [{ text: '主人喜欢安静', ts: 1 }] as ChatMemoryEntry['facts'],
+    facts: [{ kind: 'preference', key: 'like:安静', value: '主人喜欢安静', firstTs: 1, lastTs: 1 }],
     factsUpto: 1,
   };
   appendMessages(e, [{ id: 'b', role: 'user', content: '新增一句', ts: 200 }]);
@@ -81,7 +90,10 @@ test('坏数据一律丢弃：缺编号 / 空内容 / 时间非法 / 角色非�
   ]);
   assert.equal(r.added, 1);
   assert.equal(r.dropped, 9);
-  assert.deepEqual(e.messages.map((m) => m.id), ['good']);
+  assert.deepEqual(
+    e.messages.map((m) => m.id),
+    ['good'],
+  );
 });
 
 test('原样保留 origin / sender / senderName（群里说话的人不能丢）', () => {

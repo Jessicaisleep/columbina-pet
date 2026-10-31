@@ -189,8 +189,7 @@ export function startRouter(
      *
      * <p>必须在 authorize **之后**取：没令牌的请求不许替手机续命（否则任何人都能让电脑保持可写）。
      */
-    const deviceId =
-      typeof req.headers['x-dsh-pet-device'] === 'string' ? req.headers['x-dsh-pet-device'].trim() : '';
+    const deviceId = typeof req.headers['x-dsh-pet-device'] === 'string' ? req.headers['x-dsh-pet-device'].trim() : '';
     if (method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
@@ -320,13 +319,17 @@ export function startRouter(
       if (url.pathname === '/mobile/api/devices/remove' && method === 'POST') {
         if (!deps.devices) return void rejectRequest(res, 404, '手机连接未启用');
         const raw = await readBodyText(request).catch(() => '');
-        let id = '';
-        try {
-          const parsed = JSON.parse(raw) as { id?: unknown } | null;
-          id = typeof parsed?.id === 'string' ? parsed.id.trim() : '';
-        } catch {
-          return void rejectRequest(res, 400, '请求体不是合法 JSON');
-        }
+        // 用 IIFE 而不是 `let id = ''` + try 里覆盖：后者那个初值永远读不到，
+        // eslint 的 no-useless-assignment 会判红（它是对的，别为了躲规则改成禁用注解）。
+        const parsed = ((): { id?: unknown } | null | undefined => {
+          try {
+            return JSON.parse(raw) as { id?: unknown } | null;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (parsed === undefined) return void rejectRequest(res, 400, '请求体不是合法 JSON');
+        const id = typeof parsed?.id === 'string' ? parsed.id.trim() : '';
         if (id === '') return void rejectRequest(res, 400, '缺少设备 id');
         const table = await deps.devices.drop(id);
         deps.log('已删除配对手机 ' + id + '（电脑恢复可写）');

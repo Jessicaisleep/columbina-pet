@@ -227,7 +227,14 @@ import { composeSystemPrompt, petPersona } from './persona';
 import { ScreenReader, screenContextOf, screenReaderAvailable } from './screen-context';
 import { ChatActivity, CHAT_QUIET_MS } from './chat-activity';
 import { appendMessages } from './sync-append';
-import { appendLogLines, assignIds, atomicWriteText, collectNewLines, MEMORY_LOG_FILE, readLoggedIds } from './memory-io';
+import {
+  appendLogLines,
+  assignIds,
+  atomicWriteText,
+  collectNewLines,
+  MEMORY_LOG_FILE,
+  readLoggedIds,
+} from './memory-io';
 import { MobileScreenStore, mobileScreenSection } from './mobile-screen';
 import { PAIRED_DEVICES_FILE, parseDevices, phoneTakeover, takeoverReason } from '../standalone/paired-devices';
 import { runAssistant } from './assistant/loop';
@@ -2123,7 +2130,11 @@ export function apply(ctx: any): void {
     opts?: { groupId?: string; force?: boolean },
   ): Promise<
     | { ok: true; text: string; group?: string }
-    | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet' | ProactiveSkip | 'phone-takeover'; message?: string }
+    | {
+        ok: false;
+        reason: 'provider-missing' | 'generate-error' | 'unknown-pet' | ProactiveSkip | 'phone-takeover';
+        message?: string;
+      }
   > =>
     withMemoryLock(async () => {
       // 手机接管期间不主动开口：这条会写进记忆（一条 assistant + origin=proactive），
@@ -3520,7 +3531,11 @@ export function apply(ctx: any): void {
       }
       // 一次最多 2000 条：手机离线一周也到不了这个量，超过就是有人在喂垃圾。
       if (incoming.length > 2000) {
-        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: 'messages 过多（限 2000 条）' } };
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'bad-request', message: 'messages 过多（限 2000 条）' },
+        };
       }
       // 宠物 id 从 query 自己取：下面的 `petId` 常量在本分支**之后**才声明，
       // 直接引用会掉进 TDZ（实测 500：「Cannot access 'petId' before initialization」）。
@@ -3532,7 +3547,12 @@ export function apply(ctx: any): void {
       return await withMemoryLock(async () => {
         const cfg = readAllConfig(configPaths);
         const found = findPetInstance(cfg, targetPet);
-        if (!found) return { kind: 'json', status: 200, obj: { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + targetPet } };
+        if (!found)
+          return {
+            kind: 'json',
+            status: 200,
+            obj: { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + targetPet },
+          };
         const mem = await readMemory();
         const entry = memoryEntryOf(mem, found.entry, targetPet);
         const outcome = appendMessages(entry, incoming);
@@ -3543,7 +3563,13 @@ export function apply(ctx: any): void {
         return {
           kind: 'json',
           status: 200,
-          obj: { ok: true, added: outcome.added, skipped: outcome.skipped, dropped: outcome.dropped, total: entry.messages.length },
+          obj: {
+            ok: true,
+            added: outcome.added,
+            skipped: outcome.skipped,
+            dropped: outcome.dropped,
+            total: entry.messages.length,
+          },
         };
       });
     }
@@ -3578,7 +3604,11 @@ export function apply(ctx: any): void {
       // 手机在场时它自己就在上传，不需要电脑存一份；拒收回 200 + accepted:false，让手机不用重试。
       const takeover = await phoneGate();
       if (takeover !== undefined) {
-        return { kind: 'json', status: 200, obj: { ok: true, accepted: false, chars: 0, reason: 'phone-takeover', message: takeover } };
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: true, accepted: false, chars: 0, reason: 'phone-takeover', message: takeover },
+        };
       }
       const snap = mobileScreen.put(parsed);
       return {

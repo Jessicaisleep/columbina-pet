@@ -2929,6 +2929,84 @@ paths:
                     type: string
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+  /dsh-pet-7340/sync/append:
+    post:
+      tags: [Action]
+      operationId: syncAppend
+      summary: 手机离线期间说的话整段追加回电脑记忆
+      description: |
+        手机断网时把用户说的话（以及它自己生成的回话，如果手机上配了 API 密钥）按顺序存进本地队列，
+        回到同一网络后调用这里整段补齐。**只追加，不合并**：手机接管期间电脑一个字都没写，
+        所以没有冲突要解，只剩「把缺的补上」。
+
+        幂等靠 `id`：同一条消息传两遍只会进一条。`id` 必须由手机生成且稳定
+        （形如 `m-<宠物>-<时间36>-<序号>`），与电脑自己分配的编号在同一命名空间里，不能重号。
+
+        **派生状态一律不动**：`summary` / `facts` / `summarized` / `summaryTs` / `factsUpto`
+        都保持原值。摘要与事实卡永远只有一个作者（电脑），否则两个作者会互相覆盖。
+        推论：手机离线期间不做压缩，回家由电脑统一重算。
+
+        坏数据不报错、只丢弃并计数：缺 `id`、空 `content`、`ts` 不是正数、
+        `role` 不是 `user` 或 `assistant`（`system` 一律丢）。
+      parameters:
+        - $ref: "#/components/parameters/PetIdQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  maxItems: 2000
+                  items:
+                    type: object
+                    required: [id, role, content, ts]
+                    properties:
+                      id:
+                        type: string
+                        description: 手机生成的稳定编号，用于幂等去重。
+                      role:
+                        type: string
+                        enum: [user, assistant]
+                      content:
+                        type: string
+                      ts:
+                        type: number
+                        description: 毫秒时间戳，用来按原时间顺序排进末尾。
+                      origin:
+                        type: string
+                        description: 来源标记，手机会写 offline；不传则不留该字段。
+      responses:
+        "200":
+          description: |
+            `{ ok: true, added, skipped, dropped, total }` —— `added` 是真正写进去的条数，
+            `skipped` 是按 id 判定重复而跳过的条数，`dropped` 是坏数据条数，`total` 是追加后总数。
+            `messages` 不是数组或超过 2000 条 → `{ ok: false, reason: "bad-request", message }`；
+            `pet` 缺失或不存在 → `{ ok: false, reason: "unknown-pet" }`。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  added:
+                    type: integer
+                  skipped:
+                    type: integer
+                  dropped:
+                    type: integer
+                  total:
+                    type: integer
+                  reason:
+                    type: string
+                  message:
+                    type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
 components:
   parameters:
     PetIdQuery:
