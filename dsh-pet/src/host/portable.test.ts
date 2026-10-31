@@ -309,7 +309,8 @@ test('collectBackup：主配置缺失但存在旧 .json 时回落到它', () => 
   const f = fixture();
   try {
     rmSync(f.paths.userFile);
-    writeFileSync(f.paths.legacyUserFile, '{"pets":[]}', 'utf8');
+    // legacyUserFile 在 ConfigPaths 里是可选字段（旧版 .json 回落用），fixture 里一定构造了它
+    writeFileSync(f.paths.legacyUserFile!, '{"pets":[]}', 'utf8');
     const { bundle } = collectBackup(f.paths, f.userRoot);
     const main = bundle.files.find((x) => x.path === 'main-config.jsonc');
     assert.ok(main !== undefined);
@@ -327,7 +328,10 @@ test('collectBackup：pet/ 里前缀超长的配置文件被跳过而不是让�
     const longPrefix = 'x'.repeat(70);
     writeFileSync(join(f.paths.petDir, `${longPrefix}-config.json`), '{}', 'utf8');
     const { bundle, skipped } = collectBackup(f.paths, f.userRoot);
-    assert.ok(skipped.some((s) => s.includes(longPrefix)), '超长前缀应进 skipped');
+    assert.ok(
+      skipped.some((s) => s.includes(longPrefix)),
+      '超长前缀应进 skipped',
+    );
     assert.ok(!bundle.files.some((x) => x.path.includes(longPrefix)));
     // 合法的那些照常导出
     assert.ok(bundle.files.some((x) => x.path === 'pet/nahida-config.json'));
@@ -372,10 +376,10 @@ test('collectBackup：导出的 memory.json 已按新框架补事实卡（v2 形
     const entry = parsed.pet.nahida1;
     assert.ok(Array.isArray(entry.facts), '导出物里应该有 facts 数组');
     const facts = entry.facts as Array<{ kind: string; key: string; value: string }>;
-    assert.deepEqual(
-      facts.map((x) => `${x.kind}|${x.key}=${x.value}`).sort(),
-      ['identity|city=杭州', 'identity|pet=猫·团子'],
-    );
+    assert.deepEqual(facts.map((x) => `${x.kind}|${x.key}=${x.value}`).sort(), [
+      'identity|city=杭州',
+      'identity|pet=猫·团子',
+    ]);
     assert.equal(entry.factsUpto, 4, '迁移标记应为消息条数');
     assert.equal(bundle.version, BACKUP_VERSION);
     assert.equal(BACKUP_VERSION, 2, '导出物升到 v2');
@@ -455,9 +459,10 @@ test('applyBackupImport：导入已是 v2 的包时不重复回填、factsAdded 
   const f = fixture();
   try {
     // 先导一次 v1 让磁盘变成 v2 形状，再把这个 v2 文本原样当新包导进来
-    const first = [
-      { path: 'memory.json', text: legacyMemory() },
-    ].map((x) => ({ ...x, sha256: createHash('sha256').update(x.text, 'utf8').digest('hex') }));
+    const first = [{ path: 'memory.json', text: legacyMemory() }].map((x) => ({
+      ...x,
+      sha256: createHash('sha256').update(x.text, 'utf8').digest('hex'),
+    }));
     applyBackupImport(f.paths, f.userRoot, {
       format: BACKUP_FORMAT,
       version: 1,

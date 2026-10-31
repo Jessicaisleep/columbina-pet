@@ -67,7 +67,16 @@ const DOW_CN = ['', '周一', '周二', '周三', '周四', '周五', '周六', 
 function numOf(s: string): number | undefined {
   if (/^\d+$/.test(s)) return Number(s);
   const map: Record<string, number> = {
-    一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+    一: 1,
+    二: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+    十: 10,
   };
   if (s === '十') return 10;
   if (s.length === 2 && s[0] === '十') return 10 + (map[s[1]] ?? 0);

@@ -92,9 +92,10 @@ export interface ChatDialogMount {
 }
 
 /** 挂载一个对话输入弹窗（两端共用；位置为视口坐标，超出 clamp 矩形自动夹回）。
- *  最简形态：只有一条输入框（无标题/无按钮），回车即发送 → 弹窗关闭 →
+ *  最简形态：只有一条输入框（无标题/无按钮），回车即发送，**发送后弹窗不关**（清空、光标留着、
+ *  可以接着说下一句），直到用户「点弹窗外（桌宠本体左键/右键）」或按 Esc 才收起；
  *  onSent() 交给调用方叫醒一拍 /state（回复写进了 pets.<id>.say，气泡随下一拍出现）；
- *  Esc / 点弹窗外关闭；生成失败则留在弹窗内显式提示，不伪造回复。
+ *  生成失败则留在弹窗内显式提示，不伪造回复。
  *
  *  clamp（可选，#41）：弹窗允许占用的矩形（视口局部坐标，默认整个视口）。
  *  桌面模式传「窗口 ∩ 工作区」——宠物贴屏幕底/右时窗口外扩余量伸出屏幕，
@@ -198,7 +199,11 @@ export function mountChatDialog(opts: {
     sendChat(withPet, text)
       .then((state) => {
         if (state.ok) {
-          close();
+          // **发完不关弹窗**：对话模式下用户是要连着说的，发一句就收走输入框会打断对话。
+          // 关闭只有两条路：点弹窗外（= 点桌宠本体左键/右键）或 Esc（见 onDocPointerDown / onDocKeyDown）。
+          // 清空 + 回到占位符宽度，光标留着，等下一句。
+          input.value = '';
+          resizeInput();
           if (onSent) onSent();
         } else {
           err.textContent = '对话失败：' + (state.message ?? state.reason);

@@ -104,8 +104,17 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { listBalanceProviders, queryBalance, registerBalanceProvider } from './balance/index';
 import { generateWhisper } from './whisper';
 import { automaticWhisperSchedule, type StandaloneWhisperPolicy } from './whisper-policy';
-import { generateChat, generateMemorySummary } from './chat';
+import { generateChat, generateMemorySummary, trimToUserBoundary } from './chat';
 import type { ChatMemoryMessage } from './chat';
+import {
+  PROACTIVE_ORIGIN,
+  proactiveDecision,
+  proactiveEnabled,
+  proactiveInstruction,
+  proactiveMessage,
+  proactivePeriodSec,
+  type ProactiveSkip,
+} from './proactive';
 import {
   buildSummaryPatchUserText,
   buildSummaryUserText,
@@ -137,10 +146,20 @@ import {
   shouldMirrorOwner,
   touchMember,
   userMessageFor,
+  type GroupMemory,
   type GroupScope,
   type Sender,
 } from './memory-group';
-import { buildIndex, dayTrace, docsOf, recallSection, search, searchByTags, traceSection, wantedTags } from './memory-retrieval';
+import {
+  buildIndex,
+  dayTrace,
+  docsOf,
+  recallSection,
+  search,
+  searchByTags,
+  traceSection,
+  wantedTags,
+} from './memory-retrieval';
 import { looksLikeRecall, parseTimeRange } from './memory-time';
 import {
   decideBroadcast,
@@ -206,6 +225,11 @@ import { profileNameFrom, storageEntries } from './storage-paths';
 import { parseStateWaitQuery, PollStateStore } from './state';
 import { composeSystemPrompt, petPersona } from './persona';
 import { ScreenReader, screenContextOf, screenReaderAvailable } from './screen-context';
+import { ChatActivity, CHAT_QUIET_MS } from './chat-activity';
+import { appendMessages } from './sync-append';
+import { appendLogLines, assignIds, atomicWriteText, collectNewLines, MEMORY_LOG_FILE, readLoggedIds } from './memory-io';
+import { MobileScreenStore, mobileScreenSection } from './mobile-screen';
+import { PAIRED_DEVICES_FILE, parseDevices, phoneTakeover, takeoverReason } from '../standalone/paired-devices';
 import { runAssistant } from './assistant/loop';
 import { appendRecord, buildRecord, clearRecords, countRecords, readRecords } from './assistant/history';
 import {
@@ -239,6 +263,15 @@ const PACKAGE_ROOT_ASSETS = join(PACKAGE_ROOT, 'assets');
 
 /** 包内表情包目录（表情包池的最后一环：assets/memes/<名称>.png） */
 const PACKAGE_MEMES_DIR = join(PACKAGE_ROOT_ASSETS, 'memes');
+
+/**
+ * 包内自带宠物目录（`assets/pet/`）：随包分发的 pet pack，装好即有宠物。
+ *
+ * 与 `$DSH_HOME/dsh-pet/pet/`（用户层）是两个目录，同名前缀用户层优先——见 ./config 的 scanPetFiles。
+ * 素材（`<前缀>-animation/`、`<前缀>-memes/`）**也**在这里找：包内 pet 的动画不复制到用户家，
+ * 否则升级一次就多一份几十 MB 的副本，且用户改不回包内新版本。
+ */
+const PACKAGE_PET_DIR = join(PACKAGE_ROOT_ASSETS, 'pet');
 
 /** 路由前缀 */
 const ROUTE_PREFIX = '/dsh-pet-7340';
@@ -430,10 +463,44 @@ export function apply(ctx: any): void {
     userFile: userConfigPath,
     legacyUserFile: legacyUserConfigPath,
     petDir: petConfigDir,
+    // 包内 pet pack：装好插件就有宠物，不必先往用户家目录拷文件
+    packPetDir: PACKAGE_PET_DIR,
   };
   // 老用户一次性迁移：main-config.json → main-config.jsonc（重命名，内容一字不动；
   // 新文件已存在则不动旧文件）。失败不影响运行——读取侧对旧路径有回落。
   migrateUserConfig(configPaths, (msg) => log.info('[dsh-pet] ' + msg));
+
+  /**
+   * 「改这只宠物的配置要写到哪个文件」——三处写回（display / pinned / persona）共用。
+   *
+   * main → 用户主配置 `main-config.jsonc`（本来就是用户层）；
+   * 文件宠物 → **它自己的**配置文件。包内自带的那几只想改时走 **copy-on-write**：写到用户层
+   * `pet/<前缀>-config.json`，包内那份一字不动。
+   *
+   * 为什么不能直接写包内那份：插件装在 `app.asar` 里是**只读**的，写进去要么 EACCES 要么下次
+   * 升级被整份覆盖掉——用户改的人设/显示位置会静默消失。而 scanPetFiles 里**同名前缀用户层优先**，
+   * 于是「改过一次」之后就以用户层那份为准，素材仍从包内取（升级照样拿到新动画）。
+   */
+  const writeTargetFor = (
+    entry: string,
+  ):
+    | { ok: true; layerPath: string; layerDir: string; existing: Record<string, unknown> | undefined }
+    | { ok: false } => {
+    if (entry === 'main') {
+      return { ok: true, layerPath: userConfigPath, layerDir: userRoot, existing: readUserConfig(configPaths) };
+    }
+    const file = readPetConfigEntry(configPaths, entry);
+    if (!file) return { ok: false };
+    if (!file.fromPack) {
+      return { ok: true, layerPath: file.path, layerDir: petConfigDir, existing: file.raw };
+    }
+    return {
+      ok: true,
+      layerPath: join(petConfigDir, entry + '-config.json'),
+      layerDir: petConfigDir,
+      existing: file.raw,
+    };
+  };
 
   // ---- 读屏与 AI 助手（2026-10-26 新增）----
   // 读屏：常驻一个 PowerShell UIA 子进程。**懒启动**——`screenContextEnabled` 为 false 时
@@ -479,6 +546,19 @@ export function apply(ctx: any): void {
   });
 
   /**
+   * 手机端推上来的屏幕文字（2026-10-31）。
+   *
+   * <p>为什么要有它：桌面端的读屏走 PowerShell UIA，读的是**电脑**的前台窗口；
+   * 而手机上用户在看的是另一块屏幕。两者是不同设备的「此刻环境」，所以手机必须
+   * 自己抓、自己传。手机端的 AccessibilityService 见 05-手机APP 的 PetReaderService。
+   *
+   * <p><b>只保留最近一次、只在内存里</b>（{@link MobileScreenStore}）：这是「此刻环境」，
+   * 过期的屏幕内容混进 prompt 比没有更糟 —— 宠物会对着已经关掉的窗口说话。
+   * 所以有过期时间（{@link MOBILE_SCREEN_TTL_MS}），并且不落盘。
+   */
+  const mobileScreen = new MobileScreenStore();
+
+  /**
    * 生成一段屏幕上下文（追加到 system 末尾）。
    *
    * 失败/关闭一律返回空串：**读不到屏幕绝不能拖死碎碎念与对话**——这是本功能的硬约束。
@@ -486,6 +566,13 @@ export function apply(ctx: any): void {
   const screenSection = async (conf: Record<string, unknown>): Promise<string> => {
     const cfg = assistantConfigOf(conf);
     if (!cfg.screenOn) return '';
+    // 手机端刚推过新鲜的屏幕文字 → 优先用它（用户此刻真正在看的那块屏）。
+    // 桌面端的 UIA 只能看到电脑屏幕，手机上聊的时候那个东西根本不在他眼前。
+    const fresh = mobileScreen.fresh();
+    if (fresh !== undefined) {
+      log.info(`[dsh-pet] 读屏（手机）：${fresh.chars} 字，${Math.round((Date.now() - fresh.at) / 1000)}s 前`);
+      return mobileScreenSection(fresh);
+    }
     try {
       const snap = await screenReader.capture(cfg.excludes);
       const section = screenContextOf(snap);
@@ -598,19 +685,20 @@ export function apply(ctx: any): void {
         >;
       }
     | undefined => {
-    const svc = optionalService('standaloneAi') as
-      | { toolTurn?: (input: unknown) => Promise<unknown> }
-      | undefined;
+    const svc = optionalService('standaloneAi') as { toolTurn?: (input: unknown) => Promise<unknown> } | undefined;
     if (!svc || typeof svc.toolTurn !== 'function') return undefined;
     return {
       toolTurn: (input) =>
-        svc.toolTurn!(input) as ReturnType<
-          NonNullable<ReturnType<typeof assistantLlm>>['toolTurn']
-        > extends never
+        svc.toolTurn!(input) as ReturnType<NonNullable<ReturnType<typeof assistantLlm>>['toolTurn']> extends never
           ? never
           : Promise<
               | { ok: true; kind: 'text'; text: string }
-              | { ok: true; kind: 'tools'; toolCalls: Array<{ id: string; name: string; arguments: string }>; text: string }
+              | {
+                  ok: true;
+                  kind: 'tools';
+                  toolCalls: Array<{ id: string; name: string; arguments: string }>;
+                  text: string;
+                }
               | { ok: false; reason: string; message: string }
             >,
     };
@@ -659,6 +747,23 @@ export function apply(ctx: any): void {
   // 用户表情包目录（碎碎念/对话配图的图片：优先于包内 assets/memes，加图不必改包）
   const memesUserRoot = join(userRoot, 'memes');
   /**
+   * 某个 pet pack 子目录（`<素材根>-animation` / `<素材根>-memes`）实际可查的目录链：
+   *   - 用户层 `$DSH_HOME/dsh-pet/pet/<子目录>`（用户覆盖/自己做的宠物）优先；
+   *   - 其次包内 `assets/pet/<子目录>`（随包分发的原创宠物，装好即有）。
+   * 两个都查、逐文件用户层优先——**这不违反「专属目录独占」那条规则**：独占说的是
+   * 「这只宠物有自己的素材目录时不许回落到全局主素材池」，而不是「包内那份不许用」。
+   * 都不存在 → 空数组（调用方回落到主素材链）。
+   * 参数一律先过 resolveAsset：素材根来自 URL 段，防 `..\..\x` 逃出根目录。
+   */
+  const petPackDirs = (sub: string): string[] => {
+    const out: string[] = [];
+    const u = resolveAsset(petConfigDir, sub);
+    if (u !== undefined && existsSync(u)) out.push(u);
+    const p = resolveAsset(PACKAGE_PET_DIR, sub);
+    if (p !== undefined && existsSync(p) && p !== u) out.push(p);
+    return out;
+  };
+  /**
    * 表情包目录链 —— 与动画素材（/thumb）**同一套素材归属语义**：
    *   - `pet/<素材根>-memes/` 存在（种类自带表情包）：**只查它**，池与路由都不回落——
    *     查不到即 404 / 该条目剔除（与 `pet/<素材根>-animation/` 的独占规则逐字一致）；
@@ -666,12 +771,10 @@ export function apply(ctx: any): void {
    *     与「main-animation/<ext> → 包内 assets/<ext>」的主素材链同构）。
    * 池（readMemePool）与路由（/pic/memes）必须走**同一个函数**：池里能选的名字，
    * 路由必须取得到，否则气泡配图会图裂。
-   * 素材根一律先过 resolveAsset：它来自 URL 段，Windows 上 %5C 解出的反斜杠不会被
-   * rest.split('/') 切开，直接 join 会让 `..\..\x` 逃出用户根读盘（与 /thumb 同一道防线）。
    */
   const memeDirsFor = (assetRoot: string): string[] => {
-    const own = resolveAsset(petConfigDir, assetRoot + '-memes');
-    if (own !== undefined && existsSync(own)) return [own];
+    const own = petPackDirs(assetRoot + '-memes');
+    if (own.length > 0) return own;
     return [memesUserRoot, PACKAGE_MEMES_DIR];
   };
   // 轮询统一状态（S）：前端 1s 轮询的**唯一**数据源（余额 / 工作状态 / 通知 / 宠物说话）。
@@ -1055,6 +1158,33 @@ export function apply(ctx: any): void {
   // 改造前这份节流靠 whisperCache（缓存 + ts 比较），现在"该不该生成"由调度侧决定、
   // "生成结果"直接写 S——多端共享同一句由 S 天然保证，不再需要第二份缓存。
   const lastWhisperAt = new Map<string, number>();
+  // 主动聊天（2026-10-31）：上一次主动开口的时刻（按宠物）。与 lastWhisperAt 分开两张表，
+  // 因为两者周期来源不同（proactiveChatSec vs eventsRefreshSec.whisper）、下限也不同（120s vs 60s）。
+  // 合表会让"她刚嘀咕完"误伤"她该主动找你了"。
+  const proactiveAt = new Map<string, number>();
+  // 「正在对话」静默窗（2026-11-01 用户要求：对话模式下禁碎碎念，手机电脑端都要）：
+  // 最后一次说话之后 CHAT_QUIET_MS 内不生成碎碎念。碎碎念只有这一个源头（下面那个调度器），
+  // 所以挡在这里一处，两端就同时静了——不需要各端自己藏气泡（那样 AI 照旧被调用、日志照旧在写）。
+  const chatActivity = new ChatActivity();
+
+  // ---- 「手机接管」判定（见 ../standalone/paired-devices 文件头）----
+  // 返回 undefined = 这台电脑可以写；返回字符串 = 拒写原因（直接给用户看，不要包技术话术）。
+  // 每台手机每 10 秒长轮询一次 /state，路由层顺手刷新 lastSeenAt，所以文件里的心跳足够新鲜。
+  // 判定规则只有一条：**登记过手机、且所有手机的心跳都过期 → 电脑只读**。
+  // 没配过手机的用户永远走不到这条分支（否则新装就是只读，谁都不敢用）。
+  const phoneGate = async (): Promise<string | undefined> => {
+    try {
+      const raw = await readFile(join(userRoot, PAIRED_DEVICES_FILE), 'utf8');
+      const list = parseDevices(raw);
+      const now = Date.now();
+      if (!phoneTakeover(list, now)) return undefined;
+      const newest = list.reduce((max, d) => (d.lastSeenAt > max ? d.lastSeenAt : max), 0);
+      const minutes = newest === 0 ? undefined : Math.round((now - newest) / 60_000);
+      return takeoverReason(minutes);
+    } catch {
+      return undefined; // 没有登记表 = 从没配过手机
+    }
+  };
 
   // 对话记忆文件（唯一读写方 = 本进程；浏览器/桌面两端都只是客户端 → 同一实例天然共享同一份记忆）。
   // 结构双层：{ <种类桶 assetRoot ?? petId>: { <实例 id>: { messages: ChatMemoryMessage[] } } }
@@ -1085,9 +1215,44 @@ export function apply(ctx: any): void {
     }
   };
 
+  // 「只追加日志」的已记录编号。启动后第一次写盘时才去读（懒加载），
+  // 进程重启也不会把整份记忆重灌一遍日志。
+  const memoryLogPath = join(userRoot, MEMORY_LOG_FILE);
+  let loggedIds: Set<string> | undefined;
+  const ensureLoggedIds = async (): Promise<Set<string>> => {
+    if (loggedIds !== undefined) return loggedIds;
+    try {
+      loggedIds = readLoggedIds(await readFile(memoryLogPath, 'utf8'));
+    } catch {
+      loggedIds = new Set(); // 还没有日志文件 = 第一次
+    }
+    return loggedIds;
+  };
+
+  /** 写记忆：**原子落盘 + 补消息编号 + 只追加日志**（三件事一起，见 ./memory-io 文件头）
+   *
+   *  顺序要求：先补号 → 再算新行 → 再写 memory.json → 最后追加日志。
+   *  万一日志追加失败，memory.json 已是新的，代价只是「下次多追加几行」（编号去重兜住）；
+   *  反过来的顺序则会出现「日志里有、记忆里没有」——那才是真丢数据。 */
   const writeMemory = async (mem: Record<string, Record<string, ChatMemoryEntry>>): Promise<void> => {
     await mkdir(userRoot, { recursive: true });
-    await writeFile(memoryPath, JSON.stringify(mem, null, 2), 'utf8');
+    const assigned = assignIds(mem);
+    const ids = await ensureLoggedIds();
+    const lines = collectNewLines(mem, ids);
+    await atomicWriteText(memoryPath, JSON.stringify(mem, null, 2));
+    if (lines.length > 0) {
+      try {
+        await appendLogLines(memoryLogPath, lines);
+        for (const line of lines) ids.add(line.id);
+      } catch (e) {
+        log.warn(
+          `[dsh-pet] 记忆日志追加失败（memory.json 已正常写入，下次写盘会补上）：${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+      }
+    }
+    if (assigned > 0) log.info(`[dsh-pet] 记忆补齐消息编号 ${assigned} 条（只在首次写盘发生一次）`);
   };
 
   /** 把一次读写封进串行队列（同进程内防交错），返回 fn 的结果 */
@@ -1232,7 +1397,9 @@ export function apply(ctx: any): void {
   const aiTagQueue: Array<{
     entry: ChatMemoryEntry;
     /** 补标成功后由调用方负责落盘（它才知道 entryKey / petId） */
-    persist: (tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>) => Promise<void>;
+    persist: (
+      tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>,
+    ) => Promise<void>;
   }> = [];
   let aiTagRunning = false;
 
@@ -1314,7 +1481,9 @@ export function apply(ctx: any): void {
    */
   const scheduleAiTagging = (
     entry: ChatMemoryEntry,
-    persist: (tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>) => Promise<void>,
+    persist: (
+      tagged: Array<{ content: string; ts: number; aiTags: NonNullable<ChatMemoryMessage['aiTags']> }>,
+    ) => Promise<void>,
   ): void => {
     try {
       if (pendingTagTargets(entry).length === 0) return;
@@ -1346,6 +1515,7 @@ export function apply(ctx: any): void {
     if (!isGroup || !sender || !sender.id) return;
     try {
       const group = entry as unknown as Parameters<typeof touchMember>[0];
+      // 旧版本残留在群级条目上的 facts 由 `touchMember` 自己清（那里是成员桶的唯一写入口）
       touchMember(group, sender.id, sender.name, text, now);
       const { scope, recentN } = groupPolicyOf(conf);
       const evicted = planMemberEviction(group, scope, recentN);
@@ -1428,6 +1598,10 @@ export function apply(ctx: any): void {
     // ——配置随时可能被设置页 / 右键菜单 / 手改文件改动，两次读之间就是窗口。
     // **明确失败：不生成、不写 S**。写下去就是一只已不存在宠物的幽灵叶子（/state 里常驻到进程重启）。
     if (!found) return { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + petId };
+    // 手机接管期间不自言自语：碎碎念本身不写记忆，但它会花一次 AI 调用、并在手机也在说话时
+    // 变成"两边同时在讲话"的干扰。静默跳过（与占用锁同语义：不报错、不伪造文案）。
+    const takeover = await phoneGate();
+    if (takeover !== undefined) return { ok: false, reason: 'generate-error', message: takeover };
     // 读屏上下文（2026-10-26）：开关打开时抓一次前台窗口，把「用户在干什么」追加到 system 末尾。
     // 失败返回空串 -> system 与原来逐字一致，绝不因读屏失败而改变碎碎念行为。
     const screen = await screenSection(found.conf);
@@ -1453,7 +1627,13 @@ export function apply(ctx: any): void {
       // 却在边界被吞掉（API.md 描述的降级 reason 正是它）。
       return result;
     }
-    state.writePet(petId, 'say', result.image ? { text: result.text, image: result.image } : { text: result.text });
+    state.writePet(
+      petId,
+      'say',
+      result.image
+        ? { text: result.text, image: result.image, origin: 'whisper' }
+        : { text: result.text, origin: 'whisper' },
+    );
     // 成功也留一行（此前只有失败有日志）：调度拍了、生成也回来了，但「成功」在文件里毫无痕迹，
     // 于是「没触发」与「触发了并且成功」无法区分。
     log.info(
@@ -1518,9 +1698,7 @@ export function apply(ctx: any): void {
       configuredModel(conf, 'chatModel'),
     );
     if (!result.ok) {
-      log.warn(
-        '[dsh-pet] 记忆压缩失败 reason=' + result.reason + (result.message ? ' ' + result.message : ''),
-      );
+      log.warn('[dsh-pet] 记忆压缩失败 reason=' + result.reason + (result.message ? ' ' + result.message : ''));
       return { ok: false, reason: result.reason };
     }
     const summary = normalizeSummary(result.text);
@@ -1554,9 +1732,17 @@ export function apply(ctx: any): void {
     sender?: Sender,
   ): Promise<
     | { ok: true; text: string; image?: string }
-    | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
+    | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet' | 'phone-takeover'; message?: string }
   > =>
     withMemoryLock(async () => {
+      // 手机接管（2026-11-01）：手机不在这个网络时，对话必须由手机那边记，电脑这一端一个字都不能写。
+      // 判定放在 withMemoryLock **里面**第一行：排到队列时再判，才反映"轮到我的这一刻手机在不在"，
+      // 而不是"请求进来的那一刻"（队列可能等几十秒，中间手机正好出门）。
+      const takeover = await phoneGate();
+      if (takeover !== undefined) return { ok: false, reason: 'phone-takeover', message: takeover };
+      // 一进对话就先记一笔：这样整轮生成（几秒到几十秒）期间碎碎念调度器会看到「正在对话」，
+      // 不会在她组织回答的时候插一句自言自语。
+      chatActivity.note(petId);
       const cfg = readAllConfig(configPaths);
       const found = findPetInstance(cfg, petId);
       // 宠物在"校验那次读"与这里之间被删了——本函数还要先排 withMemoryLock 的串行队列（等前一次生成
@@ -1592,9 +1778,15 @@ export function apply(ctx: any): void {
       // 事实卡（L0，2026-10-29）：常驻、永不压缩。放在摘要**之前**——
       // 摘要是「往事叙述」（有损），事实卡是「确定的事」（按键覆盖），重要度更高，位置也更靠前。
       // 缺键（旧数据）→ `factsSection([])` 返回空串，拼出来的 system 与改造前逐字一致。
-      const facts = Array.isArray(target.facts) ? target.facts : [];
-      const baseSystem =
-        petSystemPrompt(found) + factsSection(facts) + memorySection(target.summary ?? '');
+      //
+      // 群聊（2026-10-30 修）：这里**必须空**。旧实现读的是 `target.facts`，而群聊下 `target`
+      // 是群级条目，它那份 facts 是**跨人混合**的——`mergeFacts` 按 `kind|key` 覆盖，
+      // 张三说「住杭州」、李四说「住北京」，群里就只剩北京一条。再以「关于对方的事实」的
+      // 抬头塞进 prompt，就和下面 `groupSection` 里每人一份的 `members[id].facts` 打架：
+      // 同一个「住在哪」，段 1 说北京、段 2 说杭州，模型只能瞎猜。
+      // 每人的事实卡由 `groupSection` 负责，这里一律不给。
+      const facts = !isGroup && Array.isArray(target.facts) ? target.facts : [];
+      const baseSystem = petSystemPrompt(found) + factsSection(facts) + memorySection(target.summary ?? '');
       // 检索回填（L3，2026-10-29）：只从**既不在摘要、也不在近期窗口**的那段里捞。
       // 那段正是旧框架的「黑洞」（实测真实数据 28 条 / 61% 完全不可见）。
       // k 来自 `memoryRecallK`（0 = 关闭）；关闭时整段不参与，system 与原来逐字一致。
@@ -1700,7 +1892,7 @@ export function apply(ctx: any): void {
       // 不能写 slice(-rounds * 2)：-0 在 JS 里 === 0，slice(-0) 返回整个数组而不是空。
       // 已摘要的那部分**本来就不该进上下文**（它们的内容已由摘要承载），从 summarized 之后开始截。
       const live = target.messages.slice(summarizedOf(target));
-      const list = sliceMemoryRounds(live, rounds);
+      const list = trimToUserBoundary(sliceMemoryRounds(live, rounds));
       const acfg = assistantConfigOf(found.conf);
 
       // ---- 助手模式（2026-10-26）：assistantEnabled 打开时，对话改走「多步工具循环」 ----
@@ -1714,8 +1906,7 @@ export function apply(ctx: any): void {
         // 屏幕上下文**不再在这里拼第二次**：上面构造 `system` 时已经拼进去了（2026-10-27）。
         // 改造前这里单独再拼一次，是因为普通对话那份没拼；现在两份共用同一个 `system`，
         // 再拼一次会让 prompt 里出现两段「用户此刻的屏幕」，白烧 token 还可能让模型重复描述。
-        const assistantSystem =
-          system + '\n' + assistantSystemHint(petWorkspace, acfg.permission, acfg.network);
+        const assistantSystem = system + '\n' + assistantSystemHint(petWorkspace, acfg.permission, acfg.network);
         const runStart = Date.now();
         const outcome = await runAssistant({
           llm: assistantLlm(),
@@ -1782,8 +1973,10 @@ export function apply(ctx: any): void {
         if (said.tags) userMsg2.aiTags = { ...said.tags, at: now2 };
         target.messages.push(userMsg2);
         target.messages.push({ role: 'assistant', content: said.text, ts: now2 });
-        // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）
-        learnFacts(target, text, now2);
+        // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）。
+        // 群聊下**跳过**：target 是群级条目，写进去就是跨人混的一份（见 baseSystem 处注释）；
+        // 每人的事实卡由下面 recordGroupSpeaker → touchMember 写进 members[id].facts。
+        if (!isGroup) learnFacts(target, text, now2);
         // 群聊成员桶（同位置：与消息一次落盘）
         recordGroupSpeaker(target, found.conf, isGroup, sender, text, now2);
         // 主人群内发言镜像进单人流（2026-10-30 任务1）
@@ -1795,9 +1988,7 @@ export function apply(ctx: any): void {
             const fresh = await readMemory();
             const e2 = memoryEntryOf(fresh, found.entry, petId);
             for (const t of tagged) {
-              const msg = e2.messages.find(
-                (m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts,
-              );
+              const msg = e2.messages.find((m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts);
               if (msg) msg.aiTags = t.aiTags;
             }
             await writeMemory(fresh);
@@ -1806,7 +1997,9 @@ export function apply(ctx: any): void {
         try {
           await compressMemory(mem, target, found.conf);
         } catch (e) {
-          log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
+          log.warn(
+            '[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)),
+          );
         }
         // 用户看到的、记进历史的、写进操作记录的，一律是**剥掉标记的正文**
         // （标记只给记忆库用，露出 `[标:…]` 就是没做完）
@@ -1831,8 +2024,9 @@ export function apply(ctx: any): void {
       target.messages.push(userMsg);
       // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
       target.messages.push({ role: 'assistant', content: generated.text, ts: now });
-      // 事实卡增量更新（同助手分支：在 writeMemory 之前，一次落盘）
-      learnFacts(target, text, now);
+      // 事实卡增量更新（同助手分支：在 writeMemory 之前，一次落盘）。
+      // 群聊下跳过，理由同上——每人的事实卡走 members[id].facts。
+      if (!isGroup) learnFacts(target, text, now);
       // 群聊成员桶（同助手分支：与消息一次落盘）
       recordGroupSpeaker(target, found.conf, isGroup, sender, text, now);
       // 主人群内发言镜像进单人流（2026-10-30 任务1）
@@ -1844,9 +2038,7 @@ export function apply(ctx: any): void {
           const fresh = await readMemory();
           const e2 = memoryEntryOf(fresh, found.entry, petId);
           for (const t of tagged) {
-            const msg = e2.messages.find(
-              (m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts,
-            );
+            const msg = e2.messages.find((m) => m.role === 'user' && m.content === t.content && (m.ts ?? 0) === t.ts);
             if (msg) msg.aiTags = t.aiTags;
           }
           await writeMemory(fresh);
@@ -1859,7 +2051,9 @@ export function apply(ctx: any): void {
       try {
         await compressMemory(mem, target, found.conf);
       } catch (e) {
-        log.warn('[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)));
+        log.warn(
+          '[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)),
+        );
       }
       // 回复写进 S（与碎碎念同一个叶子：前端本来就是同一条展示链路）
       state.writePet(
@@ -1869,6 +2063,174 @@ export function apply(ctx: any): void {
       );
       // 同一份文本随返回值带出（叶子照写，不是二选一）
       return { ok: true as const, text: generated.text, ...(generated.image ? { image: generated.image } : {}) };
+    });
+
+  /**
+   * 主动聊天该往哪个群说（2026-10-31）。
+   *
+   * 挑「最近有消息的那个群」，不挑「消息最多的那个」：一个三个月前的热闹群不该在
+   * 今天突然收到一句问候，而昨天刚聊过的群才像"她记得这里"。
+   *
+   * 没有任何群记忆 → 返回 `''`，调用方据此走单人流。**绝不兜底 'default'**：
+   * `'default'` 是"本地自测/没传群号"的桶，主动往里写会造出一个用户从没见过的群。
+   */
+  const pickProactiveGroup = (entry: ChatMemoryEntry): string => {
+    const groups = entry.groups;
+    if (!groups || typeof groups !== 'object' || Array.isArray(groups)) return '';
+    let best = '';
+    let bestTs = -Infinity;
+    for (const [gid, g] of Object.entries(groups)) {
+      if (!g || !Array.isArray(g.messages) || g.messages.length === 0) continue;
+      // 用最后一条消息的 ts 判活跃；ts 缺失/非法按 0（仍可能胜出，但排在有时间戳的后面）
+      const last = g.messages[g.messages.length - 1];
+      const ts = Number(last?.ts);
+      const t = Number.isFinite(ts) ? ts : 0;
+      if (t > bestTs) {
+        bestTs = t;
+        best = gid;
+      }
+    }
+    return best;
+  };
+
+  /**
+   * 主动聊天（2026-10-31，第四件事）：宠物**不等你说话**，按配置的间隔自己开一句。
+   *
+   * 与 `publishWhisper`（碎碎念）的关系——这是本功能最容易做错的地方，所以写在最前面：
+   *
+   *   |            | 碎碎念 publishWhisper        | 主动聊天 publishProactive            |
+   *   |------------|------------------------------|--------------------------------------|
+   *   | 写记忆     | **不写**                     | **写**（一条 assistant，origin='proactive'）|
+   *   | 上下文     | 无（只有人设）               | 完整（人设 + 事实卡 + 摘要 + 近期窗口）|
+   *   | 语义       | 自言自语                     | 真的开了一轮对话，你回一句她接得上    |
+   *   | 周期来源   | eventsRefreshSec.whisper     | proactiveChatSec（独立键）            |
+   *   | 频率下限   | 60s                          | 120s（因为它烧对话 token + 写记忆）   |
+   *
+   * **为什么必须写记忆**：用户要的是"她主动找我聊"，不是"她自言自语"。如果不写记忆，
+   * 用户回一句「哈哈」时她不知道自己在跟什么接——那就退化成碎碎念了，而这个功能就没意义了。
+   *
+   * **为什么追加的是 assistant 而不是伪造 user**：见 ./proactive 的 `proactiveMessage` 注释。
+   * 代价是记忆流里会出现两条连续的 assistant，两处依赖"一问一答"的地方已各自兜住
+   * （`trimToUserBoundary` + `summarized` 只认索引）。
+   *
+   * **群聊**：只写进 `entry.groups[群号]`，绝不写单人流（否则群里的气氛会污染一对一陪伴）。
+   * 目标群 = 该宠物最近有消息的那个群（见 `pickProactiveGroup`）。
+   *
+   * @param opts.groupId 指定群号（手动触发/测试用）；不给则由 `pickProactiveGroup` 挑。
+   */
+  const publishProactive = async (
+    petId: string,
+    opts?: { groupId?: string; force?: boolean },
+  ): Promise<
+    | { ok: true; text: string; group?: string }
+    | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet' | ProactiveSkip | 'phone-takeover'; message?: string }
+  > =>
+    withMemoryLock(async () => {
+      // 手机接管期间不主动开口：这条会写进记忆（一条 assistant + origin=proactive），
+      // 而这段时间记忆的唯一写者必须是手机，否则回家合并时两边各多一句。
+      const takeover = await phoneGate();
+      if (takeover !== undefined) return { ok: false, reason: 'phone-takeover', message: takeover };
+      // 她主动开口也算「正在对话」：用户如果在 App 里正看着这条，接下来几分钟不该再有碎碎念插进来。
+      chatActivity.note(petId);
+      const cfg = readAllConfig(configPaths);
+      const found = findPetInstance(cfg, petId);
+      // 与 publishWhisper 同一个理由：配置随时会被改，两次读之间就是窗口。
+      if (!found) return { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + petId };
+
+      const enabled = proactiveEnabled(found.conf);
+      // force = 手动触发（设置页「现在试一句」/ 测试）：跳过间隔与开关判定，但**仍要**满足
+      // "不在欠回复状态"与"AI 可用"——那两条是语义正确性，不是节流。
+      const mem = await readMemory();
+      const entry = memoryEntryOf(mem, found.entry, petId);
+
+      // 目标记忆流：指定了群号就那个群；没指定就看这只宠物有没有群记忆，有就挑最近活跃的。
+      const groupId = opts?.groupId !== undefined ? opts.groupId.trim() : pickProactiveGroup(entry);
+      const isGroup = groupId !== '';
+      const target: ChatMemoryEntry = isGroup ? groupOf(entry, groupId, log) : entry;
+
+      // 占用锁与 AI 可用性在**调度侧**已经判过一遍；这里再判一次是给手动触发兜底
+      // （手动触发不走调度，不判就会在助手动作进行中插话，把演出打断）。
+      const aiReady = standaloneAiPolicy()?.isReady() ?? true;
+      if (!aiReady) return { ok: false, reason: 'ai-unavailable' };
+
+      const now = Date.now();
+      const last = target.messages[target.messages.length - 1];
+      const periodSec = proactivePeriodSec(found.conf);
+      if (opts?.force !== true) {
+        const decision = proactiveDecision({
+          enabled,
+          periodSec,
+          lastAt: proactiveAt.get(petId) ?? 0,
+          now,
+          locked: lock.locked(petId),
+          aiReady,
+          last,
+          visible: found.pet.display !== 'none',
+        });
+        if (!decision.go) return { ok: false, reason: decision.reason ?? 'disabled' };
+      } else {
+        // 手动触发也要守住成对边界：她正欠着一个回复时不该另起话头。
+        if (last && last.role === 'user') return { ok: false, reason: 'not-at-boundary' };
+        if (last && last.role === 'assistant' && last.origin === PROACTIVE_ORIGIN) {
+          return { ok: false, reason: 'unanswered' };
+        }
+      }
+
+      // ---- 拼 system：与 chatWithPet 同一套拼装，只是没有"用户这句话"这一维 ----
+      // 顺序必须与 chatWithPet 一致（人设 → 事实卡 → 摘要 → 群聊段 → 读屏），否则同一个宠物
+      // 在"主动说"和"被动答"两种情形下看到的自我认知会不同。
+      const chatScreen = await screenSection(found.conf);
+      const facts = !isGroup && Array.isArray(target.facts) ? target.facts : [];
+      const baseSystem = petSystemPrompt(found) + factsSection(facts) + memorySection(target.summary ?? '');
+      let groupText = '';
+      if (isGroup) {
+        const gpol = groupPolicyOf(found.conf);
+        groupText = groupSection(target as GroupMemory, gpol.scope, gpol.recentN);
+      }
+      const system = chatScreen === '' ? baseSystem + groupText : baseSystem + groupText + '\n' + chatScreen;
+
+      // 历史窗口：与对话同一口径（从 summarized 之后截 rounds 轮），再裁到以 user 开头——
+      // 主动聊天自己会造出"窗口以 assistant 开头"的局面，不裁就会被 parseRequest 拒掉。
+      const rounds = memoryRounds(found.conf);
+      const live = target.messages.slice(summarizedOf(target));
+      const list = trimToUserBoundary(sliceMemoryRounds(live, rounds));
+
+      const groupName = isGroup ? groupId : undefined;
+      // 主动聊天**不配图**：配图指令要模型在正文末尾附 `[图:名]`，而"主动搭话"的场合
+      // 贴一张表情包反而突兀（用户没在对话里，突然收到一张图更像推送）。纯文本更像人。
+      const generated = await generateChat(
+        ctx,
+        system,
+        list,
+        proactiveInstruction(groupName),
+        [],
+        configuredModel(found.conf, 'chatModel'),
+      );
+      if (!generated.ok) {
+        log.warn(
+          '[dsh-pet] 主动聊天生成失败 pet=' +
+            petId +
+            ' reason=' +
+            generated.reason +
+            (generated.message ? ' ' + generated.message : ''),
+        );
+        return generated;
+      }
+
+      target.messages.push(proactiveMessage(generated.text, now));
+      await writeMemory(mem);
+      // 自动压缩：与对话同一条理由——主动聊天也会把消息堆长，不压缩迟早撑爆上下文。
+      // 失败不冒泡（摘要只是优化，绝不能让"她说了句话"因为压缩失败而失败）。
+      try {
+        await compressMemory(mem, target, found.conf);
+      } catch (e) {
+        log.warn('[dsh-pet] 主动聊天后自动压缩异常（已忽略）：' + (e instanceof Error ? e.message : String(e)));
+      }
+      // 写 S 的同一个叶子：前端本来就是同一条展示链路，所以"她主动说话"和"碎碎念"
+      // 在画面上长得一模一样（都是气泡），区别只在记忆里有没有痕迹。
+      state.writePet(petId, 'say', { text: generated.text, origin: 'proactive' });
+      log.info(`[dsh-pet] 主动聊天成功 pet=${petId}${isGroup ? ' group=' + groupId : ''}，${generated.text.length} 字`);
+      return { ok: true, text: generated.text, ...(isGroup ? { group: groupId } : {}) };
     });
 
   /**
@@ -2461,23 +2823,11 @@ export function apply(ctx: any): void {
       // 聚合里）。两种都只能按"没有这只桌宠"报——绝不能凭 id 去猜它"应该"属于哪个文件。
       const hit = findPetInstance(merged, petId);
       if (!hit) return fail('unknown-pet', `没有这只桌宠：${petId}`);
-      // 目标层：main → 用户主配置；其余 → 文件宠物自己的配置（.json 或 .jsonc，定位统一走 ./config）
-      let layerPath: string;
-      let layerDir: string;
-      let existing: Record<string, unknown> | undefined;
-      if (hit.entry === 'main') {
-        layerPath = userConfigPath;
-        layerDir = userRoot;
-        existing = readUserConfig(configPaths);
-      } else {
-        const file = readPetConfigEntry(configPaths, hit.entry);
-        if (!file) {
-          return fail('generate-error', `宠物条目配置文件找不到：${hit.entry}`);
-        }
-        layerPath = file.path;
-        layerDir = petConfigDir;
-        existing = file.raw;
-      }
+      // 目标层：main → 用户主配置；其余 → 文件宠物自己的配置（.json 或 .jsonc，定位统一走 ./config；
+      // 包内自带的宠物 copy-on-write 到用户层，见 writeTargetFor）
+      const target = writeTargetFor(hit.entry);
+      if (!target.ok) return fail('generate-error', `宠物条目配置文件找不到：${hit.entry}`);
+      const { layerPath, layerDir, existing } = target;
       // 整段替换语义：saveUserConfig 重建的是整个 pets 数组，必须带上**该层全部**宠物，只把目标
       // 那只的 display 换掉（漏掉别的 = 把它们从配置里删掉）。
       const layerPets = Array.isArray(hit.conf.pets) ? (hit.conf.pets as Record<string, unknown>[]) : [];
@@ -2571,26 +2921,16 @@ export function apply(ctx: any): void {
           );
         }
       }
-      let layerPath: string;
-      let layerDir: string;
-      let existing: Record<string, unknown> | undefined;
-      if (hit.entry === 'main') {
-        layerPath = userConfigPath;
-        layerDir = userRoot;
-        existing = readUserConfig(configPaths);
-      } else {
-        const file = readPetConfigEntry(configPaths, hit.entry);
-        if (!file) return fail('generate-error', `宠物条目配置文件找不到：${hit.entry}`);
-        layerPath = file.path;
-        layerDir = petConfigDir;
-        existing = file.raw;
-      }
+      const target = writeTargetFor(hit.entry);
+      if (!target.ok) return fail('generate-error', `宠物条目配置文件找不到：${hit.entry}`);
+      const { layerPath, layerDir, existing } = target;
       // 整段替换语义：必须带上该层**全部**宠物，只改目标那只的 position（漏掉别的 = 删掉它们）。
       const layerPets = Array.isArray(hit.conf.pets) ? (hit.conf.pets as Record<string, unknown>[]) : [];
       const pets = layerPets.map((p) => {
         if (String(p.id) !== petId) return p;
         const copy = { ...p };
-        const pos = copy.position && typeof copy.position === 'object' ? { ...(copy.position as Record<string, unknown>) } : {};
+        const pos =
+          copy.position && typeof copy.position === 'object' ? { ...(copy.position as Record<string, unknown>) } : {};
         pos.pinned = wantPinned;
         if (wantPinned) {
           pos.pinX = pinX;
@@ -2618,7 +2958,13 @@ export function apply(ctx: any): void {
       return {
         kind: 'json',
         status: 200,
-        obj: { ok: true, id: petId, pinned: wantPinned, pinX: wantPinned ? pinX : null, pinY: wantPinned ? pinY : null },
+        obj: {
+          ok: true,
+          id: petId,
+          pinned: wantPinned,
+          pinX: wantPinned ? pinX : null,
+          pinY: wantPinned ? pinY : null,
+        },
       };
     }
 
@@ -3153,6 +3499,147 @@ export function apply(ctx: any): void {
       }
     }
 
+    // 回家合并（2026-11-01）：/dsh-pet-7340/sync/append?pet=<id>
+    //   POST body { messages: [{id, role, content, ts, origin?}, ...] }
+    //
+    // 手机离线期间说的话整段追加上来。两条不可协商的规矩（见 ./sync-append 文件头）：
+    //   ① 只追加消息，**绝不碰摘要 / 事实卡** —— 派生状态永远只有一个作者，回家由电脑重算；
+    //   ② 按消息永久编号去重，重试与重复上传都是幂等的（手机网络抖一下就重传很常见）。
+    // 也不需要冲突合并：接管期间电脑一个字都没写，回来只剩"把缺的补上"。
+    if (rest === 'sync/append') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let parsed: { messages?: unknown };
+      try {
+        parsed = (JSON.parse(body ?? 'null') as typeof parsed | null) ?? {};
+      } catch {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '请求体不是合法 JSON' } };
+      }
+      const incoming = Array.isArray(parsed.messages) ? parsed.messages : undefined;
+      if (!incoming) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: 'messages 必须是数组' } };
+      }
+      // 一次最多 2000 条：手机离线一周也到不了这个量，超过就是有人在喂垃圾。
+      if (incoming.length > 2000) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: 'messages 过多（限 2000 条）' } };
+      }
+      // 宠物 id 从 query 自己取：下面的 `petId` 常量在本分支**之后**才声明，
+      // 直接引用会掉进 TDZ（实测 500：「Cannot access 'petId' before initialization」）。
+      // 这类错只在真请求时才炸，tsc 与单测都发现不了 —— 路由级代码必须真打一次。
+      const targetPet = (url.searchParams.get('pet') ?? '').trim();
+      if (!targetPet) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: 'pet 必填' } };
+      }
+      return await withMemoryLock(async () => {
+        const cfg = readAllConfig(configPaths);
+        const found = findPetInstance(cfg, targetPet);
+        if (!found) return { kind: 'json', status: 200, obj: { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + targetPet } };
+        const mem = await readMemory();
+        const entry = memoryEntryOf(mem, found.entry, targetPet);
+        const outcome = appendMessages(entry, incoming);
+        if (outcome.added > 0) await writeMemory(mem);
+        log.info(
+          `[dsh-pet] 手机合并 pet=${targetPet}：追加 ${outcome.added} 条、跳过 ${outcome.skipped} 条（重复）、丢弃 ${outcome.dropped} 条（不合法）`,
+        );
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: true, added: outcome.added, skipped: outcome.skipped, dropped: outcome.dropped, total: entry.messages.length },
+        };
+      });
+    }
+
+    // 手机读屏上传（2026-10-31，第二件事）：/dsh-pet-7340/screen
+    //   POST —— 手机端 AccessibilityService 抓到的前台文字推上来，供碎碎念/对话当上下文。
+    //   与桌面端读屏（走 PowerShell UIA 读电脑前台窗口）是**两条独立来源**：
+    //   手机上聊天时，用户眼前的东西在手机那块屏，电脑那份帮不上忙。
+    //
+    //   为什么单独一条路由而不是塞进 /broadcast：那个是"投喂一句话进气泡"，
+    //   这里是"喂环境上下文"，语义完全不同；混用会让两条链路互相污染。
+    //   为什么不做成 GET：它**写**状态（内存里的最近快照），GET 会被浏览器预取/缓存
+    //   白白调用，也会让 publicRead 的免令牌规则把它放出去。
+    if (rest === 'screen') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let parsed: { pkg?: unknown; text?: unknown };
+      try {
+        parsed = (JSON.parse(body ?? 'null') as typeof parsed | null) ?? {};
+      } catch {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '请求体不是合法 JSON' } };
+      }
+      // 上限放在这里（不是靠手机自觉）：外部输入的长度不能信。
+      // 1 MB 的 body 上限之外再收一道 —— 屏幕文字本来就不该超过几 KB。
+      if (typeof parsed.text === 'string' && parsed.text.length > 8 * 1024) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'bad-request', message: 'text 过长（限 8 KB）' },
+        };
+      }
+      // 手机接管时拒收读屏：这份快照会被拼进下一轮的 system，等于替手机那边「喂上下文」。
+      // 手机在场时它自己就在上传，不需要电脑存一份；拒收回 200 + accepted:false，让手机不用重试。
+      const takeover = await phoneGate();
+      if (takeover !== undefined) {
+        return { kind: 'json', status: 200, obj: { ok: true, accepted: false, chars: 0, reason: 'phone-takeover', message: takeover } };
+      }
+      const snap = mobileScreen.put(parsed);
+      return {
+        kind: 'json',
+        status: 200,
+        obj: {
+          ok: true,
+          // 回执如实说"收了没有、多长"：手机侧据此能判断是不是白推了一次
+          // （比如用户其实没开读屏，那这里会一直在替换同样陈旧的内容）。
+          accepted: snap !== undefined,
+          chars: snap ? snap.chars : 0,
+        },
+      };
+    }
+
+    // 手机读屏状态（诊断用）：有没有最近快照、多旧、哪个包。
+    // 单独一条 GET：设置页/手机页要能回答"读屏到底有没有在工作"，
+    // 而 /state 里没有这个位置（它不是宠物行为）。
+    if (rest === 'screen/status') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: true, ...mobileScreen.status() },
+        headers: { 'cache-control': 'no-cache, no-store' },
+      };
+    }
+
+    // 主动聊天（2026-10-31，第四件事）：/dsh-pet-7340/proactive?pet=<id>
+    //   POST —— 立刻让这只宠物主动说一句（**不等间隔**，手动触发/设置页试一句）。
+    //           与 /whisper 的区别：**会写记忆**（见 publishProactive 的注释）。
+    //   `?group=<群号>` 指定群（默认挑该宠物最近活跃的那个群；没有群记忆就走单人流）。
+    // 手动触发**绕过开关与间隔**，但仍守住两条语义：不在"她欠着一个回复"时插话、AI 必须可用。
+    // 这两条不是节流，是正确性——绕过它们会得到"用户问了她，她却聊别的"。
+    if (rest === 'proactive') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const who = requirePet(url.searchParams, () => readAllConfig(configPaths), { surface: true });
+        if (!who.ok) return who.res;
+        const groupRaw = url.searchParams.get('group');
+        const r = await publishProactive(who.petId, {
+          force: true,
+          ...(groupRaw !== null ? { groupId: groupRaw } : {}),
+        });
+        if (r.ok) {
+          return { kind: 'json', status: 200, obj: { ok: true, text: r.text, ...(r.group ? { group: r.group } : {}) } };
+        }
+        // reason 原样透出（含 not-at-boundary / unanswered / ai-unavailable），调用方据此能分清
+        // "她正欠你一句"与"生成炸了"——糊成 generate-error 会让设置页无法给出可操作提示。
+        const obj: Record<string, unknown> = { ok: false, reason: r.reason };
+        if (r.message) obj.message = r.message;
+        return { kind: 'json', status: 200, obj };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
     // 第三方投喂：/dsh-pet-7340/broadcast?pet=<id>（POST = 把一段**外部给定的**文本写进桌宠气泡）
     // 与 /whisper 的区别：这个**不生成**，调用方自己给文本——宿主侧其他插件（女仆巡检等）
     // 想说自己的话时用它，桌宠就成了那套人格的"实体"（见 issue #76）。
@@ -3645,28 +4132,17 @@ export function apply(ctx: any): void {
         // 会被静默拒绝。
         //
         // 唯一保留的边界是**结构性**的：必须是字符串、非空才写、空串表示删除覆盖。
-        // 真正的兜底交给下游——模型上下文超限时由 provider 报错，那才是准确的位置。 
+        // 真正的兜底交给下游——模型上下文超限时由 provider 报错，那才是准确的位置。
         // 与 /pet-display 同一条写盘路径：找到目标层 → 整段替换该层 pets（只改目标那只）
-        let layerPath: string;
-        let layerDir: string;
-        let existing: Record<string, unknown> | undefined;
-        if (who.entry === 'main') {
-          layerPath = userConfigPath;
-          layerDir = userRoot;
-          existing = readUserConfig(configPaths);
-        } else {
-          const file = readPetConfigEntry(configPaths, who.entry);
-          if (!file) {
-            return {
-              kind: 'json',
-              status: 200,
-              obj: { ok: false, reason: 'generate-error', message: `宠物条目配置文件找不到：${who.entry}` },
-            };
-          }
-          layerPath = file.path;
-          layerDir = petConfigDir;
-          existing = file.raw;
+        const target = writeTargetFor(who.entry);
+        if (!target.ok) {
+          return {
+            kind: 'json',
+            status: 200,
+            obj: { ok: false, reason: 'generate-error', message: `宠物条目配置文件找不到：${who.entry}` },
+          };
         }
+        const { layerPath, layerDir, existing } = target;
         const layerPets = Array.isArray(who.conf.pets) ? (who.conf.pets as Record<string, unknown>[]) : [];
         const pets = layerPets.map((p) => {
           if (String(p.id) !== petId) return p;
@@ -3731,7 +4207,11 @@ export function apply(ctx: any): void {
           try {
             payload = (JSON.parse(body ?? 'null') as typeof payload | null) ?? {};
           } catch {
-            return { kind: 'json', status: 400, obj: { ok: false, reason: 'bad-json', message: '请求体不是合法 JSON' } };
+            return {
+              kind: 'json',
+              status: 400,
+              obj: { ok: false, reason: 'bad-json', message: '请求体不是合法 JSON' },
+            };
           }
         }
         const rawIndex = method === 'DELETE' ? url.searchParams.get('index') : payload.index;
@@ -3869,7 +4349,9 @@ export function apply(ctx: any): void {
                 (out.covered ? `（在摘要覆盖区内，摘要${out.summaryRewritten ? '已重写' : '未变'}）` : ''),
             );
           } else {
-            log.warn(`[dsh-pet] 历史消息${method === 'POST' ? '修改' : '删除'}失败 pet=${petId}：${out.message ?? out.reason}`);
+            log.warn(
+              `[dsh-pet] 历史消息${method === 'POST' ? '修改' : '删除'}失败 pet=${petId}：${out.message ?? out.reason}`,
+            );
           }
           return { kind: 'json', status: 200, obj: out, headers: { 'cache-control': 'no-cache, no-store' } };
         } catch (e) {
@@ -3889,9 +4371,7 @@ export function apply(ctx: any): void {
         const mem = await readMemory();
         const rawEntry = mem[who.entry]?.[petId];
         const rawMessages = rawEntry?.messages;
-        const all = Array.isArray(rawMessages)
-          ? rawMessages.filter((m) => m && typeof m.content === 'string')
-          : [];
+        const all = Array.isArray(rawMessages) ? rawMessages.filter((m) => m && typeof m.content === 'string') : [];
         const offsetRaw = Number(url.searchParams.get('offset') ?? '0');
         const limitRaw = Number(url.searchParams.get('limit') ?? '200');
         const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
@@ -3915,6 +4395,10 @@ export function apply(ctx: any): void {
               role: String(m.role ?? ''),
               content: String(m.content ?? ''),
               ts: typeof m.ts === 'number' ? m.ts : undefined,
+              // 来意（`proactive` = 她主动来找你，`''`/缺省 = 用户与她的正常对话）。
+              // 手机页要用它把「她主动说的」在对话列表里标出来：那条消息进了记忆、
+              // 打开 App 就能在对话区看到，所以不该再顶一遍顶部气泡（用户 2026-11-01 报的重复）。
+              origin: typeof m.origin === 'string' && m.origin !== '' ? m.origin : undefined,
               // 是否已被压缩（下标 < summarized 即已进摘要）
               summarized: offset + i < summarized,
             })),
@@ -3955,9 +4439,7 @@ export function apply(ctx: any): void {
           obj: {
             ok: true,
             screenContextEnabled: mainNow.screenContextEnabled === true,
-            screenExcludePatterns: Array.isArray(mainNow.screenExcludePatterns)
-              ? mainNow.screenExcludePatterns
-              : [],
+            screenExcludePatterns: Array.isArray(mainNow.screenExcludePatterns) ? mainNow.screenExcludePatterns : [],
             assistantEnabled: mainNow.assistantEnabled === true,
             assistantPermission: isAssistantPermission(mainNow.assistantPermission)
               ? mainNow.assistantPermission
@@ -3976,6 +4458,10 @@ export function apply(ctx: any): void {
             groupBotEnabled: mainNow.groupBotEnabled === true,
             ownerQq: typeof mainNow.ownerQq === 'string' ? mainNow.ownerQq : '',
             ownerSyncEnabled: mainNow.ownerSyncEnabled === true,
+            // 主动聊天（2026-10-31，第四件事）：开关 + 间隔秒。缺键回默认（关 / 1800s）。
+            // 与碎碎念的 eventsRefreshSec.whisper **不是同一个键**——两者语义不同（见 ./proactive 文件头）。
+            proactiveChatEnabled: proactiveEnabled(mainNow),
+            proactiveChatSec: proactivePeriodSec(mainNow),
             workspaceRoot: assistantWorkspace,
             pets,
             /** 读屏能力是否可用（pwsh 找不到时为 false，设置页据此禁用开关并说明原因） */
@@ -4024,6 +4510,10 @@ export function apply(ctx: any): void {
         'groupBotEnabled',
         'ownerQq',
         'ownerSyncEnabled',
+        // 主动聊天（2026-10-31）：同上，显式给了才写。saveUserConfig 会再过一次 topFieldValid，
+        // 间隔越界（<120 或 >86400）在那一层被拒 → bad-request，不静默夹紧。
+        'proactiveChatEnabled',
+        'proactiveChatSec',
       ]) {
         if (patch[key] === undefined) continue;
         next[key] = patch[key];
@@ -4114,7 +4604,11 @@ export function apply(ctx: any): void {
       const id = String(parsed?.id ?? '');
       const item = pendingApprovals.get(id);
       if (!item) {
-        return { kind: 'json', status: 200, obj: { ok: false, reason: 'unknown-approval', message: '这条审批不存在或已处理' } };
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'unknown-approval', message: '这条审批不存在或已处理' },
+        };
       }
       pendingApprovals.delete(id);
       if (parsed?.allow !== true) {
@@ -4135,7 +4629,12 @@ export function apply(ctx: any): void {
         return {
           kind: 'json',
           status: 200,
-          obj: { ok: false, allowed: true, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+          obj: {
+            ok: false,
+            allowed: true,
+            reason: 'generate-error',
+            message: e instanceof Error ? e.message : String(e),
+          },
         };
       }
     }
@@ -4313,13 +4812,18 @@ export function apply(ctx: any): void {
     //     主素材链——用户 main-animation/<ext 子目录> 优先，其次包内 assets/<ext 子目录>
     // extraAnimDir 必须先过 resolveAsset：petId 是解码后的 URL 段，Windows 上 %5C 解出的
     // 反斜杠不会被 rest.split('/') 切开，直接 join 会让 `..\..\x` 逃出用户根读盘。
-    const extraAnimDir = resolveAsset(petConfigDir, petId + '-animation');
+    const extraAnimDirs = petPackDirs(petId + '-animation');
     /** 按扩展名查同名素材（专属目录优先；否则用户根 → 包内根） */
     const findAnim = (e: string): string | undefined => {
       const name = fileName.replace(/\.(webm|mov)$/i, '') + e;
-      return extraAnimDir !== undefined && existsSync(extraAnimDir)
-        ? resolveExisting(extraAnimDir, name)
-        : (resolveExisting(userRootFor(e), name) ?? resolveExisting(assetRootFor(e), name));
+      if (extraAnimDirs.length > 0) {
+        for (const dir of extraAnimDirs) {
+          const hit = resolveExisting(dir, name);
+          if (hit) return hit;
+        }
+        return undefined; // 有专属目录就绝不回落到全局主素材池
+      }
+      return resolveExisting(userRootFor(e), name) ?? resolveExisting(assetRootFor(e), name);
     };
     let file = findAnim(ext);
     let servedExt = ext;
@@ -4643,6 +5147,12 @@ export function apply(ctx: any): void {
             skipped.push(petId + ': 占用锁跳过');
             continue;
           }
+          // 正在对话就闭嘴（2026-11-01 用户要求）：连续聊天的间隙里插一句自言自语是打扰。
+          // 与占用锁同一处理——跳过这一拍、**不推进 lastWhisperAt**，聊完静默窗一过就恢复原节奏。
+          if (chatActivity.quiet(petId, now)) {
+            skipped.push(petId + ': 正在对话（' + Math.round(CHAT_QUIET_MS / 1000) + 's 内说过话）');
+            continue;
+          }
           due += 1;
           log.info(`[dsh-pet] 碎碎念到点 pet=${petId}（周期 ${sec}s），开始生成`);
           lastWhisperAt.set(petId, now);
@@ -4690,6 +5200,111 @@ export function apply(ctx: any): void {
       if (timer !== null) clearTimeout(timer);
     };
   }, 'dsh-pet: whisper poll');
+
+  // ---- 主动聊天周期调度（2026-10-31，第四件事）----
+  // 结构与碎碎念调度器**刻意保持同形**（arm/tick/每拍一行汇总日志/串行生成），
+  // 这样两处的心智模型是同一个：读配置 → 逐只判 → 到点的串行跑 → 排下一拍。
+  //
+  // 三处**必须不同**（写在这里防后来人"统一"掉）：
+  //   ① 周期来源是 `proactiveChatSec`（独立键），不是 eventsRefreshSec.whisper；
+  //   ② 判定多一层「成对边界」（上一条是 user = 她还欠一个回复，别另起话头；
+  //      上一条是她刚主动说的 = 等人接，别连发），全部收在 ./proactive 的纯函数里；
+  //   ③ 到点后**推进 proactiveAt 的时机与碎碎念相同**（先推进再生成）——否则一次生成
+  //      失败会让下一拍照样重试，间隔 120s 的配置会变成每拍一次疯狂重试。
+  ctx.effect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    function arm(sec: number): void {
+      if (disposed) return;
+      timer = setTimeout(() => void tick(), Math.max(1000, sec * 1000));
+    }
+    function tick(): void {
+      let next = 300;
+      try {
+        const cfg = readAllConfig(configPaths);
+        const now = Date.now();
+        let min = Infinity;
+        let checked = 0;
+        let notDue = 0;
+        const skipped: string[] = [];
+        const duePets: string[] = [];
+        const aiReady = standaloneAiPolicy()?.isReady() ?? true;
+        for (const pet of flattenPetList(cfg)) {
+          const petId = String(pet.id ?? '');
+          if (!petId) continue;
+          const found = findPetInstance(cfg, petId);
+          if (!found) continue;
+          checked += 1;
+          const periodSec = proactivePeriodSec(found.conf);
+          // 关着的宠物不参与 next 的计算，否则「所有宠物都关着」时 next 会停在最小周期、
+          // 每 300s 空转一拍。这里只在真正可能到点时把周期算进 next。
+          if (!proactiveEnabled(found.conf)) {
+            skipped.push(petId + ': proactiveChatEnabled=false');
+            continue;
+          }
+          min = Math.min(min, periodSec);
+          // 判定要读记忆（判成对边界），但**只在这一拍确实到点时读**——读盘是这里唯一的贵操作，
+          // 没到点的宠物（绝大多数拍）不该为它读一次 memory.json。
+          if (now - (proactiveAt.get(petId) ?? 0) < periodSec * 1000) {
+            notDue += 1;
+            continue;
+          }
+          if (lock.locked(petId)) {
+            skipped.push(petId + ': 占用锁跳过');
+            continue;
+          }
+          if (!aiReady) {
+            skipped.push(petId + ': AI 不可用');
+            continue;
+          }
+          // 到这里才读记忆：这一拍确实可能开口。
+          // 注意**不能** await（tick 是同步函数，碎碎念那边也是这么处理的）——
+          // 所以改成把 petId 收进 duePets，在读记忆与生成都放到下面的异步块里串行做。
+          duePets.push(petId);
+        }
+        if (duePets.length > 0) {
+          void (async () => {
+            for (let i = 0; i < duePets.length; i += 1) {
+              if (i > 0) await new Promise((r) => setTimeout(r, 800));
+              const petId = duePets[i];
+              // ⚠ 时间戳**不能**在这里推进：publishProactive 内部还要再判一次 proactiveDecision
+              // （那是给手动触发兜底的同一条判定），若先进 proactiveAt 再生成，内部那一次必然
+              // 命中 not-due → 调度永远「到点但生成不了」，日志里只看得到"到点 N"看不到"成功"。
+              // 正确顺序：生成 → 无论成败都推进时间戳（失败也不该下一拍立刻重试）。
+              try {
+                const r = await publishProactive(petId);
+                if (!r.ok) skipped.push(petId + ': ' + String(r.reason));
+              } catch (e) {
+                skipped.push(petId + ': 异常 ' + (e instanceof Error ? e.message : String(e)));
+              } finally {
+                proactiveAt.set(petId, Date.now());
+              }
+            }
+          })();
+        }
+        if (Number.isFinite(min)) next = min;
+        log.info(
+          `[dsh-pet] 主动聊天调度：检查 ${checked} 只 → 到点 ${duePets.length}、未到点 ${notDue}、跳过 ${skipped.length}` +
+            (skipped.length > 0 ? `（${skipped.join('；')}）` : '') +
+            `；下一拍 ${next}s`,
+        );
+      } catch (e) {
+        log.warn(
+          '[dsh-pet] 主动聊天调度读配置失败，主动聊天已停止（重启 DSH 后恢复）：' +
+            (e instanceof Error ? e.message : String(e)),
+        );
+        return;
+      }
+      arm(next);
+    }
+    // 启动**不立即开口**（与碎碎念不同）：碎碎念"启动即说一句"是既有行为，
+    // 而主动聊天一启动就冒一句会让用户以为程序出问题了。等一个周期再说。
+    arm(60);
+    return () => {
+      disposed = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, 'dsh-pet: proactive poll');
 
   // /pet 斜杠命令：选择「当前桌宠」（/chat 对话的目标）。浏览器端另有 commandUi 装饰的选择框
   // （裸输 /pet 回车或菜单点选时弹出，选中后提交 /pet <id> 走同一 handler）；手输参数认 id 或名字

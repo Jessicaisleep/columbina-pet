@@ -281,11 +281,7 @@ export interface BackupValidationError {
 
 export type BackupValidation = { ok: true; bundle: BackupBundle } | BackupValidationError;
 
-function fail(
-  reason: BackupValidationError['reason'],
-  message: string,
-  file?: string,
-): BackupValidationError {
+function fail(reason: BackupValidationError['reason'], message: string, file?: string): BackupValidationError {
   return file === undefined ? { ok: false, reason, message } : { ok: false, reason, message, file };
 }
 
@@ -464,11 +460,7 @@ export interface BackupImportPlan {
  * 设置页先拿它给用户看一眼（覆盖哪些、新增哪些），确认后才真导。
  * 这样「点错文件直接覆盖掉全部配置」这个最贵的误操作就没有发生的机会。
  */
-export function planBackupImport(
-  paths: ConfigPaths,
-  userRoot: string,
-  bundle: BackupBundle,
-): BackupImportPlan[] {
+export function planBackupImport(paths: ConfigPaths, userRoot: string, bundle: BackupBundle): BackupImportPlan[] {
   return bundle.files.map((f) => {
     const absolute = f.path.startsWith('pet/')
       ? join(paths.petDir, f.path.slice('pet/'.length))
@@ -520,11 +512,7 @@ export function applyBackupImport(
   options: { now?: Date } = {},
 ): BackupApplyResult {
   const now = options.now ?? new Date();
-  const stamp = now
-    .toISOString()
-    .replace(/[-:]/g, '')
-    .replace(/\..*$/, '')
-    .replace('T', '-');
+  const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-');
   const written: BackupApplyResult['written'] = [];
   const backups: string[] = [];
   const hasApiKeyFile = bundle.files.some((f) => f.path === 'standalone-ai.json');

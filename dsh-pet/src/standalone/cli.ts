@@ -26,7 +26,7 @@ import { flattenPetList, readAllConfig } from '../host/config';
 import { dshHomeDir, packageRoot } from '../host/helper-process';
 import { apply } from '../host/index';
 import { defaultLog, setDefaultLogger } from '../host/log-file';
-import { runCheck, packageVersion } from './check';
+import { runCheck, packageName, packageVersion } from './check';
 import { createDisabledStandaloneAi, createStandaloneAi } from './ai-provider';
 import { createRequestSecurity } from './request-security';
 import { writeStandaloneRuntime } from './runtime-state';
@@ -153,8 +153,8 @@ async function run(logger: StandaloneLogger, options: { port: number }): Promise
   const desktopVisible = pets.filter(isDesktopVisible);
   for (const line of [
     '',
-    '===== dsh-pet 独立模式（不需要 DSH）=====',
-    `  插件        dsh-pet@${packageVersion(packageRoot)}  ${packageRoot}`,
+    '===== dsh-genshin-pet 独立模式（不需要 DSH）=====',
+    `  插件        ${packageName(packageRoot)}@${packageVersion(packageRoot)}  ${packageRoot}`,
     `  路由        http://127.0.0.1:${server.port}/dsh-pet-7340/`,
     `  配置        ${configSource}`,
     `  宠物        ${describePets(pets)}`,

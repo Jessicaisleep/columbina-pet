@@ -45,8 +45,7 @@ try {
   );
   process.exit(3);
 }
-const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } =
-  electronApi;
+const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } = electronApi;
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
@@ -720,7 +719,10 @@ async function syncPetWindows(opts = {}) {
     merged = JSON.parse(resp.body || '{}');
   } catch (e) {
     // 拿不到配置就**什么都不做**：不能把现有窗口全关掉再去赌下一次能读到
-    console.error('[dsh-pet-desktop-helper] syncPetWindows 读配置失败，保持现状:', String(e && e.message ? e.message : e));
+    console.error(
+      '[dsh-pet-desktop-helper] syncPetWindows 读配置失败，保持现状:',
+      String(e && e.message ? e.message : e),
+    );
     return false;
   }
   // 与 startTray / renderer 同一契约：成品聚合的顶层键是**条目**，宠物在各条目的 pets 数组里
@@ -927,7 +929,7 @@ let trayQuitApp = null;
 
 /** 按当前 trayPets / trayCanQuit 重建托盘菜单（可重复调用；托盘实例复用） */
 function buildTrayMenu() {
-  if (!tray || tray.isDestroyed && tray.isDestroyed()) return;
+  if (!tray || (tray.isDestroyed && tray.isDestroyed())) return;
   tray.setContextMenu(
     Menu.buildFromTemplate([
       ...trayPets.map((pet) => ({

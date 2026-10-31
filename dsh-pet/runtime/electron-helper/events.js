@@ -148,6 +148,7 @@ PetSprite.prototype.clearWhisper = function clearWhisper() {
   this.whisperTimer = null;
   this.whisperOn = false;
   this.whisperView = null;
+  this.whisperLook = null;
   this.whisperImage = '';
   this.whisperUrl = '';
   this.renderBubble();
@@ -163,7 +164,15 @@ PetSprite.prototype.clearWhisper = function clearWhisper() {
 //     于是配置里缺 events.whisper 时，只弹气泡这条路照样走得通。
 //   - duration === 0 表示"这一条不显示"：**不动当前已在显示的气泡**
 //     （要收起它请用 POST /bubble/clear，两件事不重叠）。
-PetSprite.prototype.showWhisper = function showWhisper(text, image, url, duration, anim) {
+// 主动聊天的气泡「不自动消失」（shared 里 holdMs=0），但桌面窗口不能真挂一个永远的气泡：
+// 它会一直挡住下一只宠物，后续碎碎念也顶不掉它（单槽优先级相同就按先来后到）。
+// 给一个很长的上限，靠「你看得见它两分钟」达成目的，之后自然让位。
+const PROACTIVE_HOLD_MS = 120000;
+
+// origin：这条话的**来意**（whisper 碎碎念 / proactive 主动聊天 / 其余普通提示），由 host 写在
+// say 叶子里、经 events.js 的 applySayLeaf 传进来。视觉差异（小标题、底色、停留时长）全部由
+// shared 的 S.sayLook(origin) 给出，这里不另写一份数字——三端（桌面 / 手机页 / 安卓悬浮窗）必须同款。
+PetSprite.prototype.showWhisper = function showWhisper(text, image, url, duration, anim, origin) {
   let name = null;
   if (anim !== false) {
     const pool = this.animations.events?.whisper;
@@ -194,17 +203,22 @@ PetSprite.prototype.showWhisper = function showWhisper(text, image, url, duratio
     this.playOnce(name);
   }
   if (duration === 0) return;
+  const look = S.sayLook(origin);
   this.whisperOn = true;
+  this.whisperLook = look; // renderBubble 按它上小标题 / 换底色（见 sprite.js）
   this.whisperView = S.whisperBubbleView({ ok: true, text, ts: 0 });
   this.whisperImage = typeof image === 'string' ? image : '';
   this.whisperUrl = typeof url === 'string' ? url : '';
   this.renderBubble();
   // 气泡定时消失（与动画解耦，与余额同一语义；重复触发先清旧定时器）
+  // 时长来源：显式 duration 优先，否则按来意 —— 碎碎念 4s、普通提示 10s、
+  // 主动聊天（holdMs=0）走 PROACTIVE_HOLD_MS，理由见上面的常量注释。
+  const hold = duration ?? (look.holdMs > 0 ? look.holdMs : PROACTIVE_HOLD_MS);
   if (this.whisperTimer !== null) window.clearTimeout(this.whisperTimer);
   this.whisperTimer = window.setTimeout(() => {
     this.whisperOn = false;
     this.renderBubble();
-  }, duration ?? BUBBLE_DURATION_MS);
+  }, hold);
 };
 
 // 余额展示（气泡 + 档位动画）：周期轮询与菜单点播共用同一展示路径，视觉/行为严格一致。
@@ -320,7 +334,9 @@ function applySayLeaf(petId, leaf) {
   for (const s of sprites) {
     if (s.pet.id !== petId) continue;
     if (said.kind === 'clear') s.clearWhisper();
-    else s.showWhisper(said.text, said.image, said.url, said.duration, said.anim);
+    // 第 6 个参数是「来意」（whisper / proactive / note）：气泡的小标题与底色按它分，
+    // 三端同一套取值表（shared 的 SAY_LOOKS），不在任何一端另写一份。
+    else s.showWhisper(said.text, said.image, said.url, said.duration, said.anim, said.origin);
   }
 }
 

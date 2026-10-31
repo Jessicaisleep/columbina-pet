@@ -53,8 +53,10 @@ test('normalizeScope:非法值回落 everyone（宁可多记不可误忘）', ()
 });
 
 test('membersOf 对坏结构重建空对象（不抛、不返回数组）', () => {
-  const g = mk() as GroupMemory & { members: unknown };
-  g.members = [1, 2, 3];
+  // 故意把 members 写坏成数组：成员表在磁盘上被手改成别的形状时不能抛异常。
+  // 交叉类型收窄不到 unknown，所以走两次断言（只为了能塞进去这个非法值）
+  const g = mk();
+  (g as unknown as { members: unknown }).members = [1, 2, 3];
   const m = membersOf(g);
   assert.deepEqual(m, {});
   assert.equal(Array.isArray(m), false);

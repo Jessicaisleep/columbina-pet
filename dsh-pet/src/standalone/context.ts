@@ -228,7 +228,11 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
             toolTurn: (input: unknown) =>
               typeof ai.toolTurn === 'function'
                 ? ai.toolTurn(input as Parameters<NonNullable<StandaloneModelService['toolTurn']>>[0])
-                : Promise.resolve({ ok: false as const, reason: 'tools-unsupported', message: '模型服务不支持工具调用' }),
+                : Promise.resolve({
+                    ok: false as const,
+                    reason: 'tools-unsupported',
+                    message: '模型服务不支持工具调用',
+                  }),
           },
         }
       : {}),

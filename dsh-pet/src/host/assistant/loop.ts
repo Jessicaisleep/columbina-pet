@@ -24,12 +24,7 @@
  * - 工具执行失败 → 把错误作为 `tool` 消息回给模型，让它自己纠正（这是 agent 该有的行为）。
  * - 权限被挡 → **中断循环**，返回 `needsApproval`，由 UI 问用户；不继续瞎试。
  */
-import {
-  findTool,
-  toolDefinitions,
-  type ToolContext,
-  type ToolResult,
-} from './tools';
+import { findTool, toolDefinitions, type ToolContext, type ToolResult } from './tools';
 
 /** 循环上限：超过就停（防止无限自我调用烧额度） */
 const MAX_STEPS = 8;
@@ -178,7 +173,10 @@ export async function runAssistant(req: AssistantRequest): Promise<AssistantOutc
       const parsed = parseArgs(call.arguments);
       let result: ToolResult;
       if (!tool) {
-        result = { ok: false, content: `没有名为 ${call.name} 的工具。可用工具：${defs.map((d) => d.function.name).join('、')}` };
+        result = {
+          ok: false,
+          content: `没有名为 ${call.name} 的工具。可用工具：${defs.map((d) => d.function.name).join('、')}`,
+        };
       } else if (!parsed.ok) {
         result = { ok: false, content: '工具参数解析失败：' + parsed.error };
       } else {

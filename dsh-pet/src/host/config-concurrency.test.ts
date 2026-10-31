@@ -151,10 +151,14 @@ test('restoring defaults cannot be undone by a concurrent display change', async
     request('config', 'POST'),
   ]);
   assert.ok(results.every((r) => r.status === 200 && r.body.main));
+  // 「同步」= 用户层换成内置默认原文：白名单外的旧字段（这里的 note）被清掉。
   assert.equal(read().note, undefined);
+  // **但用户自己的 pets 必须留住**（派生版 2026-10-30 的改动）：内置 assets/config.jsonc 的
+  // pets 是空数组（宠物由包内 assets/pet/* 提供），若无条件照抄默认原文，用户点一次「同步」
+  // 就会把桌面上的宠物全删掉。见 config.ts 的 keepUserPets。
   assert.deepEqual(
     read().pets.map((p: { id: string }) => p.id),
-    ['main'],
+    ['main', 'extra'],
   );
 });
 

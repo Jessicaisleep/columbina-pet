@@ -31,6 +31,22 @@ export function packageVersion(root: string): string {
 }
 
 /**
+ * 包名（读不到就 dsh-genshin-pet）—— 体检报告与启动横幅共用。
+ *
+ * 为什么不再写死字面量：派生包改名后横幅仍打印 `dsh-pet@0.1.0`，与 package.json 的
+ * `name: dsh-genshin-pet` 自相矛盾，用户排查「装的是哪个包」时会被误导。直接读 package.json
+ * 让身份只有一个真值来源。
+ */
+export function packageName(root: string): string {
+  try {
+    const parsed = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name?: unknown };
+    return typeof parsed.name === 'string' ? parsed.name : 'dsh-genshin-pet';
+  } catch {
+    return 'dsh-genshin-pet';
+  }
+}
+
+/**
  * 打印体检报告。
  * @param logger 输出目标
  * @returns 进程退出码：0 = 就绪；1 = 缺包内默认配置或配置读不出来
@@ -41,7 +57,7 @@ export function runCheck(logger: StandaloneLogger): number {
   const electron = resolveElectronPath();
   const lines: string[] = [
     `Node            ${process.version}（${process.platform}-${process.arch}）`,
-    `插件            dsh-pet@${packageVersion(packageRoot)}  ${packageRoot}`,
+    `插件            ${packageName(packageRoot)}@${packageVersion(packageRoot)}  ${packageRoot}`,
     `DSH_HOME        ${home}`,
     `用户配置        ${paths.userFile}${existsSync(paths.userFile) ? '' : '（不存在 → 用包内默认）'}`,
     `文件宠物目录    ${paths.petDir}${existsSync(paths.petDir) ? '' : '（不存在）'}`,

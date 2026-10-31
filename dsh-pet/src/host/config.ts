@@ -126,6 +126,17 @@ const GLOBAL_DEFAULT_KEYS = [
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
+  // 主动聊天（2026-10-31 新增）：宠物**不等你说话**，按自己的节奏找你聊。
+  //
+  // 与碎碎念的分水岭（两者共用同一条气泡展示链路，但语义完全不同）：
+  //   · 碎碎念 = 自言自语，**不进记忆**——所以下次对话时它不知道自己刚才嘀咕过什么；
+  //   · 主动聊天 = 真的开启一轮对话，**写进记忆**——你回一句「哈哈」时它接得上。
+  //
+  // 为什么是用户级全局（不放 pets[]）：这是「我想不想被它打扰」的偏好，
+  // 与「这只宠物长什么样」无关；多开一只宠物不该让用户再回答一次同样的问题。
+  // 频率同理——一份节奏，全部宠物共享（否则两只各设一个周期，等于两倍的打扰）。
+  'proactiveChatEnabled',
+  'proactiveChatSec',
   // 读屏与助手（2026-10-26 新增）：都是「用户级偏好」，一份生效、多只宠物共享。
   // 放这里有明确的理由——「要不要让桌宠读我的屏幕」「要不要让它能改文件」是用户的隐私与
   // 安全决定，不该因为多开一只宠物就被各自问一遍，也不该出现「这只读那只不读」的分裂状态。
@@ -227,6 +238,17 @@ export interface ConfigPaths {
   legacyUserFile?: string;
   /** ~/.dsh/dsh-pet/pet（文件宠物目录） */
   petDir: string;
+  /**
+   * 包内自带的宠物目录（`<包根>/assets/pet`）：随包分发的 pet pack。
+   *
+   * 为什么要有它：pet/ 一直是**用户层**目录，包自己不能往用户家目录写东西，于是「装好插件就有宠物」
+   * 这件事原来做不到——包内只有 assets/config.jsonc 里那一条内置宠物。派生包（dsh-genshin-pet）
+   * 要把两只原创宠物随包发出去，就得让 scanPet 多看一个目录。
+   *
+   * 优先级：**用户层同名前缀优先**（用户在 pet/ 里放了 `nahida-config.json` 就是他要覆盖包内那只）。
+   * 可选：缺省 = 无包内宠物（与老行为逐字一致）。
+   */
+  packPetDir?: string;
 }
 
 /** 实际生效的用户层文件：优先 .jsonc；不存在则回落到旧的 .json（迁移前的老用户）；
@@ -264,11 +286,21 @@ interface PetFileEntry {
   path: string;
 }
 
-/** 扫描 pet/ 目录：<名>-config.(json|jsonc) → 条目（按文件名排序） */
-function scanPetFiles(petDir: string): PetFileEntry[] {
+/**
+ * 扫描 pet/ 目录：<名>-config.(json|jsonc) → 条目（按文件名排序）
+ *
+ * **只看一层，不递归**：素材目录（`<前缀>-animation/`）与配置文件同级，递归下去会把素材目录里的
+ * 东西也当配置扫出来。
+ */
+export interface PetEntryOrigin {
+  /** 该文件来自包内（`paths.packPetDir`）而不是用户层 `pet/` */
+  fromPack: boolean;
+}
+
+function scanPetDirOnce(dir: string): PetFileEntry[] {
   let entries;
   try {
-    entries = readdirSync(petDir, { withFileTypes: true });
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
     return []; // pet/ 目录不存在 = 无文件宠物
   }
@@ -277,7 +309,32 @@ function scanPetFiles(petDir: string): PetFileEntry[] {
     .map((e) => e.name)
     .filter((name) => /^.+?-config\.(json|jsonc)$/.test(name))
     .sort()
-    .map((name) => ({ prefix: name.replace(/-config\.(json|jsonc)$/, ''), path: join(petDir, name) }));
+    .map((name) => ({ prefix: name.replace(/-config\.(json|jsonc)$/, ''), path: join(dir, name) }));
+}
+
+/**
+ * 用户层 + 包内的 pet pack 合成一张表：**同名前缀以用户层为准**（用户在 pet/ 里放同名文件
+ * 就是想覆盖包内那只），其余按前缀字典序。
+ *
+ * 顺序理由：`seenIds` 是按遍历顺序占位的，而 pet id 跨条目必须唯一。用户层排前面 → 用户的
+ * 那份先占住 id，包内同名条目的重复实例会被 mergePet 跳过并告警（可诊断，不是静默顶掉）。
+ */
+function scanPetFiles(paths: ConfigPaths): Array<PetFileEntry & PetEntryOrigin> {
+  const out: Array<PetFileEntry & PetEntryOrigin> = [];
+  const seen = new Set<string>();
+  for (const f of scanPetDirOnce(paths.petDir)) {
+    if (seen.has(f.prefix)) continue;
+    seen.add(f.prefix);
+    out.push({ ...f, fromPack: false });
+  }
+  if (paths.packPetDir) {
+    for (const f of scanPetDirOnce(paths.packPetDir)) {
+      if (seen.has(f.prefix)) continue; // 用户层同名前缀优先
+      seen.add(f.prefix);
+      out.push({ ...f, fromPack: true });
+    }
+  }
+  return out;
 }
 
 /**
@@ -294,9 +351,9 @@ function scanPetFiles(petDir: string): PetFileEntry[] {
 export function readPetConfigEntry(
   paths: ConfigPaths,
   entry: string,
-): { path: string; raw: Record<string, unknown> | undefined } | undefined {
-  const hit = scanPetFiles(paths.petDir).find((f) => f.prefix === entry);
-  return hit ? { path: hit.path, raw: readJsonc(hit.path) } : undefined;
+): { path: string; raw: Record<string, unknown> | undefined; fromPack: boolean } | undefined {
+  const hit = scanPetFiles(paths).find((f) => f.prefix === entry);
+  return hit ? { path: hit.path, raw: readJsonc(hit.path), fromPack: hit.fromPack } : undefined;
 }
 
 /** animations 段完整性校验（与旧 assertAnimationsHost 同一套规则；不 throw，非法返回 false） */
@@ -502,11 +559,7 @@ function topFieldValid(key: string, value: unknown): boolean {
     case 'screenExcludePatterns':
       // 窗口标题黑名单：字符串数组，每项是一个子串（大小写不敏感），命中就不读那个窗口。
       // 上限 40 条、单条 80 字符：这是「排除私人窗口」用的，不是拿来做复杂匹配的。
-      return (
-        Array.isArray(value) &&
-        value.length <= 40 &&
-        value.every((v) => typeof v === 'string' && v.length <= 80)
-      );
+      return Array.isArray(value) && value.length <= 40 && value.every((v) => typeof v === 'string' && v.length <= 80);
     // ---- AI 助手（2026-10-26 新增）----
     case 'assistantEnabled':
       // 助手总开关：默认关闭。打开后对话才会走「工具调用循环」。
@@ -519,6 +572,21 @@ function topFieldValid(key: string, value: unknown): boolean {
     case 'assistantNetworkEnabled':
       // 助手能否联网（web_search / fetch_url）。与助手开关独立：可以允许写文件但禁网。
       return typeof value === 'boolean';
+    // ---- 主动聊天（2026-10-31 新增）----
+    case 'proactiveChatEnabled':
+      // 默认关闭。理由同读屏/助手：主动开口会消耗 token 并**写进记忆**，
+      // 任何「默认开启」都等于替用户决定花钱和污染记忆。
+      return typeof value === 'boolean';
+    case 'proactiveChatSec': {
+      // 间隔秒数。下限 120 是硬约束，不是随手取的：
+      //   · 主动聊天每拍都会真的调一次模型并**往 memory.json 追加两条消息**，
+      //     比碎碎念（不写记忆）重得多；给个 30 秒的下限会把记忆文件刷成噪声。
+      //   · 上限 86400（一天）——再长就不叫「主动」了，用户想要的话关掉这个功能更诚实。
+      // 非有限数/越界一律拒（不静默夹紧）：用户手改配置写成 5 秒却「看起来存进去了」，
+      // 比直接报错更难排查。
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 120 && n <= 86400;
+    }
     case 'animations':
       return animationsValid(value);
     case 'animationWeights':
@@ -611,6 +679,26 @@ function mergeEntry(
   return out;
 }
 
+/**
+ * 宠物实例字段的兜底默认值。
+ *
+ * 历史上这些默认值来自内置 `assets/config.jsonc` 的 `pets[0]`（那条「蓝毛小女仆」）。
+ * 2026-10-30 起本包**不再内置任何默认宠物**（全部宠物都以 pet pack 形式放在 `assets/pet/`），
+ * 于是 `basePets[0]` 可能是 undefined——若此时仍从它逐字段继承，`size` 会变成 NaN、
+ * `display` 会变成空串。这里把原来那条宠物身上的字段值固化成常量，保证「文件宠物没写某个字段」
+ * 时的默认值与改造前**一字不差**。
+ */
+const PET_INSTANCE_DEFAULTS: Record<string, unknown> = {
+  name: '',
+  size: 462,
+  balanceEnabled: true,
+  whisperEnabled: true,
+  workStatusEnabled: true,
+  fixedEnabled: false,
+  display: 'both',
+  position: { corner: 'top-right', marginX: 24, marginY: 100 },
+};
+
 /** pets 数组合并：文件没写/空 → 默认列表；逐实例合并（缺字段 → 内置默认 pets[0]，静默）。 */
 function mergePets(
   basePets: Record<string, unknown>[],
@@ -618,10 +706,13 @@ function mergePets(
   label: string,
   seenIds: Set<string>,
 ): Record<string, unknown>[] {
-  const basePet: Record<string, unknown> = basePets[0] ?? {};
+  const basePet: Record<string, unknown> = basePets[0] ?? PET_INSTANCE_DEFAULTS;
+  // 内置默认里没有宠物（本包的常态）：此时「没写 pets」不是配置错误，而是没有宠物可显示，
+  // 既不告警也不回落（回落只会回落成空数组，白告警一次）。
+  const noBase = basePets.length === 0;
   if (!Array.isArray(raw) || raw.length === 0) {
-    warnOnce(`${label}:pets`, `「${label}」的 pets 缺失或为空，已取默认宠物列表`);
-    return basePets;
+    if (!noBase) warnOnce(`${label}:pets`, `「${label}」的 pets 缺失或为空，已取默认宠物列表`);
+    return noBase ? [] : basePets;
   }
   const out: Record<string, unknown>[] = [];
   for (const item of raw) {
@@ -629,8 +720,8 @@ function mergePets(
     if (pet) out.push(pet);
   }
   if (out.length === 0) {
-    warnOnce(`${label}:pets`, `「${label}」的 pets 全部被跳过（id 非法/重复/冲突），已取默认宠物列表`);
-    return basePets;
+    if (!noBase) warnOnce(`${label}:pets`, `「${label}」的 pets 全部被跳过（id 非法/重复/冲突），已取默认宠物列表`);
+    return noBase ? [] : basePets;
   }
   return out;
 }
@@ -792,7 +883,7 @@ export function readAllConfig(paths: ConfigPaths): Record<string, Record<string,
   // 文件宠物条目：pet/<名>-config.json，一个文件一个条目（key = 文件名前缀 = 素材根）。
   // 基座 = 内置默认，但白名单字段（用户级成本/偏好/环境）取**用户层**——「全局默认 + 种类可覆盖」。
   const filePetBase = packBase(base, mainOverlay);
-  for (const file of scanPetFiles(paths.petDir)) {
+  for (const file of scanPetFiles(paths)) {
     const parsed = readJsonc(file.path);
     if (!parsed) {
       warnOnce('file:' + file.path, '文件宠物配置解析失败，已跳过：' + file.path);
@@ -1007,6 +1098,11 @@ export function saveUserConfig(
   if (ap !== undefined && !topFieldValid('assistantPermission', ap)) return null;
   const ane = o.assistantNetworkEnabled;
   if (ane !== undefined && !topFieldValid('assistantNetworkEnabled', ane)) return null;
+  // 主动聊天（2026-10-31）：与上面几个同语义——传了就校验后进白名单，没传则走透传保留。
+  const pce = o.proactiveChatEnabled;
+  if (pce !== undefined && !topFieldValid('proactiveChatEnabled', pce)) return null;
+  const pcs = o.proactiveChatSec;
+  if (pcs !== undefined && !topFieldValid('proactiveChatSec', pcs)) return null;
   const cleanModel = (v: Record<string, unknown>): { provider: string; model: string } => ({
     provider: String(v.provider).trim(),
     model: String(v.model).trim(),
@@ -1058,6 +1154,9 @@ export function saveUserConfig(
   if (ae !== undefined) outConfig.assistantEnabled = ae;
   if (ap !== undefined) outConfig.assistantPermission = ap;
   if (ane !== undefined) outConfig.assistantNetworkEnabled = ane;
+  // 主动聊天：开关原样存布尔，间隔归一化成数字（请求体传 "600" 也存成 600）
+  if (pce !== undefined) outConfig.proactiveChatEnabled = pce;
+  if (pcs !== undefined) outConfig.proactiveChatSec = Number(pcs);
   // 透传保留：请求体未携带的顶层字段，从 existing（磁盘现有用户文件）原样带回——
   // 设置页只提交 pets(+全局开关+physics+模型+对话历史条数)，手改的 whisperPrompt/memes/... 借此保住。
   // 白名单字段只在「请求体传了」时才算白名单（已由上方写入）；未传时走这里透传磁盘旧值——
@@ -1090,6 +1189,8 @@ export function saveUserConfig(
   if (ae !== undefined) bodyOwned.add('assistantEnabled');
   if (ap !== undefined) bodyOwned.add('assistantPermission');
   if (ane !== undefined) bodyOwned.add('assistantNetworkEnabled');
+  if (pce !== undefined) bodyOwned.add('proactiveChatEnabled');
+  if (pcs !== undefined) bodyOwned.add('proactiveChatSec');
   if (existing && typeof existing === 'object') {
     for (const key of Object.keys(existing)) {
       if (bodyOwned.has(key)) continue; // 白名单字段由请求体决定
@@ -1114,12 +1215,34 @@ export function saveUserConfig(
  * 注意（调用方要在 UI 上讲清楚）：文件一旦生成即成为**显式覆盖层**——用户层写了什么就
  * 覆盖内置默认的对应字段，所以插件升级改了内置默认后，这个文件里的旧值仍会继续生效。
  *
+ * **派生版的例外（2026-10-30）**：本包内置 `assets/config.jsonc` 的 `pets` 是**空数组**
+ * （宠物由包内 `assets/pet/*-config.json` 提供，不在主配置里）。若无条件整份照抄，
+ * 用户点一次「同步」就会把用户层里自己那些 `pets`（含位置/尺寸/开关）全部清空——
+ * 而且宠物会当场从桌面上消失。所以：**内置 pets 为空、而用户层本来有 pets 时，
+ * 保留用户层那份 pets**，其余字段照旧整份取内置默认。
+ *
  * 默认文件缺失/目录不可写 → 直接抛（宿主回 500）：绝不静默留下半个配置文件。
  */
 export function syncUserConfigFromDefault(paths: ConfigPaths): void {
   const raw = readFileSync(paths.defaultFile, 'utf8');
   mkdirSync(dirname(paths.userFile), { recursive: true });
-  writeFileSync(paths.userFile, raw, 'utf8');
+  writeFileSync(paths.userFile, keepUserPets(raw, readUserConfig(paths)), 'utf8');
+}
+
+/**
+ * 「同步」时的 pets 保全：内置默认的 `pets` 为空、用户层却有 pets → 把用户那份塞回默认原文。
+ *
+ * 为什么做文本替换而不是 parse 完再 stringify：默认文件里那几千字中文注释是给用户看的，
+ * stringify 会把它们全部抹掉——「同步」的意义一半就在这份可读性上。
+ * 只针对 `"pets": []` 这个空数组字面量做替换，命中不了就原样返回（内置默认自带 pets 时
+ * 本来就是"以内置为准"，不该掺用户旧值）。
+ */
+function keepUserPets(raw: string, existing: Record<string, unknown> | undefined): string {
+  const mine = Array.isArray(existing?.pets) ? (existing.pets as unknown[]) : [];
+  if (mine.length === 0) return raw;
+  const empty = /("pets"\s*:\s*)\[\s*\]/;
+  if (!empty.test(raw)) return raw;
+  return raw.replace(empty, (_all, head: string) => head + JSON.stringify(mine, null, 2).replace(/\n/g, '\n  '));
 }
 
 /**

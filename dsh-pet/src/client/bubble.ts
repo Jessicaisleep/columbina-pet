@@ -65,6 +65,22 @@ const bubbleCss = [
   // 上限与余额气泡相同；宽度取宽/折行的规则同 .dsh-pet-bubble（继承 width:max-content）
   '.dsh-pet-bubble.dsh-pet-whisper{font-size:calc(var(--f)*0.7473);' +
     'min-width:calc(var(--f)*2.1978);max-width:min(calc(var(--f)*10.989),100%)}',
+  // ---- 来意档位（shared/bubble-kind.ts 的 tone，三端同一套语义）----
+  // murmur = 碎碎念：灰底、边框去掉、字号更小，一眼看出是自言自语
+  // calling = 主动聊天：白底 + 明显粉色描边 + 小标题，是宠物头顶最显眼的那一个
+  // plain = 普通提示：一个类都不加，与改造前逐像素一致
+  '.dsh-pet-bubble.dsh-pet-tone-murmur{background:rgba(245,246,248,.88);' +
+    'box-shadow:0 calc(var(--f)*0.15) calc(var(--f)*0.5) rgba(0,0,0,.07)}',
+  '.dsh-pet-bubble.dsh-pet-tone-murmur::after{border-top-color:rgba(245,246,248,.88)}',
+  '.dsh-pet-bubble .dsh-pet-bubble-tag{font-size:calc(var(--f)*0.62);letter-spacing:calc(var(--f)*0.04);' +
+    'margin-bottom:calc(var(--f)*0.12);color:rgba(43,43,43,.45);font-weight:600}',
+  '.dsh-pet-bubble.dsh-pet-tone-calling{border:calc(var(--f)*0.12) solid rgba(255,138,178,.8);' +
+    'box-shadow:0 calc(var(--f)*0.2) calc(var(--f)*0.9) rgba(255,138,178,.32),0 1px 3px rgba(0,0,0,.08)}',
+  '.dsh-pet-bubble.dsh-pet-tone-calling .dsh-pet-bubble-tag{color:#d9548a;font-weight:700}',
+  // 可点（只有「她主动来找你」这条会加）：点一下开对话弹窗。
+  // 提示语与桌面端 index.html / 手机页 / 悬浮窗用的是同一句，四端不能各写一套说法。
+  '.dsh-pet-bubble.is-clickable{cursor:pointer;pointer-events:auto}',
+  '.dsh-pet-bubble.is-clickable .dsh-pet-bubble-tag::after{content:"（点一下回她）";font-weight:400;opacity:.75}',
   // 配图（碎碎念/对话共用）：样式在 shared 的 MEME_BUBBLE_CSS（两端同一份，由
   // createMemeImage 注入）——这里不再重复写一份，避免与桌面端 index.html 走样
   '.dsh-pet-bubble .pet-bub-title{font-size:calc(var(--f)*0.7692);color:rgba(43,43,43,.6);margin-bottom:calc(var(--f)*0.1978)}',
@@ -286,7 +302,17 @@ export function makeBalanceBubble(rt: {
  */
 export function makeWhisperBubble(rt: {
   h: typeof jsx;
-}): (props: { text: string; image?: string; url?: string; assetRoot?: string; on: boolean }) => ReactNode {
+}): (props: {
+  text: string;
+  image?: string;
+  url?: string;
+  assetRoot?: string;
+  tag?: string;
+  tone?: string;
+  /** 「她主动来找你」那条可点：点一下 = 开对话弹窗（用户否则不知道该去哪儿回） */
+  onOpen?: () => void;
+  on: boolean;
+}) => ReactNode {
   const { h } = rt;
   injectBubbleCss();
   injectMemeBubbleCss();
@@ -296,12 +322,21 @@ export function makeWhisperBubble(rt: {
     image,
     url,
     assetRoot,
+    tag,
+    tone,
+    onOpen,
     on,
   }: {
     text: string;
     image?: string;
     url?: string;
     assetRoot?: string;
+    /** 气泡上的小标题（如「她主动来找你」「自言自语」）；空串不渲染 */
+    tag?: string;
+    /** 来意档位（murmur / calling / plain）；plain 不额外加类 */
+    tone?: string;
+    /** 「她主动来找你」那条可点：点一下 = 开对话弹窗（用户否则不知道该去哪儿回） */
+    onOpen?: () => void;
     on: boolean;
   }) {
     const rows = whisperBubbleView({ ok: true, text, ts: 0 });
@@ -311,8 +346,26 @@ export function makeWhisperBubble(rt: {
     // 表情包池内的名称，按素材根拼路径。判别位在字段名上，不靠 startsWith('http') 嗅探
     // （名字恰好长得像地址时会判错）。
     const src = href || (key ? memeImageUrl(key, '/dsh-pet-7340', assetRoot) : '');
+    // 小标题（来意）：放在正文之上、配图之下，字最小但最先被读到
+    const tagNode = tag ? h('div', { key: 'tag', className: 'dsh-pet-bubble-tag', children: [tag] }) : null;
+    // 「她主动来找你」这条可点：点一下开对话弹窗（is-clickable 让光标与提示语一起变）
+    const clickable = onOpen !== undefined && tone === 'calling';
     return h('div', {
-      className: 'dsh-pet-bubble dsh-pet-whisper' + (src ? ' ' + MEME_BUBBLE_CLASS : '') + (on ? ' is-on' : ''),
+      className:
+        'dsh-pet-bubble dsh-pet-whisper' +
+        (tone && tone !== 'plain' ? ' dsh-pet-tone-' + tone : '') +
+        (clickable ? ' is-clickable' : '') +
+        (src ? ' ' + MEME_BUBBLE_CLASS : '') +
+        (on ? ' is-on' : ''),
+      ...(clickable
+        ? {
+            onClick: (e: { preventDefault: () => void; stopPropagation: () => void }) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onOpen();
+            },
+          }
+        : {}),
       children: src
         ? [
             h('img', {
@@ -323,9 +376,12 @@ export function makeWhisperBubble(rt: {
               src,
               alt: key || href,
             }),
+            tagNode,
             rowsToNodes(h, rows),
           ]
-        : rowsToNodes(h, rows),
+        : tagNode === null
+          ? rowsToNodes(h, rows)
+          : [tagNode, rowsToNodes(h, rows)],
     });
   };
 }

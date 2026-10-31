@@ -21,11 +21,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 const HOST_DIR = join(import.meta.dirname, '..', 'host');
 const hostSource = readFileSync(join(HOST_DIR, 'index.ts'), 'utf8');
 
-function fakeReq(init: {
-  url: string;
-  method: string;
-  headers?: Record<string, string | undefined>;
-}): IncomingMessage {
+function fakeReq(init: { url: string; method: string; headers?: Record<string, string | undefined> }): IncomingMessage {
   return {
     url: init.url,
     method: init.method,
@@ -70,10 +66,7 @@ test('portable/export 在宿主侧只收 POST：源码里不含 GET 分支', () 
 test('没有令牌的 POST /portable/export 被 authorize 拒绝', () => {
   const security = createRequestSecurity();
   const res = fakeRes();
-  const ok = security.authorize(
-    fakeReq({ url: '/dsh-pet-7340/portable/export', method: 'POST' }),
-    res,
-  );
+  const ok = security.authorize(fakeReq({ url: '/dsh-pet-7340/portable/export', method: 'POST' }), res);
   assert.equal(ok, false);
   assert.equal(res.status, 403, '没有令牌的导出请求必须 403');
 });
@@ -81,10 +74,7 @@ test('没有令牌的 POST /portable/export 被 authorize 拒绝', () => {
 test('没有令牌的 POST /portable/import 被 authorize 拒绝', () => {
   const security = createRequestSecurity();
   const res = fakeRes();
-  const ok = security.authorize(
-    fakeReq({ url: '/dsh-pet-7340/portable/import', method: 'POST' }),
-    res,
-  );
+  const ok = security.authorize(fakeReq({ url: '/dsh-pet-7340/portable/import', method: 'POST' }), res);
   assert.equal(ok, false);
   assert.equal(res.status, 403);
 });
@@ -108,22 +98,11 @@ test('（反证）GET 路径确实是免令牌的——这正是不用 GET 的�
   const res = fakeRes();
   // 随便挑一个 GET 形态的业务路径：publicRead 直接放行，不需要令牌
   const ok = security.authorize(fakeReq({ url: '/dsh-pet-7340/config', method: 'GET' }), res);
-  assert.equal(
-    ok,
-    true,
-    'GET /dsh-pet-*/config 目前是免令牌的；所以 export 绝不能做成 GET',
-  );
+  assert.equal(ok, true, 'GET /dsh-pet-*/config 目前是免令牌的；所以 export 绝不能做成 GET');
 });
 
 test('设置页导出走 POST（不是 GET）', () => {
   const page = readFileSync(join(import.meta.dirname, 'settings-page.ts'), 'utf8');
-  assert.match(
-    page,
-    /petRequestRaw\('\/dsh-pet-7340\/portable\/export', 'POST'/,
-    '设置页必须用 POST 调导出',
-  );
-  assert.ok(
-    !/portable\/export\?includeApiKey/.test(page),
-    '不能再拼 query 形式的 includeApiKey',
-  );
+  assert.match(page, /petRequestRaw\('\/dsh-pet-7340\/portable\/export', 'POST'/, '设置页必须用 POST 调导出');
+  assert.ok(!/portable\/export\?includeApiKey/.test(page), '不能再拼 query 形式的 includeApiKey');
 });

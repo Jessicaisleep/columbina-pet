@@ -164,7 +164,7 @@ test(
 
 test(
   '一次性授权：grant 之后同一个越界写动作放行，且只用一次',
-  withWs(async (ws, ctx) => {
+  withWs(async (_ws, ctx) => {
     const outside = join(tmpdir(), 'dsh-pet-grant-' + Date.now() + '.txt');
     try {
       // workspace 档 + 越界目标：本来会被拦，先发一个授权模拟「用户点了允许」
@@ -234,7 +234,9 @@ test(
 );
 
 test('每个工具都有 write 标记（决定走 checkRead 还是 checkWrite）', () => {
-  const writes = TOOLS.filter((t) => t.write).map((t) => t.name).sort();
+  const writes = TOOLS.filter((t) => t.write)
+    .map((t) => t.name)
+    .sort();
   assert.deepEqual(writes, ['append_file', 'write_file'], '写类工具只有这两个');
 });
 

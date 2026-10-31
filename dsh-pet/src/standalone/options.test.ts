@@ -58,12 +58,15 @@ describe('configPathsFor —— 配置路径推导（host/index.ts 那份的镜�
   // 这里钉住"拼接口径"本身，改动时能一眼看出动了哪条路径。
   const paths = configPathsFor('/pkg', '/home/.dsh');
 
-  test('内置默认 / 用户主配置 / 旧版回落 / 文件宠物目录', () => {
+  test('内置默认 / 用户主配置 / 旧版回落 / 文件宠物目录 / 包内宠物目录', () => {
     assert.deepEqual(paths, {
       defaultFile: join('/pkg', 'assets', 'config.jsonc'),
       userFile: join('/home/.dsh', 'dsh-pet', 'main-config.jsonc'),
       legacyUserFile: join('/home/.dsh', 'dsh-pet', 'main-config.json'),
       petDir: join('/home/.dsh', 'dsh-pet', 'pet'),
+      // 包内自带的 pet pack（本派生版的哥伦比娅 / 纳西妲）：host 侧 scanPetFiles 会把它与
+      // 上面的用户层 petDir 合并读取，同名前缀用户层优先。漏了这条，独立模式会一只宠物都读不到。
+      packPetDir: join('/pkg', 'assets', 'pet'),
     });
   });
 });

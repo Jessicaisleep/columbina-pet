@@ -151,6 +151,52 @@
         min-width: calc(var(--f) * 2.1978);
         max-width: min(calc(var(--f) * 10.989), 100%);
       }
+      /* 说话气泡的「来意」档位 —— 取值表在 shared 的 SAY_LOOKS，三端（桌面 / 手机页 / 安卓悬浮窗）
+         必须是同一套观感，这里只是把 tone 映射成 CSS：
+           murmur  = 碎碎念：灰蓝底 + 斜体 + 小字，一眼看出「这句不用回」
+           calling = 主动聊天：粉描边 + 加粗标题，是唯一「她在等你回话」的那一个
+         箭头（::after）必须跟着换底色，否则白箭头配灰底会顶出一个白三角。 */
+      .pet-bubble.is-tone-murmur {
+        background: rgba(233, 237, 244, 0.94);
+        color: #3c4658;
+        font-style: italic;
+        box-shadow: 0 calc(var(--f) * 0.15) calc(var(--f) * 0.5) rgba(0, 0, 0, 0.12);
+      }
+      .pet-bubble.is-tone-murmur::after {
+        border-top-color: rgba(233, 237, 244, 0.94);
+      }
+      .pet-bubble.is-tone-calling {
+        background: rgba(255, 250, 252, 0.96);
+        border: calc(var(--f) * 0.08) solid rgba(226, 106, 152, 0.85);
+        box-shadow: 0 calc(var(--f) * 0.2) calc(var(--f) * 0.7) rgba(226, 106, 152, 0.28);
+        /* 点一下 = 开对话弹窗（见 sprite.js 的 openChatFromBubble），光标要跟着变，
+           否则用户看不出这条能点 */
+        cursor: pointer;
+      }
+      .pet-bubble.is-tone-calling::after {
+        border-top-color: rgba(255, 250, 252, 0.96);
+      }
+      /* 小标题（「自言自语」/「她主动来找你」）：比正文小一档，不抢正文 */
+      .pet-bub-tag {
+        font-size: calc(var(--f) * 0.65);
+        line-height: 1.4;
+        margin-bottom: calc(var(--f) * 0.15);
+        letter-spacing: 0.02em;
+        color: rgba(43, 43, 43, 0.55);
+        /* 爹是斜体（murmur 底色段会设 font-style: italic），标题要正着排 */
+        font-style: normal;
+      }
+      .pet-bubble.is-tone-calling .pet-bub-tag {
+        color: #cf5b8b;
+        font-weight: 700;
+      }
+      /* 让它看起来能点：小标题后面补一句提示（纯 CSS，不改 shared 的文案表，
+         手机页用同一句话写在 .bubble.tone-calling .btag::after 里） */
+      .pet-bubble.is-tone-calling .pet-bub-tag::after {
+        content: '（点一下回她）';
+        font-weight: 400;
+        color: rgba(207, 91, 139, 0.75);
+      }
       .pet-bub-row {
         display: flex;
         justify-content: space-between;

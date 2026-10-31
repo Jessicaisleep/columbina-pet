@@ -142,6 +142,9 @@ export function createDisabledStandaloneAi(reason: string): StandaloneAiService 
     listProviders: () => [{ id: PROVIDER, name: 'Standalone' }],
     listModels: async () => [],
     resolveModelInfo: async () => undefined,
+    // 禁用态的 provider 没有任何 chunk 可发，直接结束；async generator 的 shape 是接口要求，
+    // 这里永远不 yield，所以显式关掉 require-yield（不是漏写，是故意的）。
+    // eslint-disable-next-line require-yield
     stream: async function* () {
       return;
     },
@@ -287,7 +290,11 @@ export function createStandaloneAi(
       const settings = store.current();
       // 单并发：与 stream 共用 active，避免助手轮与碎碎念同时抢一个实例
       if (active) {
-        return { ok: false as const, reason: 'provider-error' as const, message: 'Standalone AI is busy. Please wait.' };
+        return {
+          ok: false as const,
+          reason: 'provider-error' as const,
+          message: 'Standalone AI is busy. Please wait.',
+        };
       }
       const recent = requests.filter((time) => now() - time < RATE_WINDOW_MS);
       if (recent.length >= REQUESTS_PER_MINUTE) {

@@ -108,7 +108,7 @@ export const pinnedMenuBranch = (current: boolean): MenuBranch => ({
   ],
 });
 
-/** 第三方菜单项（宿主经 /state 的 sections.menu 下发的快照，一条 = 一个可点项）。 */export interface MenuMoreItem {
+/** 第三方菜单项（宿主经 /state 的 sections.menu 下发的快照，一条 = 一个可点项）。 */ export interface MenuMoreItem {
   /** 注册方身份；同时也是一级分组名（显示用） */
   owner: string;
   /** 项名（显示用，也是回传给注册方的标识） */

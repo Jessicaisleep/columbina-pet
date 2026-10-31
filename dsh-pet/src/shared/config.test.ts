@@ -41,16 +41,22 @@ const ENTRY_FIELDS: Array<keyof Pet> = [
 const readSource = (rel: string): string => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
 describe('flattenConfigPets —— 成品 → 渲染列表的唯一填充点', () => {
-  test('真实内置默认配置：每只实例的条目级字段齐全（含 physics.throwPower）', () => {
+  test('真实内置默认配置 + 包内 pet pack：每只实例的条目级字段齐全（含 physics.throwPower）', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-flatten-'));
     try {
       const merged = readAllConfig({
         defaultFile: fileURLToPath(new URL('../../assets/config.jsonc', import.meta.url)),
         userFile: join(dir, 'main-config.jsonc'), // 不存在：只测内置默认
-        petDir: join(dir, 'pet'), // 不存在：不掺文件宠物
+        petDir: join(dir, 'pet'), // 不存在：不掺用户自己放的宠物
+        // 派生版（2026-10-30）起，宠物不再写在内置 config.jsonc 的 pets 里，而是以
+        // assets/pet/*-config.json 的形式随包分发（哥伦比娅 / 纳西妲两只）。
+        packPetDir: fileURLToPath(new URL('../../assets/pet', import.meta.url)),
       });
+      // ① 内置默认本身不再自带宠物：main 条目仍是全局默认的载体，但 pets 应为空。
+      assert.deepEqual(merged.main?.pets, [], '内置默认的 pets 应为空（宠物由 assets/pet/* 提供）');
+      // ② 真正的宠物来自包内 pet pack（条目名 columbina / nahida，对 main 而言都是 extra）。
       const pets = flattenConfigPets(merged);
-      assert.ok(pets.length > 0, '内置默认配置应至少有一只宠物');
+      assert.ok(pets.length > 0, '包内 pet pack 应至少有一只宠物');
       for (const p of pets) {
         for (const field of ENTRY_FIELDS) {
           assert.ok(p[field] !== undefined, `宠物「${String(p.id)}」缺条目级字段 ${field}`);

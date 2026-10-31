@@ -296,8 +296,25 @@ test('对话历史每行都能改/删：buildOps 真跑一遍（任务2）', asy
           : url.startsWith('/dsh-pet-7340/chat/history')
             ? options.method === 'GET'
               ? { ok: true, total: 2, messages, memory: { summary: '她叫小女仆。', summarized: 1, total: 2 } }
-              : { ok: true, index: 0, total: 1, summarized: 0, covered: true, summaryRewritten: true, memory: { summary: '她叫小明。', summarized: 0, total: 1 } }
-            : { protocol: 'openai-compatible', baseUrl: 'https://example.test', model: 'x', hasKey: false, enabled: false, automaticWhispers: false, whisperIntervalSec: 300, maxTokens: 1024 };
+              : {
+                  ok: true,
+                  index: 0,
+                  total: 1,
+                  summarized: 0,
+                  covered: true,
+                  summaryRewritten: true,
+                  memory: { summary: '她叫小明。', summarized: 0, total: 1 },
+                }
+            : {
+                protocol: 'openai-compatible',
+                baseUrl: 'https://example.test',
+                model: 'x',
+                hasKey: false,
+                enabled: false,
+                automaticWhispers: false,
+                whisperIntervalSec: 300,
+                maxTokens: 1024,
+              };
       return { ok: true, status: 200, json: async () => body };
     },
   });
@@ -334,7 +351,8 @@ test('对话历史每行都能改/删：buildOps 真跑一遍（任务2）', asy
   assert.equal(first.children.length, 5, '编辑中再点改不该多出节点（重复点会叠出两套框）');
 
   // 原样保存 → 不打接口，直接收起（避免无意义的云端摘要重写）
-  const postCount = () => requests.filter((r) => r.url === '/dsh-pet-7340/chat/history' && r.options.method === 'POST').length;
+  const postCount = () =>
+    requests.filter((r) => r.url === '/dsh-pet-7340/chat/history' && r.options.method === 'POST').length;
   const before = postCount();
   await first.children[4]!.children[0]!.listeners.click?.();
   await flush();

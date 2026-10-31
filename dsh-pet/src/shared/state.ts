@@ -8,6 +8,7 @@
 // 路径（'sections.balance' / 'pets.<id>.say'）只当**不透明键**用，绝不解析——
 // 宠物 id 允许含点号，解析出来必然出错。
 import { toBalanceState, type BalanceState } from './balance';
+import { normalizeSayOrigin, type SayOrigin } from './bubble-kind';
 import { toWorkStatus, type WorkStatusSnapshot } from './work-status';
 
 /** 一个叶子：计数器 + 载荷（data 为 null = 还没有数据，消费端跳过） */
@@ -146,7 +147,21 @@ export function readBalance(leaf: StateLeaf): { state: BalanceState; manual: boo
  * 本身就是那个判别位，靠 `startsWith('http')` 嗅探会在名字恰好长得像 URL 时出错。
  */
 export type SayCue =
-  { kind: 'say'; text: string; image?: string; url?: string; duration?: number; anim?: boolean } | { kind: 'clear' };
+  | {
+      kind: 'say';
+      text: string;
+      image?: string;
+      url?: string;
+      duration?: number;
+      anim?: boolean;
+      /**
+       * 这句话的来意：碎碎念 / 主动聊天 / 普通提示。三端（桌面气泡、手机页、安卓悬浮窗）
+       * 按 `shared/bubble-kind.ts` 的同一张表决定长什么样——用户不看记录也得能分清
+       * 「她自己嘟囔」和「她真的来找你」。缺省即 `'note'`（老 host 写的老数据照常能读）。
+       */
+      origin: SayOrigin;
+    }
+  | { kind: 'clear' };
 
 /**
  * 类型收窄：宠物说话叶子 → SayCue（形状非法 / 空文本 → null，消费端跳过这一拍）。
@@ -162,6 +177,7 @@ export function readSay(leaf: StateLeaf): SayCue | null {
     url?: unknown;
     duration?: unknown;
     anim?: unknown;
+    origin?: unknown;
     clear?: unknown;
   };
   // 清空指令优先：它不带 text，所以必须排在文本校验**前面**
@@ -177,6 +193,8 @@ export function readSay(leaf: StateLeaf): SayCue | null {
     // 只认 ≥0 的有限数：非法值当"没给"（写端已校验，这里只是防御，不让脏数据毁掉整拍）
     duration: typeof d.duration === 'number' && Number.isFinite(d.duration) && d.duration >= 0 ? d.duration : undefined,
     anim: typeof d.anim === 'boolean' ? d.anim : undefined,
+    // 来意：只有 'whisper' / 'proactive' 被认，其余（含老数据没这个字段）→ 'note'
+    origin: normalizeSayOrigin(d.origin),
   };
 }
 

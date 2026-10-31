@@ -96,6 +96,36 @@ export const settingsPage = `<!doctype html>
 <div class="test-row"><button id="assistant-save" type="button">保存助手设置</button><span id="assistant-result" class="test-result" role="status" aria-live="polite"></span></div>
 <div id="approvals" class="approvals" hidden><h3>待批准的越权动作</h3><ul id="approval-list"></ul></div>
 </fieldset>
+<fieldset><legend>手机连接（让手机接着聊）</legend>
+<p class="hint" id="mobile-lead">手机连上这台电脑后，读到的就是<b>同一份对话记忆</b>：电脑上聊到一半，拿起手机能接着聊；手机说完，回到电脑也接得上。电脑关机时手机连不上（AI 在电脑上跑），这是设计如此。</p>
+<label class="check"><input id="mobile-enabled" type="checkbox" aria-describedby="mobile-lead mobile-warn">允许手机访问（局域网 / Tailscale）</label>
+<p class="notice" id="mobile-warn">开启后服务会监听局域网地址，<b>但仍然需要令牌才能读任何数据</b>。只在你信任的网络里开；公共 Wi-Fi 下建议关掉。改动绑定地址需要重启桌宠才生效。</p>
+<p class="hint" id="mobile-tls-hint">地址是 <b>https</b>（自签证书）。手机第一次打开会提示「连接不安全 / 证书不受信任」，选「高级」→「继续前往」即可，<b>不需要安装证书</b>。用 https 是因为手机浏览器只在安全页面里才给麦克风与语音识别 —— http 下语音功能整个不可用。</p>
+<div class="pair"><div><label for="mobile-host">手机该填的地址</label><input id="mobile-host" type="text" readonly tabindex="-1" value="—"></div>
+<div><label for="mobile-state">状态</label><input id="mobile-state" type="text" readonly tabindex="-1" value="—"></div></div>
+<p class="hint" id="mobile-host-hint">没检测到局域网地址时，说明这台机器没连 Wi-Fi/网线，或者只连了虚拟网卡。</p>
+<div class="test-row"><button id="mobile-save" type="button">保存手机连接设置</button><button id="mobile-pair" type="button">生成配对码</button><span id="mobile-result" class="test-result" role="status" aria-live="polite"></span></div>
+<div id="mobile-pin-box" class="memory-card" hidden>
+  <h2>配对码 <span id="mobile-pin" class="pin-code">------</span></h2>
+  <p class="hint" id="mobile-pin-hint">在手机的桌宠 App 或浏览器里打开 <code id="mobile-pin-url">—</code>，填入上面的 6 位数字。5 分钟内有效，用过一次就作废。</p>
+</div>
+<div id="mobile-devices-box" class="memory-card" hidden>
+  <h2>已配对的手机</h2>
+  <p class="hint" id="mobile-devices-lead">手机连着这台电脑时，对话由<b>电脑</b>记（手机拿的是同一份）。手机不在这个网络后，电脑<b>转为只读</b>、由手机那边接着记，等它回到这个网络再自动合并回来——这样两边永远不会各写一套。</p>
+  <ul id="mobile-devices" class="dev-list"></ul>
+  <p class="hint" id="mobile-devices-hint">删掉一台手机 = 这台电脑立刻恢复可写，那台手机需要重新配对才能连。手机没电/忘带时，电脑会一直只读，直到它回来或你在这里删掉它。</p>
+  <p class="hint dev-warn" id="mobile-takeover" hidden></p>
+</div>
+</fieldset>
+<fieldset><legend>主动聊天（让它自己找你说话）</legend>
+<p class="hint" id="proactive-lead">打开后，它<b>不用等你开口</b>，会按下面的间隔自己说一句——而且这一句<b>会记进对话记忆</b>：你回它一句，它接得上；换到手机上接着聊，它也知道自己昨天主动找过你。</p>
+<label class="check"><input id="proactiveChatEnabled" type="checkbox" aria-describedby="proactive-lead proactive-hint">允许它主动找你说话</label>
+<div class="pair"><div><label for="proactiveChatSec">间隔（秒，120–86400）</label><input id="proactiveChatSec" type="number" min="120" max="86400" step="60" value="1800" aria-describedby="proactive-hint"></div></div>
+<p class="hint" id="proactive-hint">默认 1800 秒（半小时）。最短 120 秒，最长一天。间隔按<b>每只宠物</b>算，与「碎碎念」的周期是两套互不影响的设置。</p>
+<p class="notice" id="proactive-warn">和「碎碎念」的区别：碎碎念是自言自语，<b>不进记忆</b>；主动聊天是真的开一轮对话，<b>会写进记忆</b>、会消耗一次对话额度。所以它更慢、更克制。</p>
+<p class="hint" id="proactive-group-hint">群聊模式下，它会挑你<b>最近聊过</b>的那个群开口（三个月没动静的老群不会被突然问候）。群里只写进该群的记忆，不会污染你和它的私聊。<b>注意</b>：本机没有往 QQ 群发消息的通道，所以群聊里的主动发言只会出现在这台电脑的气泡里，需要你的群机器人自己来取。</p>
+<div class="test-row"><button id="proactive-save" type="button">保存主动聊天设置</button><button id="proactive-test" type="button">现在试一句</button><span id="proactive-result" class="test-result" role="status" aria-live="polite"></span></div>
+</fieldset>
 <footer><p id="privacy">所有配置与密钥仅保存在当前机器。<br>关闭 AI 后，桌宠仍可正常显示、移动与互动。</p><button id="save" type="submit" disabled>保存到本机</button></footer>
 <p id="status" role="status" aria-live="polite">正在读取本机设置…</p>
 </form></div>
@@ -146,6 +176,17 @@ form,.tabs,.history{background:var(--paper);border:1px solid var(--line);border-
 .tabs{display:flex;gap:8px;padding:10px 12px;border-radius:10px;margin:0 0 18px;background:#f5fafd}
 .tab{border:0;background:transparent;color:var(--muted);min-height:40px;padding:6px 16px;border-radius:7px;font:600 15px/1.4 inherit;cursor:pointer}
 .tab.is-active{background:var(--blue);color:#fff}.tab:not(.is-active):hover{background:#e3eff7;color:var(--blue)}
+.dev-list{list-style:none;margin:6px 0 0;padding:0}
+.dev-item{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);min-height:44px}
+.dev-item:last-child{border-bottom:0}
+.dev-name{flex:1;font-size:14px;font-weight:600;word-break:break-all}
+.dev-meta{flex:0 0 auto;font-size:12px;color:var(--muted)}
+.dev-on{color:#1f7a4d;font-weight:600}
+.dev-off{color:#a13b30;font-weight:600}
+.dev-del{flex:0 0 auto;min-height:36px;padding:6px 14px;font-size:13px;background:#a13b30}
+.dev-del:hover{background:#8a2f26}
+.dev-empty{font-size:13px;color:var(--muted);padding:8px 0}
+.dev-warn{color:#a13b30;font-weight:600}
 fieldset{padding:0 0 28px;margin:0 0 24px;border:0;border-bottom:1px solid var(--line);min-width:0}legend{font-size:19px;font-weight:700;margin-bottom:18px;padding:0}label{display:block;font-weight:600;font-size:14px;margin:14px 0 6px}input:not([type=checkbox]):not([type=radio]),select,textarea{display:block;width:100%;min-height:44px;border:1px solid #a5bdcb;border-radius:6px;background:#fff;color:var(--ink);padding:9px 12px;font:inherit;font-size:15px}input[type=radio]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}textarea{min-height:220px;resize:vertical;line-height:1.7}input::placeholder,textarea::placeholder{color:#6a7e8b}input[type=checkbox]{accent-color:var(--blue);width:18px;height:18px;flex-shrink:0;margin:0}.check{display:flex;align-items:center;gap:10px;min-height:32px;cursor:pointer}.enabled{margin-top:24px}.clear{font-weight:400;color:var(--muted);font-size:13px}.hint{font-size:12px;line-height:1.6;color:var(--muted);margin:7px 0 0}.key-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.key-heading label{margin:0 0 6px}.key-heading .hint{margin:0 0 6px}.notice{font-size:13px;color:#704b13;background:#fff7e7;border-left:3px solid #c18e36;margin:12px 0 16px;padding:12px 14px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:20px}.rule{height:1px;background:var(--line);margin:16px 0 12px}footer{display:flex;align-items:center;justify-content:space-between;gap:18px}footer p{font-size:12px;color:var(--muted);margin:0}button{border:0;border-radius:7px;min-height:44px;padding:10px 20px;background:var(--blue);color:#fff;font:600 15px/1.5 inherit;white-space:nowrap;cursor:pointer}button:hover{background:#0b4e73}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #3a94c4;outline-offset:3px}#status{font-size:13px;min-height:24px;margin:18px 0 0;color:var(--blue)}#status[data-error=true]{color:#a13b30}
 .test-row{display:flex;align-items:center;gap:14px;margin:20px 0 6px;flex-wrap:wrap}#test-btn,#persona-save,#history-load,#history-more{background:#fff;color:var(--blue);border:1.5px solid var(--blue);min-height:38px;padding:6px 18px;font-size:14px;border-radius:6px;cursor:pointer;font-weight:600}#test-btn:hover,#persona-save:hover,#history-load:hover,#history-more:hover{background:#edf5fa}#test-btn:disabled,#persona-save:disabled,#history-load:disabled,#history-more:disabled{opacity:.6;cursor:wait}.test-result{font-size:13px;line-height:1.5;min-height:22px;flex:1 1 200px}.test-success{color:#1a7f37;font-weight:600}.test-error{color:#cf222e}.reply-preview{display:block;color:var(--muted);font-weight:normal;font-size:12px;margin-top:4px;word-break:break-all}
 .preview{margin:18px 0 0}.preview summary{font-size:13px;color:var(--blue);cursor:pointer;font-weight:600}.pre{white-space:pre-wrap;word-break:break-word;font:13px/1.7 "Consolas","Microsoft YaHei UI",monospace;background:#f7fbfd;border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin:10px 0 0;max-height:340px;overflow:auto}
@@ -261,6 +302,140 @@ export const settingsScript = `
   tabHistory.addEventListener('click', () => showTab('history'));
   tabRuns.addEventListener('click', () => showTab('runs'));
   tabBackup.addEventListener('click', () => showTab('backup'));
+
+  // ---------- 手机连接 ----------
+  // 三个端点都是本机路由（走 petRequest，带本次运行凭据）：
+  //   GET  /mobile/api/state   当前开关、端口、局域网地址
+  //   POST /mobile/api/enable  打开（写盘，重启生效）
+  //   POST /mobile/api/pair    生成 6 位配对码（只有点了才会存在，平时 /pair 一律 403）
+  const mobileEnabled = get('mobile-enabled');
+  const mobileHost = get('mobile-host');
+  const mobileState = get('mobile-state');
+  const mobileResult = get('mobile-result');
+  const mobilePinBox = get('mobile-pin-box');
+  const mobilePin = get('mobile-pin');
+  const mobilePinUrl = get('mobile-pin-url');
+  let mobilePinTimer = null;
+  function mobileMsg(text, error = false) { mobileResult.textContent = text; mobileResult.dataset.error = String(error); }
+  function renderMobile(data) {
+    mobileEnabled.checked = data.enabled === true;
+    mobileHost.value = data.host || '（未检测到局域网地址）';
+    mobileState.value = data.enabled
+      ? (data.listeningWide ? '已开启 · 正在监听局域网' : '已开启 · 需重启桌宠才生效')
+      : '未开启（仅本机可访问）';
+  }
+  async function loadMobile() {
+    try { renderMobile(await petRequest('/mobile/api/state')); }
+    catch (error) { mobileState.value = '读取失败'; mobileMsg(error.message, true); }
+  }
+  get('mobile-save').addEventListener('click', async () => {
+    mobileMsg('保存中…');
+    try {
+      await petRequest(mobileEnabled.checked ? '/mobile/api/enable' : '/mobile/api/disable', 'POST');
+      mobileMsg(mobileEnabled.checked ? '已开启。若刚才提示需要重启，请从托盘退出后重开桌宠。' : '已关闭。', false);
+      await loadMobile();
+    } catch (error) { mobileMsg(error.message, true); }
+  });
+  get('mobile-pair').addEventListener('click', async () => {
+    mobileMsg('生成中…');
+    try {
+      const data = await petRequest('/mobile/api/pair', 'POST');
+      mobilePin.textContent = data.pin;
+      // 对外一律 https（自签）：局域网 http:// 不是安全上下文，手机浏览器会禁掉
+      // 麦克风与语音识别。手机上第一次打开会弹「证书不受信任」，点「继续前往」即可。
+      mobilePinUrl.textContent = data.host ? 'https://' + data.host + '/mobile/' : '（未检测到局域网地址）';
+      mobilePinBox.hidden = false;
+      mobileMsg('配对码已生成，' + data.ttlSeconds + ' 秒内有效。', false);
+      if (mobilePinTimer) clearInterval(mobilePinTimer);
+      let left = data.ttlSeconds;
+      mobilePinTimer = setInterval(() => {
+        left -= 1;
+        if (left <= 0) {
+          clearInterval(mobilePinTimer); mobilePinTimer = null;
+          mobilePin.textContent = '------';
+          get('mobile-pin-hint').textContent = '已过期。再点一次「生成配对码」。';
+        } else {
+          mobileMsg('配对码 ' + left + ' 秒后失效。', false);
+        }
+      }, 1000);
+    } catch (error) { mobileMsg(error.message, true); }
+  });
+  // ---------- 已配对的手机（2026-11-01）----------
+  //   GET  /mobile/api/devices          列出（带 online = 心跳是否新鲜）
+  //   POST /mobile/api/devices/remove   删一台（电脑立刻恢复可写，那台手机需重新配对）
+  //
+  // 为什么「删掉就恢复可写」是安全的：删完登记表空了 → 接管判定失效 → 电脑写；
+  // 被删的 id 进 revoked，它的请求一律 403，必须重新拿配对码。
+  const deviceBox = get('mobile-devices-box');
+  const deviceList = get('mobile-devices');
+  const deviceTakeover = get('mobile-takeover');
+  function fmtAgo(ms) {
+    if (!ms) return '还没连过';
+    const diff = Date.now() - ms;
+    if (diff < 60000) return '刚刚还在';
+    if (diff < 3600000) return Math.round(diff / 60000) + ' 分钟前';
+    if (diff < 86400000) return Math.round(diff / 3600000) + ' 小时前';
+    return Math.round(diff / 86400000) + ' 天前';
+  }
+  function renderDevices(data) {
+    if (!data || data.supported === false) { deviceBox.hidden = true; return; }
+    const list = Array.isArray(data.devices) ? data.devices : [];
+    deviceBox.hidden = false;
+    deviceList.textContent = '';
+    if (list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'dev-empty';
+      li.textContent = '还没配过手机。点上面的「生成配对码」开始。';
+      deviceList.appendChild(li);
+    }
+    for (const d of list) {
+      const li = document.createElement('li');
+      li.className = 'dev-item';
+      const name = document.createElement('span');
+      name.className = 'dev-name';
+      name.textContent = (d.name && d.name !== '' ? d.name : '手机') + (d.id ? ' · ' + String(d.id).slice(-6) : '');
+      const meta = document.createElement('span');
+      meta.className = 'dev-meta ' + (d.online ? 'dev-on' : 'dev-off');
+      meta.textContent = (d.online ? '在线' : '不在线') + ' · ' + fmtAgo(d.lastSeenAt);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'dev-del';
+      del.textContent = '删除';
+      del.addEventListener('click', async () => {
+        del.disabled = true;
+        mobileMsg('正在删除…');
+        try {
+          const next = await petRequest('/mobile/api/devices/remove', 'POST', JSON.stringify({ id: d.id }));
+          renderDevices(next);
+          mobileMsg('已删除。这台电脑现在可以正常聊天了。', false);
+        } catch (error) {
+          mobileMsg(error.message, true);
+        } finally {
+          del.disabled = false;
+        }
+      });
+      li.appendChild(name);
+      li.appendChild(meta);
+      li.appendChild(del);
+      deviceList.appendChild(li);
+    }
+    if (data.phoneAway === true) {
+      deviceTakeover.hidden = false;
+      deviceTakeover.textContent = data.reason || '手机不在这个网络，电脑现在只读。';
+    } else {
+      deviceTakeover.hidden = true;
+      deviceTakeover.textContent = '';
+    }
+  }
+  async function loadDevices() {
+    try { renderDevices(await petRequest('/mobile/api/devices')); }
+    catch (error) { deviceBox.hidden = true; }
+  }
+  void loadDevices();
+  // 15 秒刷新一次「在线/不在线」。带 typeof 守卫：设置页脚本会被 settings.test.ts 放进
+  // 没有计时器的 vm 里求值，裸调 setInterval 会直接 ReferenceError 把整段脚本打断。
+  if (typeof setInterval === 'function') setInterval(() => { void loadDevices(); }, 15000);
+  void loadMobile();
 
   // ---------- 数据备份（导出 / 导入）----------
   // 导出：GET 拿 bundle → Blob 下载。走 petRequest 会按 JSON 解析，这里直接 fetch 保原文。
@@ -844,6 +1019,12 @@ export const settingsScript = `
   const memOwnerQq = get('ownerQq');
   const memSave = get('memory-save');
   const memResult = get('memory-result');
+  // 主动聊天（2026-10-31，第四件事）
+  const proactBox = get('proactiveChatEnabled');
+  const proactSec = get('proactiveChatSec');
+  const proactSave = get('proactive-save');
+  const proactTest = get('proactive-test');
+  const proactResult = get('proactive-result');
   const workspaceList = get('workspace-list');
   const approvalsBox = get('approvals');
   const approvalList = get('approval-list');
@@ -874,10 +1055,13 @@ export const settingsScript = `
       memRecentN.value = typeof data.groupMemoryRecentN === 'number' ? data.groupMemoryRecentN : 10;
       memOwnerSync.checked = data.ownerSyncEnabled === true;
       memOwnerQq.value = typeof data.ownerQq === 'string' ? data.ownerQq : '';
+      // 主动聊天：缺键给默认（关 / 1800s），与后端 proactiveEnabled / proactivePeriodSec 同口径
+      proactBox.checked = data.proactiveChatEnabled === true;
+      proactSec.value = typeof data.proactiveChatSec === 'number' ? data.proactiveChatSec : 1800;
       syncMemoryVisibility();
       const pets2 = data.pets || [];
       workspaceList.textContent = pets2.length
-        ? pets2.map(p => (p.name || p.id) + ' → ' + p.workspace).join('　|　')
+        ? pets2.map(p => (p.name || p.id) + ' → ' + p.workspace).join(' | ')
         : '（还没有宠物）';
       // 读屏不可用（缺 uia-reader.ps1）时禁用并说明
       if (data.screenAvailable === false) {
@@ -959,6 +1143,64 @@ export const settingsScript = `
       note(memResult, '已保存。' + summary + (k === 0 ? '（往事回捞已关闭）' : '每次回捞 ' + k + ' 条往事。'), 'test-success');
     } catch (error) { note(memResult, error.message, 'test-error'); }
     finally { memSave.disabled = false; }
+  });
+  // ---- 主动聊天（2026-10-31，第四件事）----
+  // 保存走与记忆/助手同一个 PATCH 端点（/assistant/settings），两个字段在白名单里。
+  // 间隔在前端先校一遍：后端 topFieldValid 越界会整包拒（返回 bad-request），
+  // 但那时用户只看到"提交的值不合法"，不知道是哪一个输入错了。
+  proactSave.addEventListener('click', async () => {
+    proactSave.disabled = true;
+    note(proactResult, '正在保存…');
+    try {
+      const sec = Number(proactSec.value);
+      if (!Number.isFinite(sec) || sec < 120 || sec > 86400) {
+        throw new Error('间隔必须是 120 到 86400 秒之间（最短 2 分钟，最长一天）');
+      }
+      const data = await petRequest('/dsh-pet-7340/assistant/settings', 'POST', {
+        proactiveChatEnabled: proactBox.checked,
+        proactiveChatSec: Math.floor(sec),
+      });
+      if (!data.ok) throw new Error(data.message || data.reason || '保存失败');
+      const mins = Math.round(sec / 60);
+      const human = sec < 3600 ? mins + ' 分钟' : (sec / 3600).toFixed(sec % 3600 === 0 ? 0 : 1) + ' 小时';
+      note(
+        proactResult,
+        proactBox.checked
+          ? '已保存。它大约每 ' + human + ' 主动找你一次（每只宠物各算各的）。'
+          : '已保存。主动聊天已关闭，它不会再自己开口。',
+        'test-success',
+      );
+    } catch (error) { note(proactResult, error.message, 'test-error'); }
+    finally { proactSave.disabled = false; }
+  });
+  // 「现在试一句」：走 POST /proactive（force 绕过间隔与开关，但仍守住"她还欠一个回复"）。
+  // 这个按钮的价值在于**让用户不必等半小时才知道它会不会说话**——否则「开了但没反应」
+  // 与「没开」在界面上长得一模一样。
+  proactTest.addEventListener('click', async () => {
+    proactTest.disabled = true;
+    note(proactResult, '正在让它说一句…');
+    try {
+      // 用当前选中的宠物（设置页顶部那个下拉），与对话/历史页同一个目标
+      // surface=any：宿主对 /proactive 与 /whisper 一样要求显式声明"期望显示在哪一端"
+      // （见 src/host/surface.ts 的三条边界——不传会回 bad-request）。这里点按钮的是人，
+      // 不关心宠物显示在网页还是桌面，只关心它到底会不会开口，所以选 any。
+      const petId = petSelect && petSelect.value ? petSelect.value : '';
+      const q = '?surface=any' + (petId ? '&pet=' + encodeURIComponent(petId) : '');
+      const data = await petRequest('/dsh-pet-7340/proactive' + q, 'POST', {});
+      if (!data.ok) {
+        // 这几种 reason 是"正常拒绝"不是故障，给用户可操作的解释而不是抛错
+        const why = {
+          'not-at-boundary': '它刚才在等你回话（你问了它、它还没答），这时不该另起话头。等它答完再试。',
+          'unanswered': '它已经主动说过一句、还没人接。回它一句再试。',
+          'ai-unavailable': 'AI 不可用（没配密钥或被停用），先把 AI 配好再试。',
+          'unknown-pet': '没有这只宠物，先在设置页顶部的宠物下拉里选一只。',
+          'generate-error': '生成失败：' + (data.message || '模型没返回内容'),
+        };
+        throw new Error(why[data.reason] || data.message || data.reason || '没说出来');
+      }
+      note(proactResult, '它说：' + data.text, 'test-success');
+    } catch (error) { note(proactResult, error.message, 'test-error'); }
+    finally { proactTest.disabled = false; }
   });
   assistantSave.addEventListener('click', async () => {
     assistantSave.disabled = true;

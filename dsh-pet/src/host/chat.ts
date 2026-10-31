@@ -49,6 +49,14 @@ export interface ChatMemoryMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: number;
+  /**
+   * 永久编号（2026-11-01）：**一旦写进文件就不再变**，合并时唯一去重依据。
+   *
+   * 为什么需要：手机出门时在本地写消息、回家追加到电脑这份记忆里。没有编号就只能靠
+   * 「第几条」判断重复，而两边各自的「第几条」根本不可比（一边多一条，后面全错位）。
+   * 老文件没有这个字段 → 第一次写盘时由 `./memory-io` 的 `assignIds` 一次性补齐。
+   */
+  id?: string;
   sender?: string;
   senderName?: string;
   /**
@@ -137,8 +145,31 @@ export async function generateChat(
   return last;
 }
 
+/**
+ * 把上下文窗口裁到「以 user 消息开头」。
+ *
+ * 为什么需要（2026-10-31，主动聊天引入）：记忆流不再是严格的一问一答——
+ * 宠物主动开口时追加的是一条 `assistant` 消息（见 ./proactive），于是
+ * `sliceMemoryRounds` 截出的尾部窗口**可能以 assistant 开头**。
+ *
+ * 而独立模式的 `parseRequest`（standalone/ai-provider.ts）硬性要求
+ * `messages[0].role === 'user'`，否则抛 `Standalone AI input is empty or exceeds limits.`
+ * ——整轮对话直接失败，用户看到的是"发不出去"。
+ *
+ * 裁掉开头那几条 assistant 的代价是**少带一点历史**，比整个请求失败划算得多；
+ * 而且被裁掉的通常是"她主动说的那句话"，它的上下文意义本来也最小。
+ *
+ * 只在开头裁：中间/结尾的 assistant 都是合法的（对话历史本来就该有）。
+ */
+export function trimToUserBoundary<T extends { role: 'user' | 'assistant' }>(messages: T[]): T[] {
+  let i = 0;
+  while (i < messages.length && messages[i].role !== 'user') i += 1;
+  return i === 0 ? messages : messages.slice(i);
+}
+
 /** 摘要生成结果：与对话同构的失败形状（调用方据此决定是否保留旧摘要） */
-export type SummaryGenerateResult = { ok: true; text: string } | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string };
+export type SummaryGenerateResult =
+  { ok: true; text: string } | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string };
 
 /**
  * 生成一段记忆摘要（长期记忆压缩用）。

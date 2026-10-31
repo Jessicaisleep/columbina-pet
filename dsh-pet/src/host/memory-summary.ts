@@ -185,9 +185,17 @@ export function planCompression(
   return { from, to, nextSummarized: to };
 }
 
-/** 一条消息渲染成一行（摘要提示词用）：`用户：…` / `宠物：…` */
+/**
+ * 一条消息渲染成一行（摘要提示词用）：`用户：…` / `宠物：…`。
+ *
+ * 群聊下 user 行改用**真名**（2026-10-30 修）。旧实现一律写「用户：」，
+ * 摘出的是「用户住在杭州」——群里的张三说的。这份摘要会常驻进 system，
+ * 模型从此认为「用户」住杭州，被李四问「我住哪」时就答错人。
+ * 单人消息没有 `senderName`，仍渲染成「用户：」，既有摘要逐字不变。
+ */
 function renderLine(m: ChatMemoryMessage): string {
-  const who = m.role === 'user' ? '用户' : '宠物';
+  const name = typeof m.senderName === 'string' ? m.senderName.trim() : '';
+  const who = m.role === 'user' ? (name !== '' ? name : '用户') : '宠物';
   const text = typeof m.content === 'string' ? m.content.trim() : '';
   return text === '' ? '' : who + '：' + text;
 }
@@ -217,6 +225,7 @@ export const SUMMARY_SYSTEM_PROMPT = [
   '1. 只保留有长期价值的信息：用户的身份/称呼/偏好/习惯/忌讳、约定过的事、重要事实与结论、未完成的待办。',
   '2. 丢弃寒暄、重复内容、语气词、一次性的闲聊与情绪表达。',
   '3. 用第三人称陈述（例如「用户喜欢下雨天」「用户提过下周三要考试」），不要写成对话，不要用第一人称。',
+  '3a. 记录里如果是**不同的人**在说话（群聊，行首是人名而不是「用户」），必须把事归到具体那个人名下（例如「张三住在杭州」「李四养了只猫」）；**绝不能把某个人的事写成"用户"的事**，也不要因为两个人说了同一类事就把它们合并成一条。',
   '4. 不要编造：只写记录里明确出现过的内容；不确定的宁可不写。',
   '5. 只输出摘要正文，不要标题、不要分点符号、不要任何解释或前后缀。',
 ].join('\n');
@@ -304,12 +313,7 @@ export interface MemoryOverview {
  *
  * 越界一律夹到 `[0, total]`：`index` 来自 HTTP 参数，可能被手改成任意值。
  */
-export function summarizedAfterChange(
-  summarized: number,
-  total: number,
-  index: number,
-  op: 'edit' | 'delete',
-): number {
+export function summarizedAfterChange(summarized: number, total: number, index: number, op: 'edit' | 'delete'): number {
   const n = Math.max(0, Math.floor(Number(summarized) || 0));
   const len = Math.max(0, Math.floor(Number(total) || 0));
   const at = Math.floor(Number(index));

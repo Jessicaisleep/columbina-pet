@@ -24,6 +24,9 @@ import {
   userConfigUnparsable,
   type ConfigPaths,
 } from './config.ts';
+// trimToUserBoundary 住在 chat.ts（与 sliceMemoryRounds 不同文件），但两者的组合语义
+// 只能一起测——单独测任何一个都看不出"主动聊天会让窗口以 assistant 开头"这个坑。
+import { trimToUserBoundary } from './chat.ts';
 
 /** 内置默认配置的完整最小形态（animations 整段必须合法——合并是整段替换/整段回退） */
 const BASE = {
@@ -631,10 +634,7 @@ describe('position.pinned —— 位置固定（三兄弟必须整组成立）',
   });
 
   test('固定但坐标非数字 → 整包拒绝', () => {
-    assert.equal(
-      saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: true, pinX: 'a', pinY: 0.5 } }] }),
-      null,
-    );
+    assert.equal(saveOnce({ pets: [{ ...PETS[0], position: { ...POS, pinned: true, pinX: 'a', pinY: 0.5 } }] }), null);
   });
 
   test('pinned 传非布尔 → 整包拒绝', () => {
@@ -1075,6 +1075,51 @@ describe('syncUserConfigFromDefault —— 同步（内置默认原文写入用�
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  /**
+   * 派生版（2026-10-30）新增：内置默认的 pets 是空数组（宠物由包内 assets/pet/* 提供），
+   * 「同步」不能因此把用户自己的 pets 清空——那会让桌面上的宠物当场消失。
+   */
+  test('内置 pets 为空 + 用户层有 pets → 同步保留用户那份（其余字段仍取内置默认）', () => {
+    const raw = '// 顶部注释\n{\n  "trayEnabled": false,\n  "pets": []\n}\n';
+    const { paths, dir } = fixture(raw);
+    try {
+      mkdirSync(dirname(paths.userFile), { recursive: true });
+      writeFileSync(paths.userFile, JSON.stringify({ pets: [{ id: 'mine', size: 300, display: 'web' }], old: 1 }));
+      syncUserConfigFromDefault(paths);
+      const after = readFileSync(paths.userFile, 'utf8');
+      assert.match(after, /顶部注释/, '注释必须保留（同步的意义一半在可读性）');
+      assert.match(after, /"mine"/, '用户的宠物必须留在用户层里');
+      assert.doesNotMatch(after, /"pets"\s*:\s*\[\s*\]/, '空数组应已被用户那份替换');
+      const pets = readUserConfig(paths)?.pets as Array<{ id: string }>;
+      assert.deepEqual(
+        pets.map((p) => p.id),
+        ['mine'],
+      );
+      // 白名单外旧字段照旧被清掉（同步 = 以内置默认为准）
+      assert.equal(readUserConfig(paths)?.old, undefined);
+      assert.equal(readUserConfig(paths)?.trayEnabled, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('内置 pets 非空 → 同步以内置为准，不掺用户旧值', () => {
+    const raw = JSON.stringify({ pets: [{ id: 'builtin', size: 300, display: 'web' }] });
+    const { paths, dir } = fixture(raw);
+    try {
+      mkdirSync(dirname(paths.userFile), { recursive: true });
+      writeFileSync(paths.userFile, JSON.stringify({ pets: [{ id: 'mine', size: 300, display: 'web' }] }));
+      syncUserConfigFromDefault(paths);
+      const pets = readUserConfig(paths)?.pets as Array<{ id: string }>;
+      assert.deepEqual(
+        pets.map((p) => p.id),
+        ['builtin'],
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /**
@@ -1304,5 +1349,51 @@ describe('sliceMemoryRounds —— chatMemoryRounds=0 必须真正不带历史�
 
   test('rounds=0 且消息列表原本为空 → 空', () => {
     assert.deepEqual(sliceMemoryRounds([], 0), []);
+  });
+});
+
+describe('trimToUserBoundary —— 主动聊天让窗口可能以 assistant 开头', () => {
+  // 这条守卫存在的原因：主动聊天追加的是一条 assistant 消息（见 ./proactive），
+  // 于是 sliceMemoryRounds 截出的尾部窗口可能以 assistant 开头，而独立模式的
+  // parseRequest 硬性要求 messages[0].role === 'user'，不裁就整轮对话失败。
+  const m = (role: 'user' | 'assistant'): { role: 'user' | 'assistant' } => ({ role });
+
+  test('以 user 开头 → 原样返回（同一个数组引用，不白复制）', () => {
+    const list = [m('user'), m('assistant')];
+    assert.equal(trimToUserBoundary(list), list);
+  });
+
+  test('以 assistant 开头 → 从头裁到第一个 user', () => {
+    const list = [m('assistant'), m('assistant'), m('user'), m('assistant')];
+    assert.deepEqual(trimToUserBoundary(list), [m('user'), m('assistant')]);
+  });
+
+  test('全是 assistant → 空列表（宁可少带历史也不能让请求失败）', () => {
+    assert.deepEqual(trimToUserBoundary([m('assistant'), m('assistant')]), []);
+  });
+
+  test('空列表 → 空', () => {
+    assert.deepEqual(trimToUserBoundary([]), []);
+  });
+
+  test('只裁开头：中间的 assistant 一律保留', () => {
+    const list = [m('user'), m('assistant'), m('user'), m('assistant')];
+    assert.deepEqual(trimToUserBoundary(list), list);
+  });
+
+  // 端到端形状：主动聊天后真实的窗口长什么样。
+  // 记忆 = [u1,a1, (她主动说的) a_pro, u2,a2]，rounds=2 截尾部 4 条 = [a1, a_pro, u2, a2]，
+  // 裁到第一个 user → [u2, a2]。丢掉的是 a1 与 a_pro，正好是"她主动说的那句"，
+  // 它的上下文意义本来最小。
+  //
+  // 注意必须用**带 role 的对象**跑：trimToUserBoundary 读的是 `.role`，
+  // 拿纯字符串（sliceMemoryRounds 的测试习惯）会读到 undefined → 整段裁光。
+  test('主动聊天场景：截窗口后再裁，能过 parseRequest', () => {
+    const msgs = [m('user'), m('assistant'), m('assistant'), m('user'), m('assistant')];
+    const window = sliceMemoryRounds(msgs, 2);
+    assert.deepEqual(window, [m('assistant'), m('assistant'), m('user'), m('assistant')]);
+    const trimmed = trimToUserBoundary(window);
+    assert.deepEqual(trimmed, [m('user'), m('assistant')]);
+    assert.equal(trimmed[0].role, 'user');
   });
 });

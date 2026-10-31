@@ -44,9 +44,7 @@ export function resolveWorkspaceRoot(dshHome: string): string {
     const parent = dirname(resolve(home));
     // 只有当上一级确实像「桌宠安装目录」时才认——否则退回数据根下的 workspace，
     // 防止 DSH_HOME 恰好是某个浅层目录（如 C:\Users\x）时把主目录当工作区。
-    const looksLikeApp = ['dsh-pet.exe', 'resources', '启动桌宠.bat'].some((mark) =>
-      existsSync(join(parent, mark)),
-    );
+    const looksLikeApp = ['dsh-pet.exe', 'resources', '启动桌宠.bat'].some((mark) => existsSync(join(parent, mark)));
     if (looksLikeApp) return parent;
     return join(resolve(home), 'workspace');
   }
@@ -110,9 +108,7 @@ export function resolveTarget(workspaceRoot: string, p: string): string {
 }
 
 /** 一次操作的权限判定结果 */
-export type PermissionVerdict =
-  | { ok: true }
-  | { ok: false; reason: 'readonly' | 'outside-workspace'; message: string };
+export type PermissionVerdict = { ok: true } | { ok: false; reason: 'readonly' | 'outside-workspace'; message: string };
 
 /**
  * 判定「读」是否允许。
@@ -135,11 +131,7 @@ export function checkRead(permission: AssistantPermission, workspaceRoot: string
  *
  * 只读档一律拒绝；工作区档只允许工作区内；完全权限放行。
  */
-export function checkWrite(
-  permission: AssistantPermission,
-  workspaceRoot: string,
-  target: string,
-): PermissionVerdict {
+export function checkWrite(permission: AssistantPermission, workspaceRoot: string, target: string): PermissionVerdict {
   if (permission === 'full') return { ok: true };
   if (permission === 'readonly') {
     return {
@@ -163,10 +155,13 @@ export function checkWrite(
  * 有效期默认 120 秒：审批是「就这一次」，不是「以后都行」。
  */
 export class GrantStore {
-  private grants = new Map<string, number>();
-  private ttlMs: number;
+  // 【类字段一律 declare + 构造器赋值】同 screen-context.ts 的 ScreenReader：es2020 目标会把
+  // 带初始化器的类字段降级成 `_defineProperty`，拖出未声明的 @oxc-project/runtime 裸 import。
+  declare private grants: Map<string, number>;
+  declare private ttlMs: number;
 
   constructor(ttlMs = 120_000) {
+    this.grants = new Map();
     this.ttlMs = ttlMs;
   }
 

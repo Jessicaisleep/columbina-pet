@@ -188,7 +188,7 @@ const QUESTION_RE = /什么|啥|哪位|哪个|哪里|哪儿|谁|怎么|怎样|�
 function tidy(s: string): string {
   return s
     .trim()
-    .replace(/^[「『"'（(\[]+/, '')
+    .replace(/^[「『"'（([]+/, '')
     .replace(/[」』"'）)\]]+$/, '')
     .replace(/[。！？!?，,；;、\s]+$/, '')
     .replace(/[吧啊呀呢哦嘛啦]+$/, '')

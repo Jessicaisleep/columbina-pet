@@ -141,4 +141,3 @@ export const pixelToPin = (o: {
   const h = a.height || 1;
   return { pinX: (o.cx - a.x) / w, pinY: (o.cy - a.y) / h };
 };
-

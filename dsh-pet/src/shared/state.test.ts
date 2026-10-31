@@ -252,7 +252,17 @@ describe('readSay —— 说话叶子（弹气泡 / 清空 两种形态）', () 
       url: undefined,
       duration: undefined,
       anim: undefined,
+      // 老数据没有 origin → 'note'（普通提示），气泡长相与改造前一致
+      origin: 'note',
     });
+  });
+
+  test('来意只认 whisper / proactive，其余（含脏值）回落 note', () => {
+    assert.equal(say({ text: 'x', origin: 'whisper' })?.origin, 'whisper');
+    assert.equal(say({ text: 'x', origin: 'proactive' })?.origin, 'proactive');
+    assert.equal(say({ text: 'x', origin: 'reply' })?.origin, 'note');
+    assert.equal(say({ text: 'x', origin: 1 })?.origin, 'note');
+    assert.equal(say({ text: 'x' })?.origin, 'note');
   });
 
   test('配图的 url 形态（issue #122 第 1 条）：地址取到、image 缺席', () => {

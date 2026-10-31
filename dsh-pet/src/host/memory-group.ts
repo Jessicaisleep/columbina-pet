@@ -26,13 +26,7 @@
  * 成员桶只保留「关于这个人的稳定事实」（L0，见 `./memory-facts`）——这才是别处拿不到的东西。
  */
 
-import {
-  extractFacts,
-  factsSection,
-  mergeFacts,
-  pruneFacts,
-  type MemoryFact,
-} from './memory-facts';
+import { extractFacts, factsSection, mergeFacts, pruneFacts, type MemoryFact } from './memory-facts';
 import type { ChatMemoryMessage } from './chat';
 
 /** 群聊记忆策略：记得每个人 / 只记得最近说过话的 N 个人 */
@@ -129,11 +123,7 @@ export function activeMembers(group: GroupMemory, scope: GroupScope, recentN: nu
  *
  * `everyone` 档同样会淘汰（超过 `MAX_MEMBERS` 时），行为见 `MAX_MEMBERS` 注释。
  */
-export function planMemberEviction(
-  group: GroupMemory,
-  scope: GroupScope,
-  recentN: number,
-): string[] {
+export function planMemberEviction(group: GroupMemory, scope: GroupScope, recentN: number): string[] {
   const keep = new Set(activeMembers(group, scope, recentN));
   return Object.keys(membersOf(group)).filter((id) => !keep.has(id));
 }
@@ -154,6 +144,17 @@ export function touchMember(
   now: number,
 ): { changed: boolean; factsAdded: number } {
   if (!senderId) return { changed: false, factsAdded: 0 };
+  // 旧版本（2026-10-30 之前）在**群级条目**上写过一份跨人混合的 facts：
+  // `learnFacts(target, …)` 的 target 是群级条目，而 `mergeFacts` 按 `kind|key` 覆盖，
+  // 张三「住杭州」会被李四「住北京」顶掉。那份东西不但错，还会以「关于对方的事实」
+  // 的抬头进 prompt，和这里每人一份的卡直接打架。
+  //
+  // 现在不再读它，就在这里顺手删掉——放在 `touchMember` 而不是调用方，是因为
+  // 这是**唯一**的成员桶写入口（`recordGroupSpeaker` 之外没有别处会写），
+  // 清理逻辑跟着写入口走才不会漏。它也不会被重新写回来：群聊下 `learnFacts` 已跳过。
+  if (Object.prototype.hasOwnProperty.call(group, 'facts')) {
+    delete (group as unknown as Record<string, unknown>).facts;
+  }
   const members = membersOf(group);
   const prev = members[senderId];
   const existingFacts = prev && Array.isArray(prev.facts) ? prev.facts : [];
@@ -244,9 +245,7 @@ export function groupSection(
     const known = facts.length > 0;
     parts.push(
       `现在跟你说话的是「${name}」。` +
-        (known
-          ? '你记得关于他的事：'
-          : '你对他还没有任何印象（第一次见他，或者你已经不记得他了）——不要假装记得。'),
+        (known ? '你记得关于他的事：' : '你对他还没有任何印象（第一次见他，或者你已经不记得他了）——不要假装记得。'),
     );
     if (known) {
       // 复用单人模式的渲染，措辞完全一致（同一种事实不该有两套说法）
@@ -260,8 +259,7 @@ export function groupSection(
   }
 
   parts.push(
-    '这是群聊：你看到的是群里最近的对话，不要把它当成一对一的私聊；' +
-      '不同人说的话要分开归属，别把甲的事安到乙头上。',
+    '这是群聊：你看到的是群里最近的对话，不要把它当成一对一的私聊；' + '不同人说的话要分开归属，别把甲的事安到乙头上。',
   );
 
   return '\n' + parts.join('\n') + '\n';
@@ -306,8 +304,7 @@ export function parseSender(raw: unknown): Sender | undefined {
     if (id === '') return undefined;
     const name = typeof o.name === 'string' && o.name.trim() !== '' ? o.name.trim() : undefined;
     const group = typeof o.group === 'string' && o.group.trim() !== '' ? o.group.trim() : undefined;
-    const groupName =
-      typeof o.groupName === 'string' && o.groupName.trim() !== '' ? o.groupName.trim() : undefined;
+    const groupName = typeof o.groupName === 'string' && o.groupName.trim() !== '' ? o.groupName.trim() : undefined;
     return {
       id,
       ...(name !== undefined ? { name } : {}),
@@ -381,10 +378,7 @@ export function groupOf(
  * 为什么必须限定「主人」：群里别人说的话进单人流，就等于把陌生人的话当成一对一私聊的
  * 上下文——那正是用户要分开的东西。只有主人是「同一个人在两处说话」，镜像才成立。
  */
-export function shouldMirrorOwner(
-  conf: Record<string, unknown>,
-  senderId: string | undefined,
-): boolean {
+export function shouldMirrorOwner(conf: Record<string, unknown>, senderId: string | undefined): boolean {
   if (conf.groupBotEnabled !== true) return false;
   if (conf.ownerSyncEnabled !== true) return false;
   const owner = typeof conf.ownerQq === 'string' ? conf.ownerQq.trim() : '';
@@ -400,13 +394,8 @@ export function shouldMirrorOwner(
  * 互动」——只有写进正文，桌宠回桌面聊时才会知道「这句话是刚才在群里说的」，而不是把它
  * 当成桌面上刚说的话。`origin` 仍然写一份给程序看（统计/排查/将来做按群过滤）。
  */
-export function ownerMirrorMessage(
-  text: string,
-  ts: number,
-  groupName: string | undefined,
-): ChatMemoryMessage {
+export function ownerMirrorMessage(text: string, ts: number, groupName: string | undefined): ChatMemoryMessage {
   const g = groupName && groupName.trim() !== '' ? groupName.trim() : '';
   const head = g === '' ? '（在群里说的）' : `（在「${g}」里说的）`;
   return { role: 'user', content: `${head}${text}`, ts, origin: g === '' ? 'group' : g };
 }
-

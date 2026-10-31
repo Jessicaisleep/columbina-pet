@@ -316,7 +316,7 @@ test('dayTrace:给整段而不是抽样（用户场景的核心）', () => {
     ['赢了', '厉害'],
     ['睡了', '晚安'],
   ];
-  const msgs = [];
+  const msgs: Array<{ role: 'user' | 'assistant'; content: string; ts: number }> = [];
   rows.forEach(([a, r], i) => {
     msgs.push({ role: 'user', content: a, ts: base + (i + 1) * H });
     msgs.push({ role: 'assistant', content: r, ts: base + (i + 1) * H + 3000 });
@@ -325,7 +325,10 @@ test('dayTrace:给整段而不是抽样（用户场景的核心）', () => {
   const span = parseTimeRange('昨天', NOW)!;
   const t = dayTrace(docs, span, { max: 40, clip: 60, query: '哎呀昨天应该出去玩的' });
   assert.equal(t.lines.length, 6, '6 轮全给，不抽样');
-  assert.ok(t.lines.some((d) => /天气不错/.test(d.ask)), '「天气不错」必须在里面');
+  assert.ok(
+    t.lines.some((d) => /天气不错/.test(d.ask)),
+    '「天气不错」必须在里面',
+  );
   assert.equal(t.truncated, false);
 });
 
@@ -342,7 +345,7 @@ test('dayTrace:上限压得很紧时，靠相关度保住该保的那条', () =>
     ['明天见', '明天见'],
     ['晚安啦', '好梦'],
   ];
-  const msgs = [];
+  const msgs: Array<{ role: 'user' | 'assistant'; content: string; ts: number }> = [];
   rows.forEach(([a, r], i) => {
     msgs.push({ role: 'user', content: a, ts: base + (i + 1) * H });
     msgs.push({ role: 'assistant', content: r, ts: base + (i + 1) * H + 3000 });
@@ -355,7 +358,10 @@ test('dayTrace:上限压得很紧时，靠相关度保住该保的那条', () =>
   assert.equal(t.truncated, true);
   assert.equal(t.total, 8, '总数照实报');
   assert.ok(t.lines.length <= 4);
-  assert.ok(t.lines.some((d) => /天气/.test(d.ask)), '带「天气」的 query 要能把它保下来');
+  assert.ok(
+    t.lines.some((d) => /天气/.test(d.ask)),
+    '带「天气」的 query 要能把它保下来',
+  );
 });
 
 test('dayTrace:空区间/倒置区间返回空', () => {
@@ -415,7 +421,7 @@ test('traceSection:超长正文会截断，且带省略号', () => {
 test('traceSection:节选时写明总数', () => {
   const H = 3_600_000;
   const base = TODAY0 - 24 * H;
-  const msgs = [];
+  const msgs: Array<{ role: 'user' | 'assistant'; content: string; ts: number }> = [];
   for (let i = 0; i < 5; i++) {
     msgs.push({ role: 'user', content: '第' + i + '件事', ts: base + (i + 1) * H });
     msgs.push({ role: 'assistant', content: '嗯', ts: base + (i + 1) * H + 1000 });

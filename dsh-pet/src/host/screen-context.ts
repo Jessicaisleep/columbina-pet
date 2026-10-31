@@ -157,21 +157,30 @@ export function screenReaderAvailable(scriptPath: string): boolean {
  * 子进程崩了就丢弃，下次调用重新 spawn（不重试同一次请求，避免雪崩）。
  */
 export class ScreenReader {
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private scriptPath: string;
+  // 【类字段一律 declare + 构造器赋值】构建目标 es2020 会把「带初始化器的类字段」
+  // 降级成 `_defineProperty(this, ...)`，进而把 `@oxc-project/runtime` 拖成一条裸
+  // import——那个包既不在 dependencies 里也不随包发布，装好的用户一启动就
+  // ERR_MODULE_NOT_FOUND（prepack-check 第 8 项会拦）。约定见 src/host/helper-process.ts。
+  declare private child: ChildProcessWithoutNullStreams | null;
+  declare private scriptPath: string;
   /** 脚本落盘目录（打包成 asar 后必须把 ps1 解出来，PowerShell 打不开 asar 路径） */
-  private cacheDir: string;
+  declare private cacheDir: string;
   /** 要排除的进程 id（桌宠自己：否则会读到自己气泡里的文字，形成自我循环） */
-  private excludePid: number;
-  private idleTimer: ReturnType<typeof setTimeout> | null = null;
-  private pending: { resolve: (v: RawDump | null) => void; timer: ReturnType<typeof setTimeout> } | null = null;
-  private buffer = '';
-  private disposed = false;
+  declare private excludePid: number;
+  declare private idleTimer: ReturnType<typeof setTimeout> | null;
+  declare private pending: { resolve: (v: RawDump | null) => void; timer: ReturnType<typeof setTimeout> } | null;
+  declare private buffer: string;
+  declare private disposed: boolean;
 
   constructor(scriptPath: string, cacheDir: string, excludePid = process.pid) {
+    this.child = null;
     this.scriptPath = scriptPath;
     this.cacheDir = cacheDir;
     this.excludePid = excludePid;
+    this.idleTimer = null;
+    this.pending = null;
+    this.buffer = '';
+    this.disposed = false;
   }
 
   /** 子进程是否活着（仅用于诊断，不参与逻辑判断） */
@@ -394,7 +403,11 @@ export function screenContextOf(snap: ScreenSnapshot | undefined, maxChars = 120
       head +
       (snap.title !== '' && what !== '' ? `（窗口标题：${snap.title}）` : '') +
       '。'
-    : '【用户此刻的屏幕】' + '用户正在用' + head + (snap.title !== '' && what !== '' ? `（窗口标题：${snap.title}）` : '') + '。';
+    : '【用户此刻的屏幕】' +
+      '用户正在用' +
+      head +
+      (snap.title !== '' && what !== '' ? `（窗口标题：${snap.title}）` : '') +
+      '。';
   return (
     lead +
     '屏幕上的可见文字如下——' +

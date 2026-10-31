@@ -169,6 +169,10 @@ class PetSprite {
     this.whisperTimer = null;
     this.whisperView = null;
     this.whisperText = '';
+    // 这条话的「来意」档位（shared 的 S.sayLook(origin) 结果：label / tone / holdMs）。
+    // 碎碎念与主动聊天共用同一个 say 叶子、同一条展示链路，用户要能一眼分清靠的就是它：
+    // murmur（灰底小字斜体 + 「自言自语」）vs calling（粉描边 + 「她主动来找你」）。
+    this.whisperLook = null;
     // 配图名称（配置 memes 的键；whisperImageEnabled 开启时由 host 随机抽定，随文本一起来）
     this.whisperImage = '';
     // 配图**地址**（POST /broadcast 的 url 参数；与 whisperImage 二选一，见 showWhisper）。
@@ -230,6 +234,14 @@ class PetSprite {
     // 余额气泡可点时：点一下切换展开/收起。内容与显隐都归 renderBubble，这里只做两件事——
     // 就地吞掉事件（别让这次点击落到下面的本体命中层），以及交给 events.js 的 toggleBalanceDetail。
     this.bubble.addEventListener('click', (e) => {
+      // 主动聊天的气泡：点它 = 「我要回她」→ 直接开对话弹窗。
+      // 不这样的话用户只能看到一个气泡，不知道去哪儿回（手机端同款行为见 mobile-page.ts）。
+      if (this.whisperCalling()) {
+        e.stopPropagation();
+        e.preventDefault();
+        this.openChatFromBubble();
+        return;
+      }
       if (!this.balanceClickable()) return;
       e.stopPropagation();
       e.preventDefault();
@@ -720,7 +732,7 @@ class PetSprite {
             if (this.playback === playbackId) this.playback = null;
             this.reportPlayback(playbackId, 'failed', 'play-rejected');
           });
-        }
+      }
       // 前台的翻转已在函数开头做过（见那里的注释）——这里绝不能再翻一次，
       // 否则 front 会来回抵消，旧层判定与新层判定同时错位。
       this.pending = null;
@@ -1581,7 +1593,9 @@ class PetSprite {
   inputBusy() {
     // 可点的余额气泡是第四个来源：它同样长在窗口里、同样靠窗口级 click 触发，而它悬在宠物头顶的
     // 余量区——那一块平时是穿透的，正需要借 busy + 控件矩形把它"圈"出来（见 syncInputRegions）。
-    return this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable();
+    return (
+      this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable() || this.whisperCalling()
+    );
   }
 
   /**
@@ -1605,6 +1619,23 @@ class PetSprite {
   balanceClickable() {
     if (!this.bubbleOn || this.balanceWrap) return false;
     return this.balancePageCount() > 1;
+  }
+
+  /** 这条正在显示的话是不是「她主动来找你」（tone === 'calling'）——决定气泡可不可点。 */
+  whisperCalling() {
+    if (!this.whisperOn || !this.whisperView || !this.whisperLook) return false;
+    return this.whisperLook.tone === 'calling';
+  }
+
+  /**
+   * 点主动聊天的气泡 = 「我要回她」：直接开对话弹窗。
+   * **气泡不许在这里收掉**——用户只是点开了输入框，还没回话。
+   * 这条气泡的生命周期由「下一条 say」决定：回完话宿主会写新的 say 叶子，
+   * showWhisper 自然把它顶掉；这之前它必须一直挂在宠物头顶提醒"还欠她一句"。
+   */
+  openChatFromBubble() {
+    if (this.chatOpen) return;
+    this.showChatFromMenu();
   }
 
   /**
@@ -2000,6 +2031,8 @@ class PetSprite {
    */
   showLocalNotice(text, duration) {
     this.whisperOn = true;
+    // 本地提示是「普通提示」档（无小标题、10 秒消失），与 host 写的 note 同款
+    this.whisperLook = S.sayLook('note');
     this.whisperView = S.whisperBubbleView({ ok: true, text, ts: 0 });
     this.whisperImage = '';
     this.whisperUrl = '';
@@ -2275,9 +2308,20 @@ class PetSprite {
       slot === 'whisper' || slot === 'work' || (slot === 'balance' && this.balanceWrap),
     );
     this.bubble.classList.toggle(S.MEME_BUBBLE_CLASS, !!whisperImg);
+    // 来意档位（三端共用 shared 的 SAY_LOOKS）：murmur = 碎碎念（灰底小字斜体 + 「自言自语」），
+    // calling = 主动聊天（粉描边 + 「她主动来找你」），plain = 余额/工作/普通提示（保持改造前）。
+    // 只在「说话气泡」这一槽生效——余额与工作气泡本来就没有来意。
+    const wLook = this.whisperLook || S.sayLook('note');
+    const whisperTone = slot === 'whisper' ? wLook.tone : 'plain';
+    this.bubble.classList.toggle('is-tone-murmur', whisperTone === 'murmur');
+    this.bubble.classList.toggle('is-tone-calling', whisperTone === 'calling');
     // 可点/展开两个状态类：可点 → 气泡参与命中区（见 syncInputRegions）；index>0 → 更宽的盒与紧凑字号
-    const clickable = slot === 'balance' && this.balanceClickable();
-    const expanded = clickable && this.balanceViewIndex > 0;
+    // 可点/展开两个状态类：可点 → 气泡参与命中区（见 syncInputRegions）
+    //   · 余额多页 → 点一下切页
+    //   · 「她主动来找你」→ 点一下开对话弹窗（用户否则不知道该去哪儿回这条）
+    const clickable =
+      (slot === 'balance' && this.balanceClickable()) || (slot === 'whisper' && whisperTone === 'calling');
+    const expanded = slot === 'balance' && clickable && this.balanceViewIndex > 0;
     this.bubble.classList.toggle('is-clickable', clickable);
     this.bubble.classList.toggle('is-expanded', expanded);
     if (slot === 'none') {
@@ -2294,6 +2338,14 @@ class PetSprite {
       line.textContent = this.workText;
       this.bubble.appendChild(line);
     } else if (slot === 'whisper') {
+      // 小标题（「自言自语」/「她主动来找你」）：只有 murmur 与 calling 有，plain 是空串不渲染。
+      // 它是用户区分「她在嘟囔」和「她真的来找我」的第一眼依据，所以放在最上面。
+      if (wLook.label) {
+        const tag = document.createElement('div');
+        tag.className = 'pet-bub-tag';
+        tag.textContent = wLook.label;
+        this.bubble.appendChild(tag);
+      }
       // 配图（shared 生成的 <img> + 共用样式）：先看图再读话，符合"配图"的阅读顺序
       if (whisperImg) this.bubble.appendChild(whisperImg);
       const line = document.createElement('div');

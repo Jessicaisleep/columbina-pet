@@ -43,6 +43,7 @@ import {
 } from '../shared/state';
 import { WORK_STATUS_INDEX, type WorkStatusSnapshot } from '../shared/work-status';
 import { makeBalanceBubble, makeWhisperBubble } from './bubble';
+import { SAY_LOOKS, sayLook, type SayLook, type SayOrigin } from '../shared/bubble-kind';
 import { clickScore, SCORE_MIN_SPEED, mountScorePopup, spawnScoreBurst } from '../shared/score-popup';
 import {
   CANVAS_H,
@@ -343,6 +344,8 @@ export function makePetUI(rt: {
     const whisperBubbleTimerRef = useRef<number | null>(null);
     // 碎碎念当前文本（本宠物独立生成的句子）+ 配图名称（开启配图时由 host 随机抽定，随文本一起来）
     const [whisperText, setWhisperText] = useState<string | null>(null);
+    // 这句话的来意决定气泡长什么样（小标题/描边/停留多久），三端共用 shared/bubble-kind.ts
+    const [whisperLook, setWhisperLook] = useState<SayLook>(SAY_LOOKS.note);
     const [whisperImage, setWhisperImage] = useState<string | undefined>(undefined);
     /** 配图的 url 形态（第三方自带地址；与 whisperImage 二选一，见 triggerWhisper） */
     const [whisperUrl, setWhisperUrl] = useState<string | undefined>(undefined);
@@ -354,6 +357,30 @@ export function makePetUI(rt: {
     const menuRef = useRef<{ close: () => void } | null>(null);
     // 对话弹窗（与桌面共用 shared 组件）：当前挂载的 close() 句柄，卸载/重开前清理
     const chatRef = useRef<{ close: () => void } | null>(null);
+
+    /**
+     * 打开对话弹窗（右键菜单「对话」与点「她主动来找你」的气泡共用这一处）。
+     * 弹窗跟随宠物：基准是**身体命中区**（.dsh-pet-hit，与气泡同一定位源——桌宠在视频中间，
+     * 视频框右上角 ≠ 宠物右上角），取身体右上角，超出视口自动夹回。
+     */
+    const openChatDialog = () => {
+      if (chatRef.current) chatRef.current.close();
+      const hitRect = stageRef.current?.querySelector('.dsh-pet-hit')?.getBoundingClientRect();
+      chatRef.current = mountChatDialog({
+        petId: cfg.id,
+        baseUrl: '/dsh-pet-7340/chat',
+        surface: 'web',
+        x: hitRect ? hitRect.right + 6 : window.innerWidth - 256,
+        y: hitRect ? hitRect.top + 6 : 8,
+        onSent: () => {
+          // 发送成功：回复已写进 S → 版本号变 → 挂着的长轮询立刻返回并弹气泡（0 延迟）
+          console.info('[dsh-pet] 对话已发送 pet=' + cfg.id);
+        },
+        onClose: () => {
+          chatRef.current = null;
+        },
+      });
+    };
 
     // 配置变化即时跟随（容器重新合并 / 设置页保存后通过 petBridge.reload 触发）
     useEffect(() => {
@@ -666,9 +693,11 @@ export function makePetUI(rt: {
             // 只有 play() 兑现才代表"确实开始出画"（loadeddata 只代表可解码）
             if (cuePlaybackId !== null) reportPlayback(cuePlaybackId, 'playing');
             if (!dropOld) return;
-            const rvfc = (el as HTMLVideoElement & {
-              requestVideoFrameCallback?: (cb: () => void) => number;
-            }).requestVideoFrameCallback;
+            const rvfc = (
+              el as HTMLVideoElement & {
+                requestVideoFrameCallback?: (cb: () => void) => number;
+              }
+            ).requestVideoFrameCallback;
             if (typeof rvfc === 'function') {
               rvfc.call(el, () => dropOld());
               window.setTimeout(dropOld, 250);
@@ -964,7 +993,7 @@ export function makePetUI(rt: {
         clearWhisperBubble();
         return;
       }
-      triggerWhisper(say.text, say.image, say.url, say.duration, say.anim);
+      triggerWhisper(say.text, say.image, say.url, say.duration, say.anim, say.origin);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [sayTick]);
 
@@ -1044,7 +1073,17 @@ export function makePetUI(rt: {
     //     （要收起它请用 POST /bubble/clear，两件事不重叠）。
     // image / url：配图的两种形态，二选一（host 判定层保证）。image = 该条目表情包池内的名称
     // （按素材根拼路径取），url = 第三方自带的完整地址（直接用）。判别位在字段名上，不靠嗅探。
-    const triggerWhisper = (text: string, image?: string, url?: string, duration?: number, anim?: boolean) => {
+    const triggerWhisper = (
+      text: string,
+      image?: string,
+      url?: string,
+      duration?: number,
+      anim?: boolean,
+      origin?: SayOrigin,
+    ) => {
+      // 来意（碎碎念 / 主动聊天 / 普通提示）：只影响气泡长相与停留时长，不影响动画与记忆。
+      const look = sayLook(origin);
+      setWhisperLook(look);
       let name: string | null = null;
       if (anim !== false) {
         const pool = petAnims.events?.whisper;
@@ -1078,10 +1117,11 @@ export function makePetUI(rt: {
       setWhisperBubbleOn(true);
       // 气泡定时消失（与动画解耦；重复触发先清旧定时器）
       if (whisperBubbleTimerRef.current !== null) window.clearTimeout(whisperBubbleTimerRef.current);
-      whisperBubbleTimerRef.current = window.setTimeout(
-        () => setWhisperBubbleOn(false),
-        duration ?? BUBBLE_DURATION_MS,
-      );
+      // holdMs=0 表示「不自动消失」：主动聊天要留到你回话，不能自己溜走
+      const hold = duration ?? look.holdMs;
+      if (hold > 0) {
+        whisperBubbleTimerRef.current = window.setTimeout(() => setWhisperBubbleOn(false), hold);
+      }
     };
     useEffect(() => {
       const onResize = () => setCustomPos((prev) => (prev ? { ...prev } : prev));
@@ -1345,11 +1385,7 @@ export function makePetUI(rt: {
      *  preferredName 传入时固定使用该动画（右键菜单点播移动动画），否则与随机链一致随机从 moves.actions 选。 */
     const tryMove = (preferredName?: string): boolean | string => {
       // 位置固定：走不动（返回 false = 调用方退化为原地播放），与桌面端 sprite.js 同一条
-      if (
-        cfg.position.pinned === true &&
-        Number.isFinite(cfg.position.pinX) &&
-        Number.isFinite(cfg.position.pinY)
-      ) {
+      if (cfg.position.pinned === true && Number.isFinite(cfg.position.pinX) && Number.isFinite(cfg.position.pinY)) {
         return false;
       }
       if (moveRef.current !== null || pendingMoveRef.current || throwRef.current !== null) return true;
@@ -1886,11 +1922,7 @@ export function makePetUI(rt: {
       // 按下积分判定，这里只是不再建立 dragRef（没有 pointermove 跟手、没有松手抛掷）。
       // 放在这里而不是函数开头：解冻与积分是"用户接管"语义，与位置无关，钉住的宠物也该能点。
       // 判据与渲染同源（都读 cfg.position）——两边不一致会出现"看着能拖但拖不动"。
-      if (
-        cfg.position.pinned === true &&
-        Number.isFinite(cfg.position.pinX) &&
-        Number.isFinite(cfg.position.pinY)
-      ) {
+      if (cfg.position.pinned === true && Number.isFinite(cfg.position.pinX) && Number.isFinite(cfg.position.pinY)) {
         return;
       }
       // 空中抓取：停掉抛掷/漫游/弹簧跟随，从当前落点开始新拖拽
@@ -2160,24 +2192,7 @@ export function makePetUI(rt: {
         // 对话：最简输入框（shared 组件，与桌面同一份）——回车发送后弹窗消失，
         // 回复用**碎碎念同款显示**（说话动画 + 白色气泡 10s），只多一步用户输入。
         // 记忆经 host /chat 读写（memory.json，浏览器/桌面同一实例共享同一份记忆）。
-        // 弹窗跟随宠物：基准是**身体命中区**（.dsh-pet-hit，与气泡同一定位源——
-        // 桌宠在视频中间，视频框右上角 ≠ 宠物右上角），取身体右上角，超出视口自动夹回。
-        if (chatRef.current) chatRef.current.close();
-        const hitRect = stageRef.current?.querySelector('.dsh-pet-hit')?.getBoundingClientRect();
-        chatRef.current = mountChatDialog({
-          petId: cfg.id,
-          baseUrl: '/dsh-pet-7340/chat',
-          surface: 'web',
-          x: hitRect ? hitRect.right + 6 : window.innerWidth - 256,
-          y: hitRect ? hitRect.top + 6 : 8,
-          onSent: () => {
-            // 发送成功：回复已写进 S → 版本号变 → 挂着的长轮询立刻返回并弹气泡（0 延迟）
-            console.info('[dsh-pet] 对话已发送 pet=' + cfg.id);
-          },
-          onClose: () => {
-            chatRef.current = null;
-          },
-        });
+        openChatDialog();
         return;
       }
       if (leaf.action === 'compress-memory') {
@@ -2308,9 +2323,7 @@ export function makePetUI(rt: {
         // 固定位置（固定在此位置 / 解除固定）：与桌面端注入**同一份**子菜单。
         // 当前状态只决定文案的「已固定」后缀，取值永远来自菜单项本身。
         pinnedMenuBranch(
-          cfg.position.pinned === true &&
-            Number.isFinite(cfg.position.pinX) &&
-            Number.isFinite(cfg.position.pinY),
+          cfg.position.pinned === true && Number.isFinite(cfg.position.pinX) && Number.isFinite(cfg.position.pinY),
         ),
         // 显示位置（仅网页/仅桌面/两者/都不）：与桌面端注入**同一份**子菜单。
         // 改成不含 web 的值（仅桌面/都不）后，本宠物会随即从 visiblePets 里消失——字面意义上的"自己走掉"。
@@ -2345,9 +2358,7 @@ export function makePetUI(rt: {
     // 与桌面端 sprite.js 的 position() 同一条判定顺序（isPinned 先于 customPos），两端才一致。
     // 配置写坏的兜底与桌面端相同：pinned 为真但没有有效坐标 → 按未固定（绝不钉到左上角）。
     const pinnedAt =
-      cfg.position.pinned === true &&
-      Number.isFinite(cfg.position.pinX) &&
-      Number.isFinite(cfg.position.pinY)
+      cfg.position.pinned === true && Number.isFinite(cfg.position.pinX) && Number.isFinite(cfg.position.pinY)
         ? { x: cfg.position.pinX as number, y: cfg.position.pinY as number }
         : null;
     const rootStyle = pinnedAt
@@ -2404,6 +2415,10 @@ export function makePetUI(rt: {
           image: whisperImage,
           url: whisperUrl,
           assetRoot: cfg.assetRoot,
+          tag: whisperLook.label,
+          tone: whisperLook.tone,
+          // 点「她主动来找你」那条 = 我要回她：直接开对话弹窗（其余档位不传，气泡不可点）
+          onOpen: openChatDialog,
           on: whisperBubbleOn,
         });
       }
@@ -2558,8 +2573,11 @@ export function makePetUI(rt: {
         clickSoundEnabled = main.clickSoundEnabled === true;
         const flattened = flattenConfigPets(merged);
         petBridge.current = flattened;
-        // 「添加宠物」模板 = main 条目 pets[0]（内置默认或用户覆盖后的主宠物）
-        petBridge.template = Array.isArray(main.pets) ? ((main.pets as Pet[])[0] ?? undefined) : undefined;
+        // 「添加宠物」模板 = main 条目 pets[0]；main 没有自己的宠物时（本包常态：两只角色都由
+        // assets/pet/ 的 pet pack 定义）回落到**整个列表的第一只**——否则「+ 添加宠物」按钮
+        // 点了没反应（addPet 里 `if (!tpl) return`），用户会以为功能坏了。
+        petBridge.template =
+          (Array.isArray(main.pets) ? ((main.pets as Pet[])[0] ?? undefined) : undefined) ?? flattened[0];
         setPets(flattened);
       };
       /** 拉成品聚合：host readAllConfig 的输出（字段填满、绝对正确），客户端零校验零兜底 */

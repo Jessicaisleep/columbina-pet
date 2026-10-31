@@ -74,6 +74,9 @@ export function configPathsFor(root: string, home: string): ConfigPaths {
     userFile: join(userRoot, 'main-config.jsonc'),
     legacyUserFile: join(userRoot, 'main-config.json'),
     petDir: join(userRoot, 'pet'),
+    // 包内 pet pack（与 host/index.ts 的 PACKAGE_PET_DIR 必须同源；独立模式与插件模式
+    // 读到的宠物列表要一致，否则 `--check` 打印的和插件实际渲染的会对不上）
+    packPetDir: join(root, 'assets', 'pet'),
   };
 }
 

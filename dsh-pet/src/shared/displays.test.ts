@@ -299,7 +299,8 @@ describe('anchorPixel / planMove —— 角落与漫游不进空洞', () => {
     }
   });
 
-  test('漫游落点落在空洞里时返回 null', () => {    const common = {
+  test('漫游落点落在空洞里时返回 null', () => {
+    const common = {
       cy: -300, // 主屏上方的高度：只有副屏在这条线上有像素
       W: 3795,
       H: 2147,
@@ -334,7 +335,8 @@ describe('anchorPixel / planMove —— 角落与漫游不进空洞', () => {
     assert.ok(Math.abs(plan.targetRatio * 3795 - 2800) < 1);
   });
 
-  test('锁定语义：areas 只给当前那块屏 ⇒ 同高度跨屏的那一步被拒', () => {    // 与上一条同一个起点 / 距离 / 方向：并集下会跨到副屏，只给主屏时必须被拒
+  test('锁定语义：areas 只给当前那块屏 ⇒ 同高度跨屏的那一步被拒', () => {
+    // 与上一条同一个起点 / 距离 / 方向：并集下会跨到副屏，只给主屏时必须被拒
     const common = {
       cx: 2300,
       cy: 700, // 主屏与副屏都覆盖这条线
@@ -393,7 +395,13 @@ describe('pinPixel / pixelToPin —— 位置固定（position.pinned）', () =>
 
   test('pixelToPin 按 hull 归一化（多屏并集坐标原点不为 0 时也对）', () => {
     // 副屏在主屏左侧：hull.x = -1920。中心点 x=0 落在 hull 的 1/3 处（hull 宽 3840）
-    const pin = pixelToPin({ cx: -640, cy: 500, W: 3840, H: 1080, hull: { x: -1920, y: 0, width: 3840, height: 1080 } });
+    const pin = pixelToPin({
+      cx: -640,
+      cy: 500,
+      W: 3840,
+      H: 1080,
+      hull: { x: -1920, y: 0, width: 3840, height: 1080 },
+    });
     assert.ok(Math.abs(pin.pinX - 0.3333333333333333) < 1e-9, `pinX=${pin.pinX}`);
     assert.ok(Math.abs(pin.pinY - 500 / 1080) < 1e-9);
   });
@@ -411,7 +419,6 @@ describe('pinPixel / pixelToPin —— 位置固定（position.pinned）', () =>
     assert.ok(p.y < 0, `y 应算出界：${p.y}`);
   });
 });
-
 
 describe('throwStepRegion —— confineToScreen：锁定屏后屏缝也当墙', () => {
   // 起点取「屏缘内 1px + 朝缝初速」：一步就会越界，最能看清放行 / 反弹的分叉

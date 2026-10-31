@@ -14,22 +14,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  extractFacts,
-  factsSection,
-  MAX_FACTS,
-  mergeFacts,
-  pruneFacts,
-  type MemoryFact,
-} from './memory-facts.ts';
-import {
-  buildIndex,
-  docsOf,
-  recallSection,
-  search,
-  tokenize,
-  type RetrievalDoc,
-} from './memory-retrieval.ts';
+import { extractFacts, factsSection, MAX_FACTS, mergeFacts, pruneFacts, type MemoryFact } from './memory-facts.ts';
+import { buildIndex, docsOf, recallSection, search, tokenize, type RetrievalDoc } from './memory-retrieval.ts';
 
 describe('extractFacts：规则抽取', () => {
   test('居住地', () => {
@@ -57,11 +43,17 @@ describe('extractFacts：规则抽取', () => {
   test('称谓与姓名要分开', () => {
     const a = extractFacts('以后叫我主人吧');
     assert.equal(a.find((x) => x.key === 'address')?.value, '主人');
-    assert.equal(a.some((x) => x.key === 'name'), false);
+    assert.equal(
+      a.some((x) => x.key === 'name'),
+      false,
+    );
 
     const b = extractFacts('我叫陈可婷');
     assert.equal(b.find((x) => x.key === 'name')?.value, '陈可婷');
-    assert.equal(b.some((x) => x.key === 'address'), false);
+    assert.equal(
+      b.some((x) => x.key === 'address'),
+      false,
+    );
   });
 
   test('喜欢与不喜欢各自建键，不互相覆盖', () => {
@@ -116,9 +108,7 @@ describe('extractFacts：规则抽取', () => {
   });
 
   test('宠物键渲染成自然句子（不泄漏分隔符）', () => {
-    const s = factsSection([
-      { kind: 'identity', key: 'pet', value: '猫·团子', firstTs: 0, lastTs: 0 },
-    ]);
+    const s = factsSection([{ kind: 'identity', key: 'pet', value: '猫·团子', firstTs: 0, lastTs: 0 }]);
     assert.equal(s.includes('养了一只猫，叫团子'), true);
     assert.equal(s.includes('·'), false, '分隔符是内部表示，不能出现在提示词里');
   });
@@ -143,9 +133,7 @@ describe('mergeFacts：覆盖语义', () => {
   });
 
   test('同 key 值变了 → 覆盖值并刷新 lastTs，保留 firstTs（搬家场景）', () => {
-    const seed: MemoryFact[] = [
-      { kind: 'identity', key: 'city', value: '杭州', firstTs: 100, lastTs: 100 },
-    ];
+    const seed: MemoryFact[] = [{ kind: 'identity', key: 'city', value: '杭州', firstTs: 100, lastTs: 100 }];
     const r = mergeFacts(seed, [{ kind: 'identity', key: 'city', value: '上海', explicit: false }], now2);
     assert.equal(r.facts.length, 1, '搬家不能变成两条并存的城市');
     assert.equal(r.facts[0].value, '上海');
@@ -155,18 +143,14 @@ describe('mergeFacts：覆盖语义', () => {
   });
 
   test('同 key 同值 → 刷新 lastTs 但不算 changed（避免每轮触发写盘）', () => {
-    const seed: MemoryFact[] = [
-      { kind: 'identity', key: 'city', value: '杭州', firstTs: 100, lastTs: 100 },
-    ];
+    const seed: MemoryFact[] = [{ kind: 'identity', key: 'city', value: '杭州', firstTs: 100, lastTs: 100 }];
     const r = mergeFacts(seed, [{ kind: 'identity', key: 'city', value: '杭州', explicit: false }], now2);
     assert.equal(r.changed, false);
     assert.equal(r.facts[0].lastTs, now2);
   });
 
   test('不同 kind 的同名 key 不互相覆盖', () => {
-    const seed: MemoryFact[] = [
-      { kind: 'identity', key: 'note:x', value: 'A', firstTs: 1, lastTs: 1 },
-    ];
+    const seed: MemoryFact[] = [{ kind: 'identity', key: 'note:x', value: 'A', firstTs: 1, lastTs: 1 }];
     const r = mergeFacts(seed, [{ kind: 'custom', key: 'note:x', value: 'B', explicit: true }], now2);
     assert.equal(r.facts.length, 2);
   });
@@ -308,10 +292,20 @@ describe('search：噪声抑制（真实数据踩到的坑）', () => {
 
   test('疑问词不参与检索（否则「叫什」会把无关旧问答顶上来）', () => {
     const t = tokenize('我家的猫叫什么');
-    assert.equal(t.some((x) => x === '什么'), false, '疑问词必须被剥掉');
-    assert.equal(t.some((x) => x === '叫什'), false);
+    assert.equal(
+      t.some((x) => x === '什么'),
+      false,
+      '疑问词必须被剥掉',
+    );
+    assert.equal(
+      t.some((x) => x === '叫什'),
+      false,
+    );
     // 剥完还要留下话题词
-    assert.equal(t.some((x) => x.includes('猫')), true);
+    assert.equal(
+      t.some((x) => x.includes('猫')),
+      true,
+    );
   });
 
   test('唯一专名单锚点能命中（「猫叫」全档案只出现一次）', () => {

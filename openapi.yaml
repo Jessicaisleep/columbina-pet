@@ -1,13 +1,17 @@
 openapi: 3.1.0
 
 info:
-  title: dsh-pet HTTP API
-  version: 0.3.8
+  title: dsh-genshin-pet HTTP API
+  version: 0.1.4
   summary: DSH 桌宠插件的宿主 HTTP 接口
   description: |
-    dsh-pet 的宿主（host）半侧通过 DSH 的 `webServer` 服务注册**一条前缀路由** `/dsh-pet-7340`，
+    dsh-genshin-pet 的宿主（host）半侧通过 DSH 的 `webServer` 服务注册**一条前缀路由** `/dsh-pet-7340`，
     浏览器半侧、桌面 Electron 半侧、以及设置页全都消费同一份实现（`handlePetRoute`）。
     本文件是该路由的公开契约：任何第三方插件 / 脚本都可以按此访问桌宠能力。
+
+    > **关于 `dsh-pet` 这个名字**：本包从上游 dsh-pet 派生，包名/仓库已改为 `dsh-genshin-pet`，
+    > 但**路由前缀 `/dsh-pet-7340`、用户数据目录 `/dsh-pet`、pet 目录 `pet/`**
+    > 是刻意保留的内部标识——它们是「用户已有数据与前端注入路径的身份」，改名需要写迁移。
 
     ## 部署形态
 
@@ -63,7 +67,7 @@ info:
 
 externalDocs:
   description: 项目仓库与使用说明
-  url: https://github.com/PC2005-cloud/dsh-pet
+  url: https://github.com/Jessicaisleep/dsh-genshin-pet
 
 servers:
   - url: http://127.0.0.1:{port}
@@ -84,6 +88,8 @@ tags:
     description: 配置的读取、保存与元信息
   - name: Assets
     description: 字体、通知图标、表情包、动画素材
+  - name: Assistant
+    description: 读屏助手——开关、操作记录与越权动作审批
 
 paths:
   /dsh-pet-7340/state:
@@ -2279,6 +2285,650 @@ paths:
         "405":
           description: 方法不允许（只接受 POST）
 
+  /dsh-pet-7340/pet-pinned:
+    post:
+      tags: [Config]
+      operationId: setPetPinned
+      summary: 固定 / 解除固定单只宠物的屏幕位置
+      description: |
+        把某一只宠物「钉」在它此刻的屏幕位置上（`pinned: true`），或解除固定（`pinned: false`）。
+        这是 `PUT /config` 的单只快捷形式，与 `POST /pet-display` 同一套写盘路径
+        （`saveUserConfig` 白名单重建 + 已存在字段原值透传）。
+
+        与 `/pet-display` 只有两点不同：
+
+        1. **不重启桌面 Helper**——固定改的是窗口几何，渲染端自己已经按新位置重排过，
+           重启只会把窗口全换一遍（白闪），对「钉在当前点」毫无意义；
+        2. `pinned: true` 时必须带上（或能推算出）`pinX` / `pinY`。
+
+        **不传坐标是合法的**：设置页往往并不知道宠物此刻在屏幕哪儿，只想「打开固定」。
+        这种情形宿主按新鲜度取两个可信来源——① 桌面端一直在上报的实况快照（`POST /pose/report`，
+        与 `/position` 同口径），② 配置里已有的 `pinX` / `pinY`。两者都没有才拒绝
+        （`reason: pin-needs-position`），**绝不静默钉到左上角 (0,0)**。
+
+        解除固定时**不删坐标**：`pinned: false` 已让渲染端完全忽略它们，留着是为了不顺手丢掉
+        用户可能想保留的数据（唯一会删的情形是值本身已是 `undefined`，那种留着只会让下次读配置告警）。
+
+        **并发**：与 `PUT /config`、`POST /pet-display` 共用同一条 `configQueue` 串行执行——
+        三者都是「读-改-写同一个 pets 数组」，并发两笔会互相覆盖。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, pinned]
+              properties:
+                id:
+                  type: string
+                  description: 宠物实例 id（合并后全局唯一）
+                  example: columbina1
+                pinned:
+                  type: boolean
+                  description: '`true` = 固定在此位置，`false` = 解除固定'
+                pinX:
+                  type: number
+                  description: |
+                    固定点中心 X（与 `/pose/report`、`/position` 同一坐标系）。
+                    `pinned: true` 时可省略——省略则按实况快照 → 配置旧值依次回退。
+                pinY:
+                  type: number
+                  description: 固定点中心 Y，回退规则同 `pinX`
+            examples:
+              pinAtCurrent:
+                summary: 让宠物钉在此刻的位置（由宿主自己取实况坐标）
+                value:
+                  id: columbina1
+                  pinned: true
+              pinAtExplicit:
+                summary: 钉到指定坐标
+                value:
+                  id: nahida1
+                  pinned: true
+                  pinX: 0.82
+                  pinY: 0.91
+              unpin:
+                summary: 解除固定（坐标保留）
+                value:
+                  id: columbina1
+                  pinned: false
+      responses:
+        "200":
+          description: |
+            **成功** → `{ ok: true, id, pinned, pinX, pinY }`：`pinX` / `pinY` 在
+            `pinned: false` 时为 `null`（表示"当前不生效"，不是"没保存过"）。
+            **业务失败** → `{ ok: false, reason, message }`。
+
+            `reason` 取值：`pet-required`（缺 `id` / 空串 / 全空白）、`bad-request`（`pinned`
+            不是布尔，或该层宠物配置非法）、`unknown-pet`（找不到这只宠物）、
+            `pin-needs-position`（要固定但既无实况、配置里也没有旧坐标）、
+            `generate-error`（配置读取失败 / 写盘失败 / 条目配置文件找不到）。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PetPinnedResponse"
+                  - $ref: "#/components/schemas/FailureResponse"
+        "400":
+          description: '请求体不是合法 JSON（`{ "error": "invalid JSON body" }`）'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/pet-persona:
+    get:
+      tags: [Config]
+      operationId: getPetPersona
+      summary: 读单只宠物的人设卡（实例级覆盖 + 条目级回落 + 最终生效的 system）
+      description: |
+        返回三份人设，供设置页做「留空时实际生效的是哪一段」的对照展示：
+
+        - `persona` —— 实例级覆盖（`pets[].whisperPrompt`），空串 = 没有覆盖；
+        - `entryPersona` —— 所属条目级人设，即留空时回落到的那一段；
+        - `system` —— 最终真正拼进模型请求的 system（含名字行与时间背景）。
+
+        **人设分三层**，这是理解本端点的前提：全局默认 `assets/config.jsonc` 的
+        `whisperPrompt` → 条目级（`pet/<前缀>-config.json` 或 `main-config.jsonc`）→ 实例级
+        （用户层某一份配置里的 `pets[]`）。实例级只覆盖「这一只」，不与其它实例共享。
+      parameters:
+        - $ref: "#/components/parameters/PetIdQuery"
+      responses:
+        "200":
+          description: |
+            **成功** → `{ ok: true, pet: { id, name, display }, persona, entryPersona, system }`；
+            **业务失败** → `{ ok: false, reason, message }`（`pet-required` / `unknown-pet` /
+            `generate-error`）。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PetPersonaView"
+                  - $ref: "#/components/schemas/FailureResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+    post:
+      tags: [Config]
+      operationId: setPetPersona
+      summary: 写单只宠物的人设卡（空串 = 删除覆盖，回落到条目级人设）
+      description: |
+        只做一件很窄的事：读写**某一只**宠物的实例级 `whisperPrompt`。写入语义与 `PUT /config`
+        完全一致（`saveUserConfig` 白名单重建 + 磁盘原值透传），落盘后写一次 `config` 段让浏览器端
+        「发现配置版本变了 → 重拉配置」。
+
+        这张卡存在的原因是独立模式的设置页没有 DSH 插件那套配置面板——没有它，人设在那里
+        完全无从写入，用户只能手改 JSON 文件。
+
+        **人设不设长度上限。** 人设是用户自己的创作，写多长、每次多花多少 token 是他们自己的
+        取舍。这里原先硬拒 >4000 字，导致用户贴一份完整角色卡会被静默拒绝。唯一保留的边界是
+        **结构性**的：必须是字符串；非空才写；空串 = 删除覆盖。真正的兜底交给下游——模型上下文
+        超限时由 provider 报错，那才是准确的位置。
+
+        路径归属由宿主反查（`findPetInstance` 定位后按条目归属决定写哪个文件），调用方不传层。
+      parameters:
+        - $ref: "#/components/parameters/PetIdQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                persona:
+                  type: string
+                  description: |
+                    新的人设正文。空串（或全空白、或缺键）= 删除实例级覆盖，
+                    回落到 `entryPersona`。**无长度上限**。
+            examples:
+              write:
+                summary: 写入一份角色卡
+                value:
+                  persona: 你是哥伦比娅·希珀塞莱尼娅，说话缓慢、语气温柔……
+              clear:
+                summary: 清空覆盖，回落到条目级人设
+                value:
+                  persona: ""
+      responses:
+        "200":
+          description: |
+            **成功** → `{ ok: true, persona, system }`，`system` 是写盘后重新算出的最终生效值
+            （设置页可直接用它刷新预览）。
+            **业务失败** → `{ ok: false, reason, message }`，`reason` 取值同 `GET`，
+            外加 `bad-request`（`persona` 不是字符串 / 宠物配置非法）。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PetPersonaWriteResult"
+                  - $ref: "#/components/schemas/FailureResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/portable/export:
+    post:
+      tags: [Config]
+      operationId: exportBackup
+      summary: 导出全部用户状态为一个备份包
+      description: |
+        把「哪些文件算用户的全部状态」收敛成一份 JSON 包返回，供换机器 / 重装 / 手滑改坏配置 /
+        给别人一份同样配置时使用。收进包里的只有三类路径：`main-config.jsonc`、
+        `memory.json`、`standalone-ai.json`（`includeApiKey: true` 时），以及
+        `pet/<前缀>-config.json`。
+
+        **只收 POST，故意不开 GET**：standalone 模式的 `publicRead()` 会放行**所有**
+        `GET /dsh-pet-<数字>/…` 而不要求令牌，而导出包里含 `memory.json`（用户的真实对话原文）。
+        用一个免令牌的 GET 把它吐出去，等于任何能在本机打开网页的进程都能读走聊天记录。
+
+        **不走 `configQueue`**：导出纯读、不写任何文件，串行没有意义。
+
+        读不出来的文件**跳过而不是抛错**（备份的价值是「能救多少救多少」），跳过的在
+        `skipped` 里列出。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                includeApiKey:
+                  type: boolean
+                  default: false
+                  description: |
+                    是否把 `standalone-ai.json`（含**明文** apiKey）一起导出。默认 `false`。
+                    请求体坏掉不阻断导出：按默认（不含密钥）走，调用方能从响应的
+                    `bundle.includeApiKey` 看出实际取值。
+            examples:
+              withoutKey:
+                summary: 常规导出（不含密钥）
+                value: {}
+              withKey:
+                summary: 连密钥一起导出（明文，注意去向）
+                value:
+                  includeApiKey: true
+      responses:
+        "200":
+          description: |
+            备份包 + 被跳过的文件清单。响应头带 `cache-control: no-cache, no-store`。
+            包结构见 `BackupBundle`；`files[].text` 是**原文**（保留注释与换行风格），
+            每份文件带自己的 `sha256`，整包另有覆盖「排序后的 (path, sha256)」的 `sha256`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupExportResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          description: '收集或序列化失败（`{ "error": "导出失败，详见日志" }`）'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /dsh-pet-7340/portable/import:
+    post:
+      tags: [Config]
+      operationId: importBackup
+      summary: 从备份包恢复用户状态（两阶段：dry 只算不写）
+      description: |
+        **两阶段导入**：`dry: true` 只算「会覆盖哪几个 / 新增哪几个」并返回计划，不落盘；
+        设置页先 dry 一次给用户看，确认后才真导。这样「点错文件直接覆盖掉全部配置」这个最贵的
+        误操作没有发生的机会。
+
+        三处刻意的设计：
+
+        1. **写前先留副本**——已存在的目标文件复制成 `<名>.bak-before-import-<yyyyMMdd-HHmmss>`。
+           导入是破坏性操作，用户手滑选错包时这是唯一的退路。副本名不匹配 `pet/*-config.json`
+           的扫描规则，不会被当成宠物读进去。
+        2. **不含密钥的包不删本机密钥**——`includeApiKey === false` 且本机已有
+           `standalone-ai.json` 时保持原样。用户的直觉是「导入配置」而不是「清空我的密钥」。
+        3. **旧包自动归位（v2）**——`memory.json` 在**写盘前**过一遍迁移。必须在 sha256 校验
+           之后做：校验对的是原文，就地改文本会让校验先失败。
+
+        **业务失败一律 200 + `{ ok: false, reason, message }`**：校验失败是「用户选错了文件」
+        这种正常情况，不该用 4xx 让前端当网络错误处理。400 只留给 JSON 坏了 / 缺 `text`，
+        413 只留给体积超限。
+
+        **不走 `configQueue`**：导入是整份替换而非「读-改-写同一个 pets 数组」，与 `/config`
+        并发时的正确结果本来就只能是「谁后到谁说了算」；真要串行反而会互相等待造成假死。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  description: |
+                    备份文件的**原文**（`JSON.stringify` 后的包体字符串，不是解析后的对象）。
+                    整包上限 512 KB（`BACKUP_MAX_BYTES`）——这个数由 standalone 的 1 MB 请求体
+                    上限反推：原文里的引号要再转义，实测膨胀 12~15%。
+                dry:
+                  type: boolean
+                  default: false
+                  description: '`true` = 只算计划不写盘'
+            examples:
+              dryRun:
+                summary: 先干跑看计划
+                value:
+                  text: '{"format":"dsh-pet-backup","version":2,"files":[...]}'
+                  dry: true
+      responses:
+        "200":
+          description: |
+            **dry** → `{ ok: true, dry: true, version, exportedAt, appVersion, includeApiKey,
+            files: BackupImportPlan[], memory?: { willUpgrade, factsAdded } }`；
+            **真导** → `{ ok: true, version, written[], backups[], apiKeyKept, memoryUpgraded,
+            factsAdded }`；
+            **校验失败** → `{ ok: false, reason, message, file? }`，`reason` 取值：
+            `not-json` / `wrong-format` / `unsupported-version` / `too-large` /
+            `too-many-files` / `bad-path` / `file-mismatch` / `bundle-mismatch` / `bad-content`。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/BackupImportDryResponse"
+                  - $ref: "#/components/schemas/BackupImportResult"
+                  - $ref: "#/components/schemas/BackupValidationFailure"
+        "400":
+          description: '`text` 缺失 / 不是字符串，或请求体不是合法 JSON'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          description: '超过 `BACKUP_MAX_BYTES × 1.3`（`{ "error": "备份文件过大" }`）'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: '写盘失败（`{ "error": "导入失败，详见日志" }`）'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /dsh-pet-7340/assistant/settings:
+    get:
+      tags: [Assistant]
+      operationId: getAssistantSettings
+      summary: 读屏与助手开关（含每只宠物的工作区路径）
+      description: |
+        设置页「读屏与助手」区块的展示数据源。单独一条而不是走 `/config`：设置页只该改这几个
+        字段，走 `/config` 的整包 `PUT` 要求调用方先拿到并回传完整 `pets` 数组，漏一个字段就可能
+        把用户配置改坏。
+
+        `screenAvailable: false` 表示读屏能力在本机不可用（随包的 UIA 脚本缺失或系统没有
+        PowerShell），设置页据此禁用开关并说明原因。
+      responses:
+        "200":
+          description: 当前开关值 + 每只宠物的 `workspace` 绝对路径
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantSettingsView"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+    post:
+      tags: [Assistant]
+      operationId: setAssistantSettings
+      summary: 部分更新读屏与助手开关（PATCH 语义）
+      description: |
+        只写 body 里**显式给出**的键，`undefined` 跳过。逐字段校验，非法值直接拒，**不做部分写入**。
+
+        `pets` 必须取**用户层原文**，不能取合并结果——合并器会把默认值填满每只宠物，
+        把那份写回用户层等于把默认值固化成用户的显式设置，以后改内置默认就再也影响不到这个用户。
+
+        写盘后**清空全部一次性授权**：权限档位变了，降权前拿到的旧授权不能继续用。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistantSettingsPatch"
+      responses:
+        "200":
+          description: |
+            **成功** → `{ ok: true }`；
+            **业务失败** → `{ ok: false, reason, message }`（`bad-request` 请求体不是对象 /
+            值不合法、`generate-error` 写盘失败）。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - $ref: "#/components/schemas/FailureResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/assistant/history:
+    get:
+      tags: [Assistant]
+      operationId: listAssistantHistory
+      summary: 助手操作记录（新的在前）
+      description: |
+        每条记录是一次「宠物替用户动手」的留痕：指令原文（截断 500 字）、权限档位、整体结果
+        （`ok` / `blocked` / `failed`）、最终回复（截断 1000 字）、做了哪些动作（每步只留参数与
+        结果摘要）、耗时。正文（`content`）只报长度不报内容——可能很长，也可能含隐私。
+        单条记录上限 8 KB，文件超 512 KB 时裁到最近 500 条。
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: 返回条数，默认 100；非正整数按 100 处理
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: '`{ ok: true, total, limit, items: AssistantRecord[] }`，响应头 `cache-control: no-cache, no-store`'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantHistoryResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+    delete:
+      tags: [Assistant]
+      operationId: clearAssistantHistory
+      summary: 清空全部助手操作记录
+      description: "幂等：没有记录时同样返回 ``ok: true``。"
+      responses:
+        "200":
+          description: '`{ ok: true }`，失败时 `{ ok: false, message }`'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - type: object
+                    required: [ok, message]
+                    properties:
+                      ok:
+                        type: boolean
+                        const: false
+                      message:
+                        type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/assistant/approvals:
+    get:
+      tags: [Assistant]
+      operationId: listAssistantApprovals
+      summary: 待审批的越权动作
+      description: |
+        越权动作**不静默失败**：用户能看到「它想干什么、想改哪个文件」，由人决定这一次是否放行。
+        列表在进程内存里，宿主重启即清空（授权与待办都不跨进程存活）。
+      responses:
+        "200":
+          description: '`{ ok: true, workspace, items: AssistantApproval[] }`，新的在前'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantApprovalsResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+    post:
+      tags: [Assistant]
+      operationId: resolveAssistantApproval
+      summary: 处理一条待审批（允许 = 一次性授权并按原指令重放 / 拒绝 = 只删掉）
+      description: |
+        批准只覆盖**这一个动作 + 这一个路径**这一次，不是永久开洞。放行后按原用户指令重放整轮，
+        因此响应可能较慢（要走一次完整生成）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  description: 待审批项 id（取自 `GET` 的 `items[].id`）
+                allow:
+                  type: boolean
+                  description: '`true` = 放行并重放；其它值（含缺省）= 拒绝'
+            examples:
+              allow:
+                summary: 放行这一次
+                value:
+                  id: ap_1
+                  allow: true
+              deny:
+                summary: 拒绝
+                value:
+                  id: ap_1
+                  allow: false
+      responses:
+        "200":
+          description: |
+            **拒绝** → `{ ok: true, allowed: false }`；
+            **放行并重放成功** → `{ ok: true, allowed: true, text }`；
+            **放行但重放失败** → `{ ok: false, allowed: true, reason, message }`；
+            **审批项不存在 / 已处理** → `{ ok: false, reason: "unknown-approval", message }`；
+            **请求体坏** → `{ ok: false, reason: "bad-request", message }`。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/AssistantApprovalResult"
+                  - $ref: "#/components/schemas/FailureResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/screen:
+    post:
+      tags: [Action]
+      operationId: pushScreen
+      summary: 手机读屏——把手机屏幕上的文字交给宿主当环境上下文
+      description: |
+        安卓 App（`PetReaderService` 无障碍服务）每 20 秒把当前前台界面的文字推上来，宿主只保留
+        **最近一次**快照，带 90 秒 TTL，**只在内存里**（重启即失效，不落盘、不上传）。
+
+        与"电脑读屏"的关系：`screenSection()` 先看手机快照，新鲜就直接用；过期或从没推过才回落到
+        本机 UIA 读屏。取舍理由——用户手上正在看的那块屏幕，比电脑上开着的窗口更接近"此刻"。
+
+        为什么是 POST 而不是 GET：它**写**状态（内存里的最近快照）。GET 会被浏览器预取/缓存白白
+        调用，也会让 `publicRead` 的免令牌规则把它放出去。
+
+        **校验**（不通过一律 HTTP 200 + `ok: false`，与 `POST /chat` 口径一致）：
+
+        - `text` 超过 8 KB → `bad-request`。上限在宿主这里收，**不靠手机自觉**；
+        - `text` 缺失或 `trim()` 后为空 → 不算错误，按"这次没读到"处理：`accepted: false`，
+          并**清掉旧快照**（留着一个空壳会让宿主以为屏幕是空的）；
+        - `pkg` 可选，只作日志与提示里的"她在用什么"，不参与判定。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pkg:
+                  type: string
+                  description: 前台应用包名，例如 `com.tencent.mm`。
+                text:
+                  type: string
+                  description: 无障碍树里抓到的文字（换行或 ` | ` 分隔）。上限 8 KB。
+      responses:
+        "200":
+          description: |
+            **收下** → `{ ok: true, accepted: true, chars }`；
+            **空文本** → `{ ok: true, accepted: false, chars: 0 }`（清掉旧快照）；
+            **`text` 过长 / 请求体不是合法 JSON** → `{ ok: false, reason: "bad-request", message }`。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  accepted:
+                    type: boolean
+                    description: 这次推上来的内容有没有被采纳（空文本即 `false`）。
+                  chars:
+                    type: integer
+                    description: 采纳后的字数（截断到 1200 之后）。
+                  reason:
+                    type: string
+                  message:
+                    type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/screen/status:
+    get:
+      tags: [State]
+      operationId: screenStatus
+      summary: 手机读屏状态——有没有最近快照、多旧、哪个包
+      description: |
+        诊断用只读端点。回答的是"读屏到底有没有在工作"：`present` 表示**收到过**，`ageMs` 表示
+        多久以前（超过 90 秒 `fresh()` 就不再采用，但这里仍如实报 `present: true` ——
+        "收到过但旧了"与"从没收到"是两件事，混起来就没法定位）。
+      responses:
+        "200":
+          description: 返回 ok / present / chars / ageMs / pkg 五个字段（present 为 false 时其余为 0 或空）。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  present:
+                    type: boolean
+                  chars:
+                    type: integer
+                  ageMs:
+                    type: number
+                    description: 距上次上传的毫秒数。
+                  pkg:
+                    type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/proactive:
+    post:
+      tags: [Action]
+      operationId: proactive
+      summary: 主动聊天——让这只宠物主动说一句（手动触发，绕过开关与间隔）
+      description: |
+        与 `POST /whisper` 的分工：`/whisper` **不写记忆**（只是碎碎念），这里**会写记忆**
+        （一条 `origin: proactive` 的 assistant），所以用户接下来接话时她知道自己在说什么。
+
+        手动触发**绕过开关与间隔**（设置页的"现在试一句"用它），但仍守住两条语义 —— 这两条不是
+        节流，是正确性，绕过去会得到"用户问了她，她却聊别的"：
+
+        - `unanswered`：上一条就是她主动说的、用户还没回 → 不连发；
+        - `ai-unavailable`：AI 没配置好 → 不硬造内容。
+
+        周期性开口由宿主内的调度器负责（按 `proactiveChatSec`，默认 1800 秒），走路由同一个
+        `publishProactive`，因此两条路径的判定与副作用完全一致。
+      parameters:
+        - $ref: "#/components/parameters/PetIdQuery"
+        - $ref: "#/components/parameters/SurfaceQuery"
+        - name: group
+          in: query
+          required: false
+          schema:
+            type: string
+          description: 群号。给了就走群记忆；不给就挑该宠物最近活跃的那个群，没有群记忆则退化为单人流。
+      responses:
+        "200":
+          description: |
+            **说了** → `{ ok: true, text, group? }`；
+            **没说** → `{ ok: false, reason }`，`reason` 原样透出（`disabled` / `locked` /
+            `not-due` / `unanswered` / `not-at-boundary` / `ai-unavailable` / `generate-error`），
+            调用方据此能分清"她正欠你一句"与"生成炸了"；
+            **`pet` 缺失或不存在** → `{ ok: false, reason: "bad-request" | "unknown-pet", message }`。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  text:
+                    type: string
+                    description: 她这次说的话（ok 为 true 时才有）。
+                  group:
+                    type: string
+                  reason:
+                    type: string
+                  message:
+                    type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
 components:
   parameters:
     PetIdQuery:
@@ -3287,6 +3937,475 @@ components:
             为什么要它：整张清单每条消息都要附，token 随张数线性增长，限制后配图开销上限可控。
             设置页「AI 模型与对话上下文」区的数字输入框写的就是它。缺失默认 10。
 
+    PetPinnedResponse:
+      type: object
+      required: [ok, id, pinned, pinX, pinY]
+      description: 固定 / 解除固定的成功体。`pinned` 为 `false` 时 `pinX` / `pinY` 返回 `null`（当前不生效，不是没保存过）。
+      properties:
+        ok:
+          type: boolean
+          const: true
+        id:
+          type: string
+        pinned:
+          type: boolean
+        pinX:
+          type: number
+          nullable: true
+        pinY:
+          type: number
+          nullable: true
+
+    PetPersonaView:
+      type: object
+      required: [ok, pet, persona, entryPersona, system]
+      description: 单只宠物的人设三视图。
+      properties:
+        ok:
+          type: boolean
+          const: true
+        pet:
+          type: object
+          required: [id, name, display]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            display:
+              type: string
+              enum: [web, desktop, both, none]
+        persona:
+          type: string
+          description: 实例级覆盖；空串 = 没有覆盖（回落到 `entryPersona`）
+        entryPersona:
+          type: string
+          description: 所属条目级人设，即留空时实际生效的那一段
+        system:
+          type: string
+          description: 最终拼进模型请求的 system（含名字行与时间背景）
+
+    PetPersonaWriteResult:
+      type: object
+      required: [ok, persona, system]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        persona:
+          type: string
+          description: 写盘后该实例的覆盖值（空串 = 已删除覆盖）
+        system:
+          type: string
+          description: 写盘后重新算出的最终生效 system，设置页可直接拿来刷新预览
+
+    BackupFile:
+      type: object
+      required: [path, text, sha256]
+      properties:
+        path:
+          type: string
+          description: 相对 `data/dsh-pet/` 的路径，只用正斜杠。合法取值：`main-config.jsonc` / `memory.json` / `standalone-ai.json` / `pet/<前缀>-config.json`
+          example: pet/nahida-config.json
+        text:
+          type: string
+          description: 文件原文（保留注释与换行风格）
+        sha256:
+          type: string
+          description: 对 text 求 sha256 后的十六进制小写
+
+    BackupBundle:
+      type: object
+      required: [format, version, exportedAt, appVersion, includeApiKey, files, sha256]
+      properties:
+        format:
+          type: string
+          const: dsh-pet-backup
+        version:
+          type: integer
+          example: 2
+        exportedAt:
+          type: string
+          format: date-time
+        appVersion:
+          type: string
+          description: 产出该包的程序版本（排障用，不参与校验）
+        includeApiKey:
+          type: boolean
+          description: 是否包含 `standalone-ai.json`（含明文 apiKey）
+        files:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/BackupFile"
+        sha256:
+          type: string
+          description: |
+            覆盖「按路径排序后的 (path, sha256) 列表」的整包校验。
+            不直接哈希 `JSON.stringify(files)`：那样会把 text 也滚进去，同一个文件只要换行风格变了
+            校验就变——换行归一化是导入端的事，不该让「内容没变但格式变了」的包被判损坏。
+
+    BackupExportResponse:
+      type: object
+      required: [ok, bundle, skipped]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        bundle:
+          $ref: "#/components/schemas/BackupBundle"
+        skipped:
+          type: array
+          description: 读不出来而被跳过的相对路径（备份的价值是「能救多少救多少」，不因单个文件失败而整体失败）
+          items:
+            type: string
+
+    BackupImportPlan:
+      type: object
+      required: [path, absolute, bytes, overwrite]
+      properties:
+        path:
+          type: string
+          description: 相对路径，与 `bundle.files[].path` 同口径
+        absolute:
+          type: string
+          description: 目标绝对路径
+        bytes:
+          type: integer
+          description: UTF-8 字节数
+        overwrite:
+          type: boolean
+          description: 目标是否已存在（设置页据此提示「会覆盖」）
+
+    BackupImportDryResponse:
+      type: object
+      required: [ok, dry, version, exportedAt, appVersion, includeApiKey, files]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        dry:
+          type: boolean
+          const: true
+        version:
+          type: integer
+        exportedAt:
+          type: string
+          format: date-time
+        appVersion:
+          type: string
+        includeApiKey:
+          type: boolean
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/BackupImportPlan"
+        memory:
+          type: object
+          description: 旧记忆会被升级成什么（只在包里有 `memory.json` 时出现）
+          properties:
+            willUpgrade:
+              type: boolean
+            factsAdded:
+              type: integer
+
+    BackupImportResult:
+      type: object
+      required: [ok, version, written, backups, apiKeyKept, memoryUpgraded, factsAdded]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        version:
+          type: integer
+        written:
+          type: array
+          items:
+            type: object
+            required: [path, bytes, overwrite]
+            properties:
+              path:
+                type: string
+              bytes:
+                type: integer
+              overwrite:
+                type: boolean
+        backups:
+          type: array
+          description: 落盘前留的自动副本文件名（同名 + `.bak-before-import-<时间戳>`）；无旧文件则为空
+          items:
+            type: string
+        apiKeyKept:
+          type: boolean
+          description: 包里不含密钥、但本机原有密钥文件被保持原样（true = 没被清掉）
+        memoryUpgraded:
+          type: boolean
+        factsAdded:
+          type: integer
+
+    BackupValidationFailure:
+      type: object
+      required: [ok, reason, message]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        reason:
+          type: string
+          enum:
+            - not-json
+            - wrong-format
+            - unsupported-version
+            - too-large
+            - too-many-files
+            - bad-path
+            - file-mismatch
+            - bundle-mismatch
+            - bad-content
+        message:
+          type: string
+        file:
+          type: string
+          description: 出问题的具体文件（可选）
+
+    AssistantSettingsView:
+      type: object
+      required:
+        - ok
+        - screenContextEnabled
+        - screenExcludePatterns
+        - assistantEnabled
+        - assistantPermission
+        - assistantNetworkEnabled
+        - memoryMode
+        - groupMemoryScope
+        - groupMemoryRecentN
+        - memoryRecallK
+        - chatMemoryRounds
+        - groupBotEnabled
+        - ownerQq
+        - ownerSyncEnabled
+        - workspaceRoot
+        - pets
+        - screenAvailable
+      properties:
+        ok:
+          type: boolean
+          const: true
+        screenContextEnabled:
+          type: boolean
+        screenExcludePatterns:
+          type: array
+          items:
+            type: string
+        assistantEnabled:
+          type: boolean
+        assistantPermission:
+          type: string
+          enum: [readonly, workspace, full]
+        assistantNetworkEnabled:
+          type: boolean
+        memoryMode:
+          type: string
+          enum: [single, group]
+          description: '`single` 一对一（老行为，默认）/ `group` 群聊按人分桶'
+        groupMemoryScope:
+          type: string
+          enum: [everyone, recent]
+          description: 群聊记忆策略；非法值回落 `everyone`（宁可多记，不可误忘）
+        groupMemoryRecentN:
+          type: integer
+          minimum: 1
+          maximum: 100
+        memoryRecallK:
+          type: integer
+          minimum: 0
+          maximum: 50
+        chatMemoryRounds:
+          type: integer
+        groupBotEnabled:
+          type: boolean
+          description: 群聊机器人开关（默认单人；「记住主人」两件套只在它为 true 时有意义）
+        ownerQq:
+          type: string
+        ownerSyncEnabled:
+          type: boolean
+        workspaceRoot:
+          type: string
+        pets:
+          type: array
+          items:
+            type: object
+            required: [id, name, workspace]
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              workspace:
+                type: string
+        screenAvailable:
+          type: boolean
+          description: 读屏能力是否可用（随包 UIA 脚本存在 + 系统有 PowerShell）；false 时设置页应禁用开关并说明原因
+
+    AssistantSettingsPatch:
+      type: object
+      description: |
+        只写显式给出的键（`undefined` 跳过）。逐字段校验，非法值直接拒，不做部分写入。
+        可写键：`screenContextEnabled` / `screenExcludePatterns` / `assistantEnabled` /
+        `assistantPermission` / `assistantNetworkEnabled` / `memoryMode` / `groupMemoryScope` /
+        `groupMemoryRecentN` / `memoryRecallK` / `chatMemoryRounds` / `groupBotEnabled` /
+        `ownerQq` / `ownerSyncEnabled`。
+      properties:
+        screenContextEnabled:
+          type: boolean
+        screenExcludePatterns:
+          type: array
+          items:
+            type: string
+        assistantEnabled:
+          type: boolean
+        assistantPermission:
+          type: string
+          enum: [readonly, workspace, full]
+        assistantNetworkEnabled:
+          type: boolean
+        memoryMode:
+          type: string
+          enum: [single, group]
+        groupMemoryScope:
+          type: string
+          enum: [everyone, recent]
+        groupMemoryRecentN:
+          type: integer
+          minimum: 1
+          maximum: 100
+        memoryRecallK:
+          type: integer
+          minimum: 0
+          maximum: 50
+        chatMemoryRounds:
+          type: integer
+        groupBotEnabled:
+          type: boolean
+        ownerQq:
+          type: string
+        ownerSyncEnabled:
+          type: boolean
+
+    AssistantRecord:
+      type: object
+      required: [ts, petId, petName, permission, userText, status, reply, steps, ms]
+      properties:
+        ts:
+          type: integer
+          description: 毫秒时间戳
+        petId:
+          type: string
+        petName:
+          type: string
+          description: 宠物显示名（可能为空）
+        permission:
+          type: string
+          description: 执行时的权限档位
+        userText:
+          type: string
+          description: 用户当时的指令原文（截断到 500 字）
+        status:
+          type: string
+          enum: [ok, blocked, failed]
+        reply:
+          type: string
+          description: 给用户的最终回复（截断到 1000 字）；被拦 / 失败时是错误说明
+        steps:
+          type: array
+          items:
+            type: object
+            required: [name, args, ok, summary]
+            properties:
+              name:
+                type: string
+              args:
+                type: string
+                description: 参数摘要（正文只报长度不报内容）
+              ok:
+                type: boolean
+              summary:
+                type: string
+                description: 结果摘要，最多 200 字
+        ms:
+          type: integer
+        blockedTarget:
+          type: string
+          description: 被拦时的目标（仅在 status 为 blocked 时出现）
+
+    AssistantHistoryResponse:
+      type: object
+      required: [ok, total, limit, items]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        total:
+          type: integer
+        limit:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantRecord"
+
+    AssistantApproval:
+      type: object
+      required: [id, petId, tool, target, reason, message, createdAt]
+      properties:
+        id:
+          type: string
+        petId:
+          type: string
+        tool:
+          type: string
+          description: 被拦下的工具名
+        target:
+          type: string
+          description: 想动的目标（通常是一个路径）
+        reason:
+          type: string
+        message:
+          type: string
+        createdAt:
+          type: integer
+          description: 毫秒时间戳
+
+    AssistantApprovalsResponse:
+      type: object
+      required: [ok, workspace, items]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        workspace:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantApproval"
+
+    AssistantApprovalResult:
+      type: object
+      required: [ok, allowed]
+      properties:
+        ok:
+          type: boolean
+        allowed:
+          type: boolean
+        text:
+          type: string
+          description: 放行并重放成功时的回复正文（同时写进 `pets.<id>.say`）
+        reason:
+          type: string
+        message:
+          type: string
     PetConfigEntry:
       type: object
       description: |

@@ -11,12 +11,12 @@
  *
  * 【检查项】
  *   1. 必需文件是否存在（lib、类型声明、patch、对齐参数）
- *   2. 至少有待机动画的 thumb
+ *   2. 自带的角色素材包（assets/pet/*）齐全，且每份 config 的 idle 动画都能在
+ *      自己的 <前缀>-animation/ 里找到同名 webm
  *   3. 原始 1200×1200 母版不得进 npm 包（体积超限，应放 GitHub Releases）
  *   4. client.js 是官方 bundle 形态（__ModuleLoader__.load + exports.apply）
  *   5. package.json 声明了 dsh.bundle 和 dsh.client（否则装不上）
- *   6. 表情包图片确实随包发布（files 白名单含 assets/memes 且目录里有 png；
- *      配图功能只读包内 assets/memes，漏发即功能整体失效），并核对 memes 键与图片对齐
+ *   6. 表情包条件断言：assets/memes 有图时 files 必须含它（本包默认没有图）
  *   7. 包总大小 < 200MB（自设软上限，防误塞母版；npm 硬上限远更大）
  *
  * ============================================================================
@@ -89,9 +89,38 @@ for (const f of required) {
   existsSync(join(ROOT, f)) ? ok(`exists ${f}`) : fail(`missing ${f}`);
 }
 
-// ---- 2. 至少有待机动画（播放必需）——单一 webm 格式（浏览器 + 桌面模式共用）----
-const idleWebm = join(ROOT, 'assets', 'webm', '待机呼吸休闲.webm');
-existsSync(idleWebm) ? ok('idle webm present') : fail('missing 待机呼吸休闲.webm thumb');
+// ---- 2. 自带的角色素材包必须真在包里（装上去就是空桌面）----
+// 【2026-10-30 派生版】本包不再带 assets/webm（上游蓝毛小女仆那 106 个动作），
+// 两个角色全部走 pet pack：assets/pet/<前缀>-config.json + assets/pet/<前缀>-animation/*.webm。
+// host 侧 scanPetFiles 会把「包内 assets/pet」与「用户层 $DSH_HOME/dsh-pet/pet」合并读取，
+// 这里断言包内这一层确实存在、且每份 config 的 idle 动画能在自己的 animation 目录里找到文件
+// ——后者是关键：idle 名字写错时宿主只在运行时静默不播动画，发布前不查就发现不了。
+const packDir = join(ROOT, 'assets', 'pet');
+const packConfigs = existsSync(packDir) ? readdirSync(packDir).filter((n) => /^.+?-config\.(json|jsonc)$/.test(n)) : [];
+if (packConfigs.length > 0) ok(`pet packs present (${packConfigs.length}: ${packConfigs.join(', ')})`);
+else fail('no pet pack in assets/pet (装上去会是空桌面：没有 config 也没有动画)');
+const stripExt = (n) => n.replace(/\.[^.]+$/, '');
+for (const cfgName of packConfigs) {
+  const prefix = cfgName.replace(/-config\.(json|jsonc)$/, '');
+  const animDir = join(packDir, prefix + '-animation');
+  const webms = existsSync(animDir) ? readdirSync(animDir).filter((n) => n.endsWith('.webm')) : [];
+  if (webms.length === 0) {
+    fail(`pet pack ${prefix} has no webm in ${prefix}-animation/`);
+    continue;
+  }
+  try {
+    const conf = JSON.parse(stripJsonc(readFileSync(join(packDir, cfgName), 'utf8')));
+    const idle = Array.isArray(conf.animations?.idle) ? conf.animations.idle : [];
+    if (idle.length === 0) fail(`pet pack ${prefix} declares no animations.idle`);
+    const have = new Set(webms.map(stripExt));
+    const lost = idle.filter((n) => !have.has(n));
+    if (lost.length === 0)
+      ok(`pet pack ${prefix}: idle resolved (${idle.length}/${idle.length}, ${webms.length} webm)`);
+    else fail(`pet pack ${prefix}: idle 动画找不到文件 → ${lost.join('、')}`);
+  } catch (e) {
+    fail(`pet pack ${cfgName} parse error: ${e.message}`);
+  }
+}
 
 // ---- 3. 原始母版不得进 npm 包 ----
 // assets/ 根下若有 .webm 就是原始母版（播放素材在 assets/webm|mov 子目录）
@@ -120,15 +149,45 @@ else fail('package.json missing dsh.bundle.patch');
 if (pkg.dsh?.client?.platform === 'web') ok('dsh.client.web declared');
 else fail('package.json missing dsh.client platform web');
 
-// ---- 6. 表情包图片必须随包发布（配图功能的素材源） ----
+// ---- 5b. 商店截图：screenshots.json 里列的每张图都得存在，且都在 files 白名单里 ----
+// 坑与 memes 相同：prepare.js 会覆盖 package.json 的 files，漏了哪张，市场详情页就是
+// 一个破图占位。这份文件是可选的（没有就不算错），但一旦存在就必须自洽。
+const shotsPath = join(ROOT, 'screenshots.json');
+if (!existsSync(shotsPath)) {
+  ok('no screenshots.json (市场详情页回退到 README 抽图)');
+} else {
+  try {
+    const raw = readFileSync(shotsPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : (parsed.screenshots ?? []);
+    const bad = list.filter((p) => typeof p !== 'string' || p.startsWith('/') || p.includes('..'));
+    const missing = list.filter((p) => typeof p === 'string' && !existsSync(join(ROOT, p)));
+    const notInFiles = list.filter(
+      (p) => typeof p === 'string' && !(Array.isArray(pkg.files) && pkg.files.includes(p)),
+    );
+    if (bad.length) fail(`screenshots.json 有非法路径（不能以 / 开头、不能含 ..）：${bad.join(', ')}`);
+    else if (missing.length) fail(`screenshots.json 指向的图不存在：${missing.join(', ')}`);
+    else if (notInFiles.length) fail(`screenshots.json 的图不在 files 白名单里（会漏发）：${notInFiles.join(', ')}`);
+    else if (list.length < 1 || list.length > 8) fail(`screenshots.json 必须 1-8 张，实际 ${list.length} 张`);
+    else ok(`screenshots.json aligned (${list.length} 张，全部存在且在 files 里)`);
+  } catch (e) {
+    fail(`screenshots.json 解析失败：${e.message}`);
+  }
+}
+// ---- 6. 表情包：本包默认不带（assets/memes 已随派生版移除），带了就必须真发出去 ----
 // 坑：scripts/prepare.js 每次发布都会用**硬编码白名单覆盖** package.json 的 files，
 // 只在 package.json 里加一行是无效的 → 这里显式断言，防止再次静默漏发。
+// 【2026-10-30 派生版】上游的 27 张蓝鱼梗图已删除（它们属于上游角色，删角色就该删图）；
+// 因此这里改成条件断言：目录存在且有图 → 必须在 files 白名单里；都没有 → 只是「没配图功能」，放行。
 const memesDir = join(ROOT, 'assets', 'memes');
-if (Array.isArray(pkg.files) && pkg.files.includes('assets/memes')) ok('files includes assets/memes');
-else fail('package.json files must include assets/memes (meme images would not ship)');
 const memePngs = existsSync(memesDir) ? readdirSync(memesDir).filter((n) => n.endsWith('.png')) : [];
-if (memePngs.length > 0) ok(`meme images present (${memePngs.length} png)`);
-else fail('no png in assets/memes (whisper/chat 配图会整体失效)');
+if (memePngs.length === 0) {
+  ok('no assets/memes (配图功能关闭，config.jsonc 的 memes 应为空)');
+} else if (Array.isArray(pkg.files) && pkg.files.includes('assets/memes')) {
+  ok(`files includes assets/memes (${memePngs.length} png)`);
+} else {
+  fail('assets/memes 有图但 package.json files 没含 assets/memes（图会全部漏发）');
+}
 // memes 键 ↔ 图片文件对齐：缺图条目会被 host 静默剔除（设计如此，不阻断发布），
 // 但数字对不上值得发布前看一眼，故只提示
 try {
@@ -154,8 +213,11 @@ const walk = (dir) => {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, entry.name);
     if (entry.isDirectory()) {
-      // 跳过不会进 npm 包的目录
-      if (!['node_modules', '.git', 'scripts', 'step01', 'step02', 'step03', 'preview'].includes(entry.name)) walk(p);
+      // 跳过不会进 npm 包的目录。dist-app 是 electron-builder 的独立端产物（几百 MB），
+      // 既不在 package.json 的 files 白名单里，也不该算进「包体积」——否则打完独立端
+      // 再来 pack 插件就会误报 package too large。
+      const skip = ['node_modules', '.git', 'scripts', 'step01', 'step02', 'step03', 'preview', 'dist-app'];
+      if (!skip.includes(entry.name)) walk(p);
     } else if (!entry.name.endsWith('.map')) {
       // 打包产物 tarball（npm pack 遗留）不计入自查口径
       if (!entry.name.endsWith('.tgz')) total += statSync(p).size; // sourcemap 不计

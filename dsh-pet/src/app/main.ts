@@ -35,7 +35,11 @@ import { createFileLogger, setDefaultLogger } from '../host/log-file';
 import { createDisabledStandaloneAi, createStandaloneAi } from '../standalone/ai-provider';
 import { packageVersion } from '../standalone/check';
 import { createStandaloneContext, type RegisteredRoute } from '../standalone/context';
+import { readMobileConfig, writeMobileConfig, lanAddresses } from '../standalone/mobile-config';
+import { dropDevice, readTable, registerDevice, touchDevice } from '../standalone/paired-devices';
+import { ensureTlsMaterial } from '../standalone/tls-store';
 import { configPathsFor } from '../standalone/options';
+import { createPairing } from '../standalone/pairing';
 import { createRequestSecurity } from '../standalone/request-security';
 
 import { installDesktopAuth, type DesktopSession } from './desktop-auth';
@@ -118,8 +122,15 @@ async function boot(): Promise<void> {
   const routes: RegisteredRoute[] = [];
   let port = 0;
 
+  // 手机连接的启动期决策：**开启时**才把服务绑到 0.0.0.0（多一道防线 —— 即使远程判定
+  // 哪天写漏了，关着开关时进程根本没在对外监听）。运行中改开关只影响「要不要放行」，
+  // 不改绑定；从关到开需要重启应用，设置页会如实提示。
+  const mobile = readMobileConfig(dshHomeDir());
+  let mobileEnabled = mobile.enabled;
+  const pairing = createPairing();
+
   // 与 CLI 同一套安全模型：令牌只经「配置页地址的 #token=」递到浏览器，不进日志
-  const security = createRequestSecurity();
+  const security = createRequestSecurity({ remoteEnabled: () => mobileEnabled });
   // AI 设置读不出来（内容不合法 / ACL 太宽）不该让整个桌宠陪葬 —— 降级成「AI 不可用」。
   // 分发场景必踩：zip / robocopy 默认不保留 ACL，解压出来的 standalone-ai.json 一定带
   // BUILTIN\Users:(RX)，readAiSettings 会判 Unsafe settings permissions。见 createDisabledStandaloneAi。
@@ -139,10 +150,54 @@ async function boot(): Promise<void> {
     authenticatedUrl: security.authenticatedUrl,
   });
 
-  const server = await startRouter(routes, { security, ai, log, status, landingPage });
+  const server = await startRouter(routes, {
+    security,
+    ai,
+    log,
+    status,
+    landingPage,
+    pairing,
+    remoteEnabled: () => mobileEnabled,
+    bindHost: mobile.enabled ? '0.0.0.0' : '127.0.0.1',
+    // 对外一律 HTTPS（自签）。局域网 http:// 不是安全上下文，手机浏览器会
+    // 直接禁掉 getUserMedia 与 SpeechRecognition —— 语音功能就废了。
+    tls: () => ensureTlsMaterial(dshHomeDir(), lanAddresses(), log),
+    mobile: {
+      read: () => readMobileConfig(dshHomeDir()),
+      // 写盘后同步内存开关：放行判定每请求都要问一次，不能每次都读盘
+      write: (next) => {
+        writeMobileConfig(dshHomeDir(), next);
+        mobileEnabled = next.enabled;
+      },
+      lan: lanAddresses,
+      listeningWide: mobile.enabled,
+    },
+    /**
+     * 已配对手机登记表（2026-11-01）：接管判定的唯一依据，也是「配对设备管理」的读写口。
+     *
+     * <p>文件落在 `$DSH_HOME/dsh-pet/paired-devices.json`，与 mobile.json 同目录 —— 手机连接
+     * 的设置本来就该在同一个地方，用户要删/要移植时不用满盘找。
+     */
+    devices: {
+      read: () => readTable(dshHomeDir()),
+      register: (id, name) => registerDevice(dshHomeDir(), { id, name, at: Date.now() }),
+      touch: async (id, name) => {
+        await touchDevice(dshHomeDir(), { id, name, at: Date.now() });
+      },
+      drop: (id) => dropDevice(dshHomeDir(), id),
+    },
+  });
   port = server.port;
   const origin = `http://127.0.0.1:${port}`;
-  log(`本机服务 ${origin}`);
+  // 对外是**另一个** HTTPS 端口（与回环端口不同），日志里必须写对，
+  // 否则排查「手机连不上」时会照着错误的端口去试。
+  const lan = mobile.enabled ? lanAddresses()[0] : '';
+  log(
+    `本机服务 ${origin}` +
+      (mobile.enabled
+        ? `（手机连接已开启：https://${lan || '<未检测到局域网地址>'}:${server.mobilePort}/mobile/）`
+        : ''),
+  );
 
   // 先把「我自己就是应用」告诉插件，再 apply：apply 内部据此短路 spawn 与下载
   process.env.DSH_PET_IN_PROCESS = '1';

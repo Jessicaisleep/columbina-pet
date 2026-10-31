@@ -379,7 +379,10 @@ test('AI 设置读不出来时降级为空实现，绝不抛异常（否则整�
   assert.equal(pub.enabled, false);
   assert.equal(pub.hasKey, false);
   assert.equal('apiKey' in pub, false); // 公开视图不带明文密钥
-  assert.deepEqual(ai.listProviders().map((p) => p.id), ['standalone']);
+  assert.deepEqual(
+    ai.listProviders().map((p) => p.id),
+    ['standalone'],
+  );
 });
 
 test('降级实现的每个异步入口都返回结构化失败，不冒泡', async () => {

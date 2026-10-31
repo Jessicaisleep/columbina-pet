@@ -10,7 +10,7 @@ import { screenContextOf, type ScreenSnapshot } from './screen-context.ts';
 
 /** 造一个快照 */
 function snap(partial: Partial<ScreenSnapshot> = {}): ScreenSnapshot {
-  return { title: '', cls: '', pid: 0, text: '', pieces: 0, truncated: false, ms: 0, ...partial };
+  return { title: '', cls: '', pid: 0, text: '', pieces: 0, truncated: false, ms: 0, stale: false, ...partial };
 }
 
 test('screenContextOf：空快照 / 空文本 → 空串（调用方据此整段不追加）', () => {
