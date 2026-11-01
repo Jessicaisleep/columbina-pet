@@ -22,7 +22,7 @@
  *     （如余额周期读不到就按 1800、碎碎念按 300）；
  *   - **显式写了但非法**（类型/结构/白名单外）→ 告警 + 填内置默认值
  *     （同一 文件+字段 进程内只告警一次，避免每请求刷屏；保证返回绝不出现残缺/非法值）；
- *   - **例外：全局默认**（GLOBAL_DEFAULT_KEYS 那 10 个「用户级成本/偏好/环境/节奏」字段）——
+ *   - **例外：全局默认**（GLOBAL_DEFAULT_KEYS 里那批「用户级成本/偏好/环境/节奏」字段）——
  *     文件宠物条目的基座取**用户层**（main-config.jsonc）而不是内置默认，即"设置页改一次，
  *     所有宠物都生效"；种类文件仍可在自己顶层覆盖（写了就用自己那份）；
  *   - 身份字段例外（无默认可填）：id 必须存在、全局唯一（缺失/重复/非法/冲突 →
@@ -107,6 +107,10 @@ const GLOBAL_DEFAULT_KEYS = [
   'chatImageEnabled',
   'chatImageLimit',
   'chatMemoryRounds',
+  // 回话节奏（2026-11-01）：分条回复 + 合并静默窗口。都是「这个人想怎么被回话」的偏好，
+  // 跟某只宠物长什么样无关 —— 与 chatMemoryRounds 同类，所以也是用户级全局。
+  'chatSplitEnabled',
+  'chatMergeWindowMs',
   'memoryCompressEnabled',
   'memoryCompressRounds',
   'memoryKeepRounds',
@@ -537,6 +541,16 @@ function topFieldValid(key: string, value: unknown): boolean {
       const n = Number(value);
       return Number.isFinite(n) && n >= 0;
     }
+    case 'chatSplitEnabled':
+      // 分条回复开关（2026-11-01）：布尔。缺键按**开**处理（见 ./split-reply 的 splitEnabledOf）
+      return typeof value === 'boolean';
+    case 'chatMergeWindowMs': {
+      // 合并静默窗口（毫秒）：0 合法（= 关闭合并）；上限 3000——再长用户会以为程序卡住了。
+      // 与 proactiveChatSec 同口径：非有限数 / 越界一律拒，不静默夹紧
+      // （夹紧会让「填了 5000 却只生效 3000」变成无声的出入）。
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 && n <= 3000;
+    }
     case 'notificationsEnabled':
       return typeof value === 'boolean';
     case 'clickSoundEnabled':
@@ -672,6 +686,26 @@ function mergeEntry(
     if (!topFieldValid(key, own)) {
       warnOnce(`${label}:${key}`, `「${label}」的 ${key} 非法，已取默认值`);
       out[key] = base[key];
+      continue;
+    }
+    out[key] = own;
+  }
+  // 内置默认里**没写**的全局键要单独补一遍。
+  //
+  // 上面那圈只遍历 base 的键，于是「用户层写了、内置默认没列」的字段一律看不见——
+  // 设置页保存成功、磁盘上也有值，读出来却永远是代码里的硬默认。2026-11-01 实测：
+  // memoryRecallK 存成 4，/assistant/settings 读回 3（`recallCount` 的缺省值）；
+  // 群聊那五个键（groupBotEnabled / groupMemoryScope / groupMemoryRecentN / ownerQq /
+  // ownerSyncEnabled）与记忆压缩三个键同理，一整批设置都是「存得进去、不生效」。
+  //
+  // 全局键是用户级偏好，它的有效性不该取决于内置默认里有没有写这一行 —— 所以在这里按
+  // GLOBAL_DEFAULT_KEYS 再走一遍，base 没有就在 out 里补上。非法值仍然只告警不采信。
+  for (const key of GLOBAL_DEFAULT_KEYS) {
+    if (key in out) continue;
+    const own = overlay ? overlay[key] : undefined;
+    if (own === undefined) continue;
+    if (!topFieldValid(key, own)) {
+      warnOnce(`${label}:${key}`, `「${label}」的 ${key} 非法，已忽略`);
       continue;
     }
     out[key] = own;
@@ -1059,6 +1093,11 @@ export function saveUserConfig(
   // 与 chatMemoryRounds 同一套语义——传了就校验后进白名单，没传则走下面的透传保留。
   const cil = o.chatImageLimit;
   if (cil !== undefined && !topFieldValid('chatImageLimit', cil)) return null;
+  // 回话节奏两件套（2026-11-01，用户要求「像真人那样分多条说」）：同一个白名单口径。
+  const cspl = o.chatSplitEnabled;
+  if (cspl !== undefined && !topFieldValid('chatSplitEnabled', cspl)) return null;
+  const cmw = o.chatMergeWindowMs;
+  if (cmw !== undefined && !topFieldValid('chatMergeWindowMs', cmw)) return null;
   // 记忆压缩三个字段（开关 + 两个阈值；设置页「AI 模型与对话上下文」区写的就是它们）：
   // 与 chatMemoryRounds 同一套语义——传了就校验后进白名单，没传则走下面的透传保留。
   // 校验复用读取侧的 topFieldValid，读写同一份规则（尤其"keep ≥ compress 允许写、消费端兜底"
@@ -1123,6 +1162,9 @@ export function saveUserConfig(
   // 数值归一化落盘：请求体传 "9" 也存成 9（与读取侧 topFieldValid 的 Number() 口径一致）
   if (cmr !== undefined) outConfig.chatMemoryRounds = Number(cmr);
   if (cil !== undefined) outConfig.chatImageLimit = Number(cil);
+  // 回话节奏：开关原样存布尔，窗口归一化成数字（请求体传 "800" 也存成 800）
+  if (cspl !== undefined) outConfig.chatSplitEnabled = cspl;
+  if (cmw !== undefined) outConfig.chatMergeWindowMs = Number(cmw);
   // 记忆压缩：开关原样存布尔，两个阈值归一化成数字（请求体传 "20" 也存成 20）
   if (mce !== undefined) outConfig.memoryCompressEnabled = mce;
   if (mcr !== undefined) outConfig.memoryCompressRounds = Number(mcr);
@@ -1174,6 +1216,8 @@ export function saveUserConfig(
   if (cm !== undefined) bodyOwned.add('chatModel');
   if (cmr !== undefined) bodyOwned.add('chatMemoryRounds');
   if (cil !== undefined) bodyOwned.add('chatImageLimit');
+  if (cspl !== undefined) bodyOwned.add('chatSplitEnabled');
+  if (cmw !== undefined) bodyOwned.add('chatMergeWindowMs');
   if (mce !== undefined) bodyOwned.add('memoryCompressEnabled');
   if (mcr !== undefined) bodyOwned.add('memoryCompressRounds');
   if (mkr !== undefined) bodyOwned.add('memoryKeepRounds');

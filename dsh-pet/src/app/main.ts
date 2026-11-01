@@ -35,6 +35,7 @@ import { createFileLogger, setDefaultLogger } from '../host/log-file';
 import { createDisabledStandaloneAi, createStandaloneAi } from '../standalone/ai-provider';
 import { packageVersion } from '../standalone/check';
 import { createStandaloneContext, type RegisteredRoute } from '../standalone/context';
+import { readHostId } from '../standalone/host-identity';
 import { readMobileConfig, writeMobileConfig, lanAddresses } from '../standalone/mobile-config';
 import { dropDevice, readTable, registerDevice, touchDevice } from '../standalone/paired-devices';
 import { ensureTlsMaterial } from '../standalone/tls-store';
@@ -157,6 +158,9 @@ async function boot(): Promise<void> {
     status,
     landingPage,
     pairing,
+    // 这台电脑的长期身份（host-id 文件）：手机靠它区分「插件端 2 只」与「独立端 3 只」
+    // 两条连接。缺了也不致命 —— 配对照样成功，只是手机改按地址记。
+    hostId: () => readHostId(dshHomeDir()),
     remoteEnabled: () => mobileEnabled,
     bindHost: mobile.enabled ? '0.0.0.0' : '127.0.0.1',
     // 对外一律 HTTPS（自签）。局域网 http:// 不是安全上下文，手机浏览器会

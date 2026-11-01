@@ -21,7 +21,10 @@ show('idle', a.idle);
 show('turn', a.turn);
 show('drag', a.drag);
 show('clicks', a.clicks);
-show('moves.actions', a.moves.actions.map((x) => x.name));
+show(
+  'moves.actions',
+  a.moves.actions.map((x) => x.name),
+);
 show('events.balance', a.events.balance);
 for (const cat of a.categories) show(`category[${cat.id} w=${cat.weight}]`, cat.actions);
 console.log('weights:', JSON.stringify(c.animationWeights));

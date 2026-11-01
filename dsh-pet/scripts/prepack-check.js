@@ -98,7 +98,15 @@ for (const f of required) {
 const packDir = join(ROOT, 'assets', 'pet');
 const packConfigs = existsSync(packDir) ? readdirSync(packDir).filter((n) => /^.+?-config\.(json|jsonc)$/.test(n)) : [];
 if (packConfigs.length > 0) ok(`pet packs present (${packConfigs.length}: ${packConfigs.join(', ')})`);
-else fail('no pet pack in assets/pet (装上去会是空桌面：没有 config 也没有动画)');
+else {
+  // 派生出来的独立端仓库（columbina-pet）不带 assets/pet：它的角色素材就是 assets/webm 下
+  // 那套蓝毛主体动画（宠物定义在用户层 main-config.jsonc / 包内 config.jsonc 的动画池里）。
+  // 两个仓库共用这一份脚本，所以这里认「扁平 webm 目录」也算有素材，否则独立端每次都被判成空桌面。
+  const flatDir = join(ROOT, 'assets', 'webm');
+  const flatWebms = existsSync(flatDir) ? readdirSync(flatDir).filter((n) => n.endsWith('.webm')) : [];
+  if (flatWebms.length > 0) ok(`no pet pack dir; flat assets/webm present (${flatWebms.length} webm)`);
+  else fail('no pet pack in assets/pet (装上去会是空桌面：没有 config 也没有动画)');
+}
 const stripExt = (n) => n.replace(/\.[^.]+$/, '');
 for (const cfgName of packConfigs) {
   const prefix = cfgName.replace(/-config\.(json|jsonc)$/, '');

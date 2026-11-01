@@ -3,7 +3,10 @@
   "compilerOptions": {
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    // 测试跑在 Node 24 上：Array.prototype.at / toSorted 运行时都存在，
+    // 主 tsconfig 是 ES2020 目标（要兼容 Electron 旧运行时），测试配置这里单独抬到 ES2023。
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
   "include": ["src/**/*.test.ts"],
   "exclude": []

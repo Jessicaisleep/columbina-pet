@@ -33,6 +33,7 @@ import { defaultLog } from './log-file';
 import { extractChatImage, memeCatalog, type MemeEntry } from './memes';
 import { extractAiTags, tagInstruction, type MemoryTags } from './memory-tags';
 import { modelCandidates, modelLabel, type ModelRef } from './model-selection';
+import { splitInstruction } from './split-reply';
 
 /** 生成失败原因（与 shared/whisper.ts 的 WhisperState 失败分支同构） */
 export type ChatGenerateResult =
@@ -106,6 +107,10 @@ function imageInstruction(pool: MemeEntry[]): string {
  * @param userText 用户刚输入的话
  * @param pool 表情包候选池（开启对话配图时传入；空/缺省 = 纯文本，指令与解析都不介入）
  * @param preferred 条目配置单独指定的模型（chatModel）；缺省 / 留空 = 只用当前对话的模型
+ * @param wantTags 是否附打标指令（记忆标签；群聊/摘要等场合可关）
+ * @param split 是否附「分条说话」指令（2026-11-01）：开启后模型会用 `[分]` 隔开几条短句，
+ *   host 用 `./split-reply` 切开逐条发。只影响**指令**，切分与落盘由调用方做
+ *   （同一份指令也要给主动聊天用，所以不在这里切）。
  * @returns 回复文本（+ 命中池内的配图名），或结构化失败（provider 缺失 / 生成错误）
  */
 export async function generateChat(
@@ -116,6 +121,7 @@ export async function generateChat(
   pool: MemeEntry[] = [],
   preferred?: ModelRef,
   wantTags = true,
+  split = false,
 ): Promise<ChatGenerateResult> {
   // 候选链：配置的模型优先 → 当前对话的模型兜底（chatModel 留空时链上只有后者，与旧版逐字一致）
   const candidates = modelCandidates(ctx, preferred);
@@ -131,7 +137,7 @@ export async function generateChat(
   // 兜底文案与失败分支同源，避免两处字面量漂移
   let last: ChatGenerateResult = { ok: false, reason: 'generate-error', message: noTextReason(undefined) };
   for (const [i, sel] of candidates.entries()) {
-    const result = await generateWith(ctx, llm, sel, system, history, userText, pool, wantTags);
+    const result = await generateWith(ctx, llm, sel, system, history, userText, pool, wantTags, split);
     if (result.ok) return result;
     last = result;
     // 回落要留痕：配的模型没生效时能在日志里看到原因（否则"我明明配了 A，怎么还是用 B"没法查）
@@ -269,6 +275,7 @@ async function generateWith(
   userText: string,
   pool: MemeEntry[],
   wantTags: boolean,
+  split: boolean,
 ): Promise<ChatGenerateResult> {
   // 历史 → dsh-llm 消息：user 经 createUserMessage（plugin 来源），assistant 经 createAssistantMessage
   const historyMessages = history.map((m) =>
@@ -295,6 +302,9 @@ async function generateWith(
   let userBody = userText;
   if (wantImage) userBody += imageInstruction(pool);
   if (wantTags) userBody += tagInstruction();
+  // 分条指令（2026-11-01）：与上面两条同一位置（紧邻回答处）。关掉时正文与旧行为逐字一致，
+  // 「分条回复」这个开关因此是**纯增量**：关掉 = 回到一句话一条。
+  if (split) userBody += splitInstruction();
   const options = {
     provider: sel.provider,
     model: sel.model,

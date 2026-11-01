@@ -16,7 +16,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -56,7 +56,11 @@ describe('flattenConfigPets —— 成品 → 渲染列表的唯一填充点', (
       assert.deepEqual(merged.main?.pets, [], '内置默认的 pets 应为空（宠物由 assets/pet/* 提供）');
       // ② 真正的宠物来自包内 pet pack（条目名 columbina / nahida，对 main 而言都是 extra）。
       const pets = flattenConfigPets(merged);
-      assert.ok(pets.length > 0, '包内 pet pack 应至少有一只宠物');
+      // 「包内至少要有一只」只对**带 assets/pet 的仓库**成立：派生出来的独立端仓库
+      // （columbina-pet）把角色素材放在 assets/webm + 用户层 pet 目录，没有 assets/pet，
+      // 那里这条断言会误报，而本文件要两端同源，所以按实际是否存在 pack 目录决定强度。
+      const hasPacks = existsSync(fileURLToPath(new URL('../../assets/pet', import.meta.url)));
+      if (hasPacks) assert.ok(pets.length > 0, '包内 pet pack 应至少有一只宠物');
       for (const p of pets) {
         for (const field of ENTRY_FIELDS) {
           assert.ok(p[field] !== undefined, `宠物「${String(p.id)}」缺条目级字段 ${field}`);

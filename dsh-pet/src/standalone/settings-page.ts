@@ -126,6 +126,14 @@ export const settingsPage = `<!doctype html>
 <p class="hint" id="proactive-group-hint">群聊模式下，它会挑你<b>最近聊过</b>的那个群开口（三个月没动静的老群不会被突然问候）。群里只写进该群的记忆，不会污染你和它的私聊。<b>注意</b>：本机没有往 QQ 群发消息的通道，所以群聊里的主动发言只会出现在这台电脑的气泡里，需要你的群机器人自己来取。</p>
 <div class="test-row"><button id="proactive-save" type="button">保存主动聊天设置</button><button id="proactive-test" type="button">现在试一句</button><span id="proactive-result" class="test-result" role="status" aria-live="polite"></span></div>
 </fieldset>
+<fieldset><legend>回话节奏（像真人那样分几条说）</legend>
+<p class="hint" id="rhythm-lead">真人发消息很少把一长段话塞进一条：说一句、停一下、再补一句。打开下面的开关，它回答时会自己把话拆成 <b>1–3 条短句</b>，一条一条发出来（几个气泡先后出现，不是一次性刷出一大段）。</p>
+<label class="check"><input id="chatSplitEnabled" type="checkbox" aria-describedby="rhythm-lead rhythm-hint">分条回复（把一段话拆成几条短句逐条发）</label>
+<div class="pair"><div><label for="chatMergeWindowMs">合并窗口（毫秒，0–3000，0 = 不合并）</label><input id="chatMergeWindowMs" type="number" min="0" max="3000" step="100" value="800" aria-describedby="rhythm-hint"></div></div>
+<p class="hint" id="rhythm-hint">合并窗口管的是<b>你这边</b>：你连着发好几条时，它会先攒这一小会儿（默认 800 毫秒）再一起理解、<b>只回一次</b>，不会一句一回把话说碎。填 0 = 关掉合并（发一条回一条）。代价：窗口越长，它开口越晚（最多晚这么久）。</p>
+<p class="notice">两条硬保护不在这里配：一批最多合并 6 条、从你第一条起最多等 5 秒——一直打字也会回你。</p>
+<div class="test-row"><button id="rhythm-save" type="button">保存回话节奏</button><span id="rhythm-result" class="test-result" role="status" aria-live="polite"></span></div>
+</fieldset>
 <footer><p id="privacy">所有配置与密钥仅保存在当前机器。<br>关闭 AI 后，桌宠仍可正常显示、移动与互动。</p><button id="save" type="submit" disabled>保存到本机</button></footer>
 <p id="status" role="status" aria-live="polite">正在读取本机设置…</p>
 </form></div>
@@ -1025,6 +1033,11 @@ export const settingsScript = `
   const proactSave = get('proactive-save');
   const proactTest = get('proactive-test');
   const proactResult = get('proactive-result');
+  // 回话节奏（2026-11-01，用户要求「像真人那样分多条说」）
+  const rhythmSplit = get('chatSplitEnabled');
+  const rhythmMerge = get('chatMergeWindowMs');
+  const rhythmSave = get('rhythm-save');
+  const rhythmResult = get('rhythm-result');
   const workspaceList = get('workspace-list');
   const approvalsBox = get('approvals');
   const approvalList = get('approval-list');
@@ -1058,6 +1071,9 @@ export const settingsScript = `
       // 主动聊天：缺键给默认（关 / 1800s），与后端 proactiveEnabled / proactivePeriodSec 同口径
       proactBox.checked = data.proactiveChatEnabled === true;
       proactSec.value = typeof data.proactiveChatSec === 'number' ? data.proactiveChatSec : 1800;
+      // 回话节奏：缺键给默认（开 / 800ms），与后端 splitEnabledOf / mergeWindowMsOf 同口径
+      rhythmSplit.checked = data.chatSplitEnabled !== false;
+      rhythmMerge.value = typeof data.chatMergeWindowMs === 'number' ? data.chatMergeWindowMs : 800;
       syncMemoryVisibility();
       const pets2 = data.pets || [];
       workspaceList.textContent = pets2.length
@@ -1172,6 +1188,30 @@ export const settingsScript = `
       );
     } catch (error) { note(proactResult, error.message, 'test-error'); }
     finally { proactSave.disabled = false; }
+  });
+  // ---- 回话节奏（2026-11-01，分条回复 + 合并窗口）----
+  // 与主动聊天同一个 PATCH 端点（/assistant/settings），两个字段都在白名单里。
+  // 窗口在前端先校一遍：后端 topFieldValid 越界会整包拒（bad-request），
+  // 那时用户只看到「提交的值不合法」，不知道是哪个输入错了。
+  rhythmSave.addEventListener('click', async () => {
+    rhythmSave.disabled = true;
+    note(rhythmResult, '正在保存…');
+    try {
+      const ms = Number(rhythmMerge.value);
+      if (!Number.isFinite(ms) || ms < 0 || ms > 3000) {
+        throw new Error('合并窗口必须是 0 到 3000 毫秒之间（0 = 不合并）');
+      }
+      const data = await petRequest('/dsh-pet-7340/assistant/settings', 'POST', {
+        chatSplitEnabled: rhythmSplit.checked,
+        chatMergeWindowMs: Math.floor(ms),
+      });
+      if (!data.ok) throw new Error(data.message || data.reason || '保存失败');
+      const parts = [];
+      parts.push(rhythmSplit.checked ? '她会把回答拆成几条短句逐条发' : '她一次只说一条（不拆）');
+      parts.push(ms === 0 ? '你连发几条时她一句一回，不做合并' : '你连发几条时她先攒 ' + Math.floor(ms) + ' 毫秒再一起回');
+      note(rhythmResult, '已保存。' + parts.join('；') + '。', 'test-success');
+    } catch (error) { note(rhythmResult, error.message, 'test-error'); }
+    finally { rhythmSave.disabled = false; }
   });
   // 「现在试一句」：走 POST /proactive（force 绕过间隔与开关，但仍守住"她还欠一个回复"）。
   // 这个按钮的价值在于**让用户不必等半小时才知道它会不会说话**——否则「开了但没反应」
@@ -1390,5 +1430,68 @@ export const settingsScript = `
     } catch (error) { note(runsResult, error.message, 'test-error'); }
     finally { runsClear.disabled = false; }
   });
+
+  // ---------- 另一端改了设置，这里自动跟过来（2026-11-01） ----------
+  //
+  // 手机端也能改人设、记忆、回话节奏了（见 ./mobile-settings），改的是**同一份**配置。
+  // 那条路走完，宿主会写 state.writeSection('config', {})；手机在长轮询里看得到，
+  // 这一页没有长轮询，就用一条低频对账把它补上：每 4 秒比一次「值变没变」，变了才重新
+  // 载入。三条自我约束：
+  //   ① 值没变什么都不做（自己的保存也会落到同一个值，不会自己覆盖自己）；
+  //   ② 用户手上有焦点在输入框里 → 只提示、不覆盖：手机上点一下保存，不该把这里写了一半
+  //      的人设冲掉；
+  //   ③ 页面不可见时不轮询（后台开的设置页没必要一直问）。
+  const syncBar = document.createElement('p');
+  syncBar.className = 'hint';
+  syncBar.hidden = true;
+  // 这条横幅只是提示用：某些环境（单测里那个没有 body 的 vm，见本文件里同样的 setInterval 守卫）
+  // 没有 document.body，插不进去也不能让整页脚本挂掉 —— 少一条提示远好过整页白屏。
+  if (document.body && typeof document.body.insertBefore === 'function') {
+    document.body.insertBefore(syncBar, document.body.firstChild);
+  }
+  function showSyncBar(text) {
+    syncBar.textContent = text || '';
+    syncBar.hidden = !text;
+  }
+  function remoteFingerprint(st, persona) {
+    return [
+      st.chatMemoryRounds, st.memoryRecallK, st.groupBotEnabled, st.groupMemoryScope, st.groupMemoryRecentN,
+      st.ownerSyncEnabled, st.ownerQq, st.chatSplitEnabled, st.chatMergeWindowMs,
+      st.proactiveChatEnabled, st.proactiveChatSec, st.screenContextEnabled,
+      st.assistantEnabled, st.assistantPermission, st.assistantNetworkEnabled,
+      persona,
+      // 分隔符用控制字符：人设正文是自己写的，任何可打印字符都可能出现在里面，
+      // 用 '|' 之类做分隔会有一天把两段不同的东西拼成同一个指纹（→ 改了指纹没变→不同步）。
+    ].join('\\u0001');
+  }
+  function editingNow() {
+    const el = document.activeElement;
+    if (!el || el === document.body) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+  let remoteFp = '';
+  async function pollRemoteChanges() {
+    if (document.hidden) return;
+    try {
+      const st = await petRequest('/dsh-pet-7340/assistant/settings');
+      const per = await petRequest('/dsh-pet-7340/pet-persona?pet=' + encodeURIComponent(petSelect.value));
+      const fp = remoteFingerprint(st, per.persona || '');
+      if (remoteFp === '') { remoteFp = fp; return; } // 首轮只记基线，不覆盖刚载入的内容
+      if (fp === remoteFp) return;
+      if (editingNow()) {
+        showSyncBar('另一端改了设置。你正在编辑，所以这里没有自动覆盖 —— 想让这里也变成最新的，先点走输入框（或刷新页面）。');
+        return;
+      }
+      remoteFp = fp;
+      personaBox.value = per.persona || '';
+      syncCount();
+      await loadAssistantSettings();
+      showSyncBar('另一端（比如手机）改了设置，这里已自动同步过来。');
+    } catch {
+      // 对账失败什么都不做：这是后台心跳，报错弹窗会盖住用户正在做的事。
+    }
+  }
+  if (typeof setInterval === 'function') setInterval(() => { void pollRemoteChanges(); }, 4000);
 })();
 `;

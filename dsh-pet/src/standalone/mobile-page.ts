@@ -11,6 +11,10 @@
  *
  * 与 settings-page 一样拆成 page/style/script 三段：宿主给它们各自的 content-type，
  * 页面里不写内联 style/script，CSP 就不必开 unsafe-inline。
+ *
+ * 设置屏（2026-11-01，用户要求「手机端也能改人设、记忆等设置，一端改完另一端自动同步」）
+ * 三段字符串直接写在下面（不拆到别的模块：build-www.mjs 用 Node 直接 import 本文件，
+ * 而 Node 的 ESM 解析不补扩展名，跨文件的相对导入会在打包那一步炸掉）。
  */
 
 export const mobilePage = `<!doctype html>
@@ -45,9 +49,20 @@ export const mobilePage = `<!doctype html>
     <header class="bar">
       <span id="pet-name">桌宠</span>
       <span id="conn-state" class="dot" title="连接状态"></span>
+      <button id="pick-btn" type="button" class="link">切换</button>
+      <button id="set-btn" type="button" class="link">设置</button>
       <button id="disconnect" type="button" class="link">断开</button>
     </header>
     <p id="tip" class="tipbar is-hidden"></p>
+    <!-- 切换面板（2026-11-01）：上半是**这台电脑**上的宠物，下半是**配对过的电脑**。
+         两块都要有：宠物决定你眼前是哪只，宿主决定数据来自哪一份（插件端 2 只 / 独立端 3 只）。 -->
+    <div id="picker" class="picker is-hidden">
+      <div class="phead">这台电脑上的宠物</div>
+      <div id="pick-pets" class="plist"></div>
+      <div class="phead">连哪台电脑</div>
+      <div id="pick-hosts" class="plist"></div>
+      <div class="prow"><button id="pick-add" type="button" class="nbtn">＋ 连另一台电脑</button><button id="pick-close" type="button" class="nbtn">收起</button></div>
+    </div>
     <div id="stage" class="stage">
       <div id="bubble" class="bubble is-hidden"><span id="bubble-tag" class="btag"></span><span id="bubble-text"></span></div>
       <div id="pet" class="pet"></div>
@@ -74,6 +89,78 @@ export const mobilePage = `<!doctype html>
       <input id="text" type="text" autocomplete="off" placeholder="说点什么…" maxlength="2000">
       <button id="send" type="submit">发送</button>
     </form>
+  </section>
+
+  <section id="setts" class="screen is-hidden">
+    <header class="bar">
+      <button id="set-back" type="button" class="link">返回</button>
+      <span id="set-title">设置</span>
+      <span id="set-state" class="dot" title="同步状态"></span>
+    </header>
+    <p id="set-sync" class="tipbar is-hidden"></p>
+    <div class="sscroll">
+      <h2 class="sh">这只宠物的人设</h2>
+      <p class="shint">这段会作为她说话的第一段设定。留空 = 用电脑上这只宠物的默认人设。
+        改的是电脑上那一份，改完两端一致。<strong>不设字数上限</strong>，代价是每次说话多花相应 token。</p>
+      <textarea id="set-persona" rows="8" spellcheck="false" placeholder="例：你是蓝毛小女仆，说话慢半拍，喜欢用短句，偶尔有点小坏心思。"></textarea>
+      <p id="set-persona-note" class="shint"></p>
+
+      <h2 class="sh">记忆</h2>
+      <div class="srow2">
+        <div><label for="set-rounds">带多少轮对话</label>
+          <input id="set-rounds" type="number" min="0" max="200" step="1" inputmode="numeric"></div>
+        <div><label for="set-recall">每次回捞往事</label>
+          <input id="set-recall" type="number" min="0" max="50" step="1" inputmode="numeric"></div>
+      </div>
+      <p class="shint">轮数是「每次说话时把最近多少轮原始对话带上」，回捞是「按当前话题从往事里翻几条」。都是 0 = 不带。</p>
+      <label class="scheck"><input id="set-group" type="checkbox">群聊机器人（关掉 = 纯单人桌宠）</label>
+      <div id="set-group-block">
+        <div class="srow2">
+          <div><label for="set-scope">群成员记忆</label>
+            <select id="set-scope">
+              <option value="everyone">记得群里每个人</option>
+              <option value="recent">只记最近 N 个</option>
+            </select></div>
+          <div><label for="set-recentn">N（1–100）</label>
+            <input id="set-recentn" type="number" min="1" max="100" step="1" inputmode="numeric"></div>
+        </div>
+        <label class="scheck"><input id="set-ownersync" type="checkbox">把我在群里的发言也记进单人记忆</label>
+        <div class="srow2"><div><label for="set-ownerqq">我的 QQ 号</label>
+          <input id="set-ownerqq" type="text" inputmode="numeric" autocomplete="off" placeholder="例如 100012345"></div></div>
+      </div>
+
+      <h2 class="sh">回话节奏</h2>
+      <label class="scheck"><input id="set-split" type="checkbox">分条回复（拆成几条短句逐条发）</label>
+      <div class="srow2"><div><label for="set-merge">合并窗口（毫秒，0–3000）</label>
+        <input id="set-merge" type="number" min="0" max="3000" step="100" inputmode="numeric"></div></div>
+      <p class="shint">合并窗口 = 你连发几条时她先等这么久、攒一起理解再回。0 = 不合并（一句一回）。
+        窗口越长越像真人，但回复也会相应晚这么久。默认 800。</p>
+
+      <h2 class="sh">主动聊天</h2>
+      <label class="scheck"><input id="set-proactive" type="checkbox">她会自己先开口找你</label>
+      <div class="srow2"><div><label for="set-prosec">间隔（秒，120–86400）</label>
+        <input id="set-prosec" type="number" min="120" max="86400" step="60" inputmode="numeric"></div></div>
+      <p class="shint">每只宠物各算各的。这里和「碎碎念」不是一个开关：碎碎念是自言自语，不写进对话。</p>
+
+      <h2 class="sh">读屏与助手</h2>
+      <label class="scheck"><input id="set-screen" type="checkbox">说话前读一眼我的屏幕</label>
+      <label class="scheck"><input id="set-assistant" type="checkbox">允许她在对话里动手（在你的工作区里读写文件）</label>
+      <div class="srow2">
+        <div><label for="set-perm">动手权限</label>
+          <select id="set-perm">
+            <option value="readonly">只读</option>
+            <option value="workspace">工作区内可写</option>
+            <option value="full">完全</option>
+          </select></div>
+      </div>
+      <label class="scheck"><input id="set-net" type="checkbox">允许联网</label>
+
+      <div class="srow"><button id="set-save" class="nbtn primary" type="button">保存设置</button></div>
+      <p id="set-result" class="msg"></p>
+      <p class="shint">配对设备管理只在电脑上做——「哪些手机能连进来」得由坐在电脑前的人决定，
+        这台手机上不提供入口。</p>
+      <p class="shint" id="set-ver"></p>
+    </div>
   </section>
 </div>
 </body></html>`;
@@ -107,6 +194,21 @@ button.link{background:none;color:#9aa6b8;font-weight:400;padding:6px 8px;font-s
 .dot{width:9px;height:9px;border-radius:50%;background:#4b5563}
 .dot.on{background:#34d399}
 .dot.off{background:#ef4444}
+/* 切换面板（2026-11-01）：不盖浮层，直接插在顶部提示条下面把内容挤下去 ——
+   手机上「盖住聊天区」的面板容易被当成弹窗误关，插在流里反而一眼看懂这是设置区。 */
+.picker{padding:2px 0 10px;background:#121822;border-bottom:1px solid #1e2530}
+.phead{padding:10px 14px 2px;font-size:12px;color:#7f8ea6;letter-spacing:.3px}
+.plist{display:flex;flex-direction:column}
+.pitem{display:flex;align-items:center;gap:8px;width:100%;padding:11px 14px;border:0;border-top:1px solid #1a212c;
+  border-radius:0;background:none;color:#e8ecf3;font-size:14px;font-weight:400;text-align:left;line-height:1.3}
+.pitem .pname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pitem .psub{flex:0 0 auto;font-size:12px;color:#7f8ea6}
+.pitem.on{color:#7ee0a8}
+.pitem.on .psub{color:#7ee0a8}
+.pitem .pdel{flex:0 0 auto;padding:4px 10px;border-radius:8px;background:#2a3444;color:#ff9a9a;font-size:12px}
+.pempty{padding:12px 14px;font-size:13px;color:#7f8ea6}
+.prow{display:flex;gap:8px;padding:12px 14px 0}
+.prow .nbtn{flex:1}
 .stage{position:relative;height:34vh;min-height:180px;max-height:300px;display:flex;align-items:flex-end;justify-content:center;
   background:radial-gradient(120% 80% at 50% 100%,#1b2330 0%,#0f1218 70%);overflow:hidden}
 /* 顶部提示条：发消息前同步慢（>1 秒）、或某次操作失败时在这里说人话。 */
@@ -156,10 +258,43 @@ button.link{background:none;color:#9aa6b8;font-weight:400;padding:6px 8px;font-s
 .nlabel{flex:0 0 auto;font-size:13px;color:#c8d2e0}
 .nsub{flex:1;font-size:12px;color:#7f8ea6;text-align:right}
 .nbtn{flex:0 0 auto;padding:6px 12px;font-size:13px;border-radius:8px;background:#2a3444}
-.nbtn.on{background:#1f7a4d}`;
+.nbtn.on{background:#1f7a4d}
+.sh{margin:20px 14px 6px;font-size:13px;font-weight:600;color:#9fb0c7;letter-spacing:.3px}
+.shint{margin:0 14px 8px;font-size:12px;line-height:1.6;color:#7f8ea6}
+.sscroll{flex:1;min-height:0;overflow-y:auto;padding-bottom:28px;-webkit-overflow-scrolling:touch}
+#setts .bar{gap:10px}
+#set-title{flex:1;font-weight:600}
+.sscroll textarea,.sscroll input,.sscroll select{width:100%;margin:0 0 4px;padding:10px 12px;border:1px solid #26303e;
+  border-radius:10px;background:#151b25;color:#e8ecf3;font:14px/1.55 inherit;-webkit-appearance:none}
+.sscroll textarea{margin:0 14px 6px;width:calc(100% - 28px);resize:vertical;min-height:120px;font-size:14px}
+.sscroll select{appearance:none}
+.sscroll label{display:block;font-size:12px;color:#7f8ea6;margin:0 0 4px}
+.srow2{display:flex;gap:10px;padding:0 14px}
+.srow2>div{flex:1;min-width:0}
+/* 勾选行：.sscroll label 那条 display:block 会把这里的 flex 顶掉（它多一个元素选择器，
+   优先级更高），结果复选框和文字叠在一起 —— 截图里「分条回复」的框压着第一个字。
+   所以选择器写成 .sscroll label.scheck，比它多一个类；再把这行 input 的 padding /
+   border 清掉（.sscroll input 那条给所有输入框加了 10px 12px 内边距，会把 18px 的
+   复选框撑变形）。 */
+.sscroll label.scheck{display:flex;align-items:center;gap:10px;margin:10px 14px;font-size:14px;color:#e8ecf3}
+.sscroll label.scheck input{width:18px;height:18px;flex:0 0 auto;margin:0;padding:0;border:0;background:none;-webkit-appearance:checkbox;appearance:auto}
+.srow{display:flex;gap:10px;padding:16px 14px 0}
+.srow .nbtn{flex:1;padding:12px;font-size:15px}
+.nbtn.primary{background:#1f7a4d;color:#eafff3}
+#set-group-block.is-hidden{display:none}
+#setts .msg{margin:8px 14px 0}
+`;
 
 export const mobileScript = `'use strict';
 (function(){
+  // 多宿主（2026-11-01，用户原话：「手机端可以同时配对两者，但是一次只能使用一份数据，
+  // 玩家自己选独立端或者插件端」）：
+  //   LS_HOSTS  = 配对过的电脑列表 [{id,host,token,label,pets,at}]，id 是电脑自报的 hostId；
+  //   LS_ACTIVE = 当前正在用的那台。
+  // 一台手机可能配过两台电脑（插件端 2 只 / 独立端 3 只），两边的宠物、对话、离线队列
+  // **绝不能混**：所以宠物选择、本地副本、离线队列、拖动位置一律按宿主 id 分键（见 pk）。
+  var LS_HOSTS='dshpet.hosts', LS_ACTIVE='dshpet.active';
+  // 老版本的三个键：只在启动时读一次做迁移，别处不再写。
   var LS_HOST='dshpet.host', LS_TOKEN='dshpet.token', LS_PET='dshpet.pet';
   var LS_DEV='dshpet.device', LS_DEVNAME='dshpet.deviceName';
   // 离线三件套（2026-11-01，用户拍板「不在同一 WIFI 只有手机能写，回来是追加」）：
@@ -169,13 +304,52 @@ export const mobileScript = `'use strict';
   var LS_MIRROR='dshpet.mirror', LS_OUTBOX='dshpet.outbox';
   var LS_AIURL='dshpet.aiurl', LS_AIMODEL='dshpet.aimodel', LS_AIKEY='dshpet.aikey';
 
+  // ---- 配对过的电脑（多宿主）----
+  // 按宿主 id 分键：换宿主之后读不到另一台的宠物、对话副本与离线队列 —— 这就是
+  // 「一次只用一份数据」的落地方式（不是靠界面藏起来，是数据本身就分开存）。
+  function pk(name){
+    return name+'@'+(state.hostId||'none');
+  }
+  function readProfiles(){
+    try{var a=JSON.parse(localStorage.getItem(LS_HOSTS)||'[]');return Array.isArray(a)?a:[]}catch(e){return []}
+  }
+  function writeProfiles(a){
+    // 上限 8 台：这是人手动配对的列表，不是日志；写多了 localStorage 会被别的东西挤掉。
+    try{localStorage.setItem(LS_HOSTS,JSON.stringify(a.slice(0,8)))}catch(e){}
+  }
+  function getActiveId(){try{return localStorage.getItem(LS_ACTIVE)||''}catch(e){return ''}}
+  function setActiveId(id){try{localStorage.setItem(LS_ACTIVE,id||'')}catch(e){}}
+  function profileById(id){
+    var a=readProfiles();
+    for(var i=0;i<a.length;i++)if(a[i]&&a[i].id===id)return a[i];
+    return null;
+  }
+  function upsertProfile(p){
+    var a=readProfiles(),hit=false;
+    for(var i=0;i<a.length;i++){
+      if(a[i]&&a[i].id===p.id){a[i]=p;hit=true}
+    }
+    if(!hit)a.push(p);
+    writeProfiles(a);setActiveId(p.id);
+    return p;
+  }
+  // 老版本只存了一个 host+token：升级过来的人不该被要求重新配对一次。
+  // 先记成 id='legacy:'+地址，等这台电脑下次真正配对时换成它自报的 hostId。
+  function migrateLegacy(){
+    if(readProfiles().length)return;
+    var h='',t='';
+    try{h=localStorage.getItem(LS_HOST)||'';t=localStorage.getItem(LS_TOKEN)||''}catch(e){}
+    if(!h||!t)return;
+    upsertProfile({id:'legacy:'+h,host:h,token:t,label:'',pets:[],at:Date.now()});
+  }
+
   // ---- 本地副本 ----
   function saveMirror(list){
-    try{localStorage.setItem(LS_MIRROR,JSON.stringify({pet:state.pet,at:Date.now(),items:list.slice(-200)}))}catch(e){}
+    try{localStorage.setItem(pk(LS_MIRROR),JSON.stringify({pet:state.pet,at:Date.now(),items:list.slice(-200)}))}catch(e){}
   }
   function readMirror(){
     try{
-      var o=JSON.parse(localStorage.getItem(LS_MIRROR)||'null');
+      var o=JSON.parse(localStorage.getItem(pk(LS_MIRROR))||'null');
       if(!o||!o.pet)return null;
       // 离线启动时 state.pet 还是空的（它平时由 loadConfig 从电脑拉回来）。
       // 这里**必须**用副本里记的宠物 id 把 state.pet 补上，否则：
@@ -187,10 +361,10 @@ export const mobileScript = `'use strict';
   }
   // ---- 离线队列 ----
   function outbox(){
-    try{var a=JSON.parse(localStorage.getItem(LS_OUTBOX)||'[]');return Array.isArray(a)?a:[]}catch(e){return []}
+    try{var a=JSON.parse(localStorage.getItem(pk(LS_OUTBOX))||'[]');return Array.isArray(a)?a:[]}catch(e){return []}
   }
   function setOutbox(a){
-    try{localStorage.setItem(LS_OUTBOX,JSON.stringify(a))}catch(e){}
+    try{localStorage.setItem(pk(LS_OUTBOX),JSON.stringify(a))}catch(e){}
   }
   function queueCount(){return outbox().filter(function(m){return m.pet===state.pet}).length}
   function queueMsg(role,content,ts){
@@ -274,9 +448,19 @@ export const mobileScript = `'use strict';
   // /config 的顶层键就是素材根（main / columbina / nahida），其下 pets[] 才是实例（columbina1…）。
   // /thumb/<素材根>/<名>.webm —— 第一段必须是素材根，填实例 id 会 404（多实例共享同一套素材）。
   var state={base:'',token:'',pet:'',assetRoot:'',timer:null,since:null,cur:null,busy:false,
+    // hostId：当前在用哪台电脑（配对时由电脑自报，老版本升级上来的是 'legacy:地址'）。
+    // pets：这台电脑上的宠物清单，来自 /config —— 换宠物只在这份清单里挑。
+    // local：APK 里随包带的动画清单 {素材根:[名字…]}（用户要求「电脑端能放的动画手机也放」，
+    //        所以打包时把 assets 下所有 webm 一起塞进 www/pets/）；浏览器形态下这份清单取不到，
+    //        自动退回向电脑现取（见 assetUrl）。
+    hostId:'',pets:[],local:null,idleTimer:null,
+    // cfgVer：上一次看到的「配置版本」（/state 里的 sections.config.counter）。
+    // 手机设置的同步就靠它：宿主每次写配置都会更新这个 counter，长轮询当场就能看到，
+    // 不需要新增接口，也不用多挂一条轮询。
+    cfgVer:0,
     // overlayOn：悬浮窗开着时页面里弹出的话也推一份过去——用户此刻可能正在别的 App 里，
     // 只看得到悬浮宠物，看不到这个页面。
-    idle:'',click:'',pos:{x:0,y:0},overlayOn:false};
+    idle:'',click:'',pool:{idle:[],click:[],actions:[]},pos:{x:0,y:0},overlayOn:false};
 
   function api(path,opt){
     opt=opt||{};
@@ -329,7 +513,14 @@ export const mobileScript = `'use strict';
       .then(function(j){
         if(!j||!j.token)throw new Error('配对失败');
         state.base=base;state.token=j.token;
-        localStorage.setItem(LS_HOST,host);localStorage.setItem(LS_TOKEN,j.token);
+        // 配对成功 = 多一条宿主记录（不是覆盖上一条）。电脑自报的 hostId 优先当身份键：
+        // 它不随网络/端口变化，所以「插件端」「独立端」两条连接可以长期共存、随时切换。
+        // 老电脑（没有 hostId）退化成按地址记。
+        var id=(j&&j.hostId)?String(j.hostId):('h:'+host);
+        state.hostId=id;
+        upsertProfile({id:id,host:host,token:j.token,label:'',pets:[],at:Date.now()});
+        // 老键顺手清掉：留着会让下次启动的迁移逻辑把旧地址又变出一条记录
+        try{localStorage.removeItem(LS_HOST);localStorage.removeItem(LS_TOKEN)}catch(e){}
         return boot();
       })
       .catch(function(e){
@@ -349,7 +540,10 @@ export const mobileScript = `'use strict';
       // 判据用 401/403：那是"你是谁我不认"，与"连不上"（超时/网络）要给的提示完全不同。
       var msg=String((e&&e.message)||'');
       if(e&&e.status===401||e&&e.status===403||/令牌|token|unauthor/i.test(msg)){
-        localStorage.removeItem(LS_TOKEN);
+        // 只清**这一台**的令牌：手机可能还配着另一台能用的电脑，
+        // 全清掉会把人家辛辛苦苦配的记录一起弄丢。
+        var dead=profileById(state.hostId);
+        if(dead){dead.token='';upsertProfile(dead)}
         state.token='';
         stopPoll();stopScreenLoop();
         showConnect('电脑换了新的口令（重启过桌宠），请回电脑重新拿一次配对码。',true);
@@ -358,13 +552,37 @@ export const mobileScript = `'use strict';
       // 连不上电脑（超时/被墙/换了网络）**不要退回连接页**：那样等于把手机变成砖头，
       // 用户连上次的对话都看不到。进离线模式：显示本地副本 + 离线期间说的话先排队。
       var m=readMirror();
-      if(m){
+      var last=profileById(state.hostId);
+      var canLocal=!!(last&&last.pet&&last.assetRoot&&state.local&&state.local[last.assetRoot]);
+      // 没有本地副本、但包里有这只的动画 → 仍然进离线模式：手机自己就是一台能看宠物的设备。
+      // （用户要的是「电脑端能放的动画，手机 APP 也放」，那么连不上电脑不该等于看不见宠物。）
+      if(m||canLocal){
         state.offline=true;
         showMain();
         $('chat').innerHTML='';
-        var items=m.items||[];
+        var items=(m&&m.items)||[];
         items.forEach(function(x){addBubble(x.role,x.content,x.origin)});
-        addBubble('sys','现在连不上电脑（'+msg+'）。下面是上次同步过来的对话；你现在说的话会先存在手机上，回到同一网络后自动补进去。');
+        addBubble('sys','现在连不上电脑（'+msg+'）。'+(m?'下面是上次同步过来的对话；':'这台电脑的对话还没同步过；')+'你现在说的话会先存在手机上，回到同一网络后自动补进去。');
+        // 离线也要有宠物：素材与动画都在包里（见 loadLocalPack），用的是上次这只。
+        if(canLocal){
+          state.pet=last.pet;state.assetRoot=last.assetRoot;
+          // 待机名/点击名/动作池都从宿主记录恢复：离线时没有 /config 可问，
+          // 少了这三样就只剩下「知道是哪只、但不知道该播哪个文件」。
+          state.idle=last.idle||'';state.click=last.click||'';
+          state.pool=last.pool||{idle:[],click:[],actions:[]};
+          // 这台电脑上有几只也从记录恢复 —— 离线时切换面板要能列出全部宠物，
+          // 每只的素材都在包里，切过去就该直接播（不用等回到同一 Wi-Fi）。
+          if(last.list&&last.list.length){
+            state.pets=last.list.map(function(p){
+              return {id:p.id,name:p.name,assetRoot:p.assetRoot,idle:p.idle,click:p.click,
+                      pool:(p.id===last.pet?state.pool:{idle:[],click:[],actions:[]})};
+            });
+          }
+          $('pet-name').textContent=last.petName||last.pet;
+          renderPicker();
+          mountPet();
+          startIdleLoop();
+        }
         startPoll();
         return;
       }
@@ -384,21 +602,263 @@ export const mobileScript = `'use strict';
         var anims=(e&&e.animations)||{};
         var idle0=(Array.isArray(anims.idle)&&anims.idle[0])||'';
         var click0=(Array.isArray(anims.clicks)&&anims.clicks[0])||'';
+        // 同一素材根下的实例共享一套动画池：算一次，挂到每只身上。
+        var pool=animPool(anims);
         if(Array.isArray(e.pets))e.pets.forEach(function(p){
-          if(p&&p.id)pets.push({id:p.id,name:p.name,assetRoot:(p.assetRoot||k),idle:idle0,click:click0});
+          if(p&&p.id)pets.push({id:p.id,name:p.name,assetRoot:(p.assetRoot||k),idle:idle0,click:click0,pool:pool});
         });
       });
       if(!pets.length)throw new Error('电脑上还没有宠物');
-      var want=localStorage.getItem(LS_PET);
+      state.pets=pets;
+      var want=localStorage.getItem(pk(LS_PET));
       var hit=pets.filter(function(p){return p.id===want})[0]||pets[0];
       state.pet=hit.id;state.assetRoot=hit.assetRoot;
       state.idle=hit.idle||'待机呼吸';state.click=hit.click||'';
-      localStorage.setItem(LS_PET,state.pet);
+      state.pool=hit.pool||{idle:[],click:[],actions:[]};
+      localStorage.setItem(pk(LS_PET),state.pet);
       $('pet-name').textContent=hit.name||hit.id;
+      // 宿主记录里存一份「几台、几宠物」的快照：切换面板要在**没连上**的时候也能说清
+      // 「这一条是 3 只的那台」还是「2 只的那台」。
+      var prof=profileById(state.hostId);
+      if(prof){
+        prof.pets=pets.map(function(p){return p.name||p.id});
+        prof.label=pets.length+' 只 · '+(pets[0].name||pets[0].id);
+        prof.at=Date.now();
+        // 记住上次用的是哪只：离线启动时没有 /config，只能靠这份记录把宠物画出来。
+        // 连 idle/click/动作池一起存：离线启动时没有 /config，光有「哪只」画不出画面 ——
+        // 待机文件名是「待机呼吸休闲」这种，猜不出来（猜「待机呼吸」就 404、舞台全黑）。
+        prof.pet=state.pet;prof.assetRoot=state.assetRoot;prof.petName=hit.name||hit.id;
+        prof.idle=state.idle;prof.click=state.click;prof.pool=state.pool;
+        // 整份「这台电脑上有几只、每只播哪个文件」也存下来：手机带着全部动画，
+        // 但没这份表就只画得出上次那一只，切换面板里其余几只是空的（用户要的是「能切换」）。
+        prof.list=pets.map(function(p){
+          return {id:p.id,name:p.name,assetRoot:p.assetRoot,idle:p.idle,click:p.click};
+        });
+        upsertProfile(prof);
+      }
       mountPet();
+      renderPicker();
+      startIdleLoop();
     });
   }
+
+  // ---- 待机循环 ----
+  // 电脑端本来就会自己随机放动作（state.ts 的 idle/actions 池），手机原来只有一条待机 webm 在
+  // loop。这里每 18–32 秒（随机，避免多台设备同拍）在不忙、页面可见时随机放一个动作，放完回待机。
+  // 间隔不能太短：这些是 5–15 秒的整段动画，连着播就成了「一直跳舞」，不像待机。
+  function startIdleLoop(){
+    stopIdleLoop();
+    function step(){
+      state.idleTimer=setTimeout(function(){
+        // 离线也放：包里有素材就能换着播（这正是「把全部动画放进手机」换来的）。
+        // 只有「离线且包里没素材」才静默 —— 那时播放只会 404，看着像卡住。
+        if(!state.busy&&(!state.offline||state.local)&&!document.hidden&&window.__petOnce){
+          // 优先放动作（玩魔方、伸懒腰这类），没有动作池就换一条待机变体。
+          var n=pickAnim('actions')||pickAnim('idle');
+          if(n)window.__petOnce(n);
+        }
+        step();
+      },18000+Math.floor(Math.random()*14000));
+    }
+    step();
+  }
+  function stopIdleLoop(){if(state.idleTimer){clearTimeout(state.idleTimer);state.idleTimer=null}}
+
+  // ---- 换宠物 / 换电脑 ----
+  // 用户原话（2026-11-01）：「手机显示宠物可以切换」「手机端可以同时配对两者，但是一次只能
+  // 使用一份数据，玩家自己选独立端或者插件端」。所以这里是两个维度：
+  //   换宠物 = 同一台电脑上换一只（对话、记忆、素材都按宠物在宿主侧分域）；
+  //   换电脑 = 换数据源（插件端 2 只 / 独立端 3 只），本地副本与离线队列本来就按宿主 id 分键，
+  //            所以切过去看到的是那一台自己的对话，不会串。
+  function switchPet(id){
+    var hit=state.pets.filter(function(p){return p.id===id})[0];
+    if(!hit){return}
+    if(hit.id===state.pet){closePicker();return}
+    // 离线换宠物只允许「包里有这只的动画」的情况：没有素材还切过去，舞台就空了，
+    // 看着像坏了。提示一句比黑屏好。
+    if(state.offline&&(!state.local||!state.local[hit.assetRoot])){
+      tip('这只的动画还没存到手机上，连回电脑后才能切',2600);
+      return;
+    }
+    state.pet=hit.id;state.assetRoot=hit.assetRoot;
+    state.idle=hit.idle||'待机呼吸';state.click=hit.click||'';
+    state.pool=hit.pool||{idle:[],click:[],actions:[]};
+    try{localStorage.setItem(pk(LS_PET),state.pet)}catch(e){}
+    $('pet-name').textContent=hit.name||hit.id;
+    // 对话与气泡都是按宠物分域的，换宠物必须整块重来：
+    // 不重来就会把上一只说的话贴到这一只脸上，用户会以为是记忆串了。
+    stopIdleLoop();
+    $('chat').innerHTML='';
+    state.since=null;state.cur=null;
+    mountPet();
+    startIdleLoop();
+    renderPicker();
+    if(state.offline){
+      var m=readMirror();
+      if(m)(m.items||[]).forEach(function(x){addBubble(x.role,x.content,x.origin)});
+    }else{
+      loadHistory().catch(function(){});
+    }
+  }
+  function switchHost(id){
+    if(id===state.hostId){closePicker();return}
+    var p=profileById(id);
+    if(!p||!p.token)return;
+    stopPoll();stopIdleLoop();stopScreenLoop();
+    state.cur=null;state.since=null;$('chat').innerHTML='';
+    state.offline=false;
+    state.hostId=p.id;state.base=location.protocol+'//'+p.host;state.token=p.token;
+    // 换电脑 = 换一整套数据（用户的「一次只用一份」）。上一台的宠物、素材根、动画池、
+    // 宠物清单和已下载的 blob 全部作废，否则会拿 A 的宠物去读 B 的本地副本 ——
+    // readMirror() 会因为「副本里记的宠物不是现在这只」而整块丢弃，界面就停在上一台的样子。
+    state.pet=p.pet||'';state.assetRoot=p.assetRoot||'';
+    state.idle=p.idle||'';state.click=p.click||'';state.pool=p.pool||{idle:[],click:[],actions:[]};
+    state.pets=[];
+    $('pet-name').textContent=p.petName||p.pet||'';
+    blobCache={};
+    setActiveId(p.id);
+    closePicker();
+    boot().then(function(){refreshSelfai()}).catch(function(){});
+  }
+  function forgetHost(id){
+    var a=readProfiles().filter(function(x){return x&&x.id!==id});
+    writeProfiles(a);
+    if(state.hostId===id){
+      stopPoll();stopIdleLoop();stopScreenLoop();
+      state.token='';state.hostId='';
+      // 还有别的电脑就直接切过去；一台都不剩才回连接页 —— 删一台不该把手机变砖头。
+      if(a.length){switchHost(a[0].id);return}
+      showConnect('');
+      return;
+    }
+    renderPicker();
+  }
+  var pickOpen=false;
+  function openPicker(){pickOpen=true;$('picker').classList.remove('is-hidden');renderPicker()}
+  function closePicker(){pickOpen=false;$('picker').classList.add('is-hidden')}
+  function row(cls){
+    var d=document.createElement('div');d.className=cls;return d;
+  }
+  function cell(cls,txt){var s=document.createElement('span');s.className=cls;s.textContent=txt;return s}
+  function renderPicker(){
+    if(!pickOpen)return;
+    var box=$('pick-pets');box.innerHTML='';
+    if(!state.pets.length){
+      var e=document.createElement('div');e.className='pempty';e.textContent='还没读到这台电脑的宠物列表（连不上电脑时只显示已同步的那一只）';box.appendChild(e);
+    }else{
+      state.pets.forEach(function(p){
+        var r=row('pitem'+(p.id===state.pet?' on':''));
+        r.appendChild(cell('pname',p.name||p.id));
+        r.appendChild(cell('psub',p.id===state.pet?'当前':''));
+        r.addEventListener('click',function(){switchPet(p.id)});
+        box.appendChild(r);
+      });
+    }
+    var hb=$('pick-hosts');hb.innerHTML='';
+    var list=readProfiles();
+    if(!list.length){
+      var e2=document.createElement('div');e2.className='pempty';e2.textContent='还没配过任何电脑';hb.appendChild(e2);
+    }else{
+      list.forEach(function(p){
+        var on=p.id===state.hostId;
+        var r=row('pitem'+(on?' on':''));
+        r.appendChild(cell('pname',p.label||p.host||p.id));
+        r.appendChild(cell('psub',on?'当前':''));
+        r.addEventListener('click',function(){switchHost(p.id)});
+        // 移除按钮：删的是「这台电脑的配对」，不是删宠物。删完如果它是当前那台，
+        // 会自动切到另一台；全删完才回连接页。
+        var del=document.createElement('button');
+        del.type='button';del.className='pdel';del.textContent='移除';
+        del.addEventListener('click',function(ev){
+          ev.stopPropagation();
+          forgetHost(p.id);
+        });
+        r.appendChild(del);
+        hb.appendChild(r);
+      });
+    }
+  }
+  function bindPicker(){
+    var b=$('pick-btn');
+    if(b)b.addEventListener('click',function(){
+      if(pickOpen)closePicker();else openPicker();
+    });
+    var c=$('pick-close');
+    if(c)c.addEventListener('click',closePicker);
+    var a=$('pick-add');
+    if(a)a.addEventListener('click',function(){
+      closePicker();
+      // 不清任何记录：只是回到连接页再配一台，配完两台都在列表里。
+      showConnect('');
+    });
+  }
+  // ---- 动画池（2026-11-01 用户追加：「把电脑端所有动画放进手机APP里，电脑端能放的动画、
+  // 待机动画循环这些，手机APP也放」）----
+  // 池子只装**名字**，与桌面端同一套语义（名字即文件名，精确匹配，没有模糊回退）。
+  // 待机/点击取 animations.idle / animations.clicks；可随机播放的动作取 moves.actions 与
+  // categories[].actions（与桌面端 state.ts 的动作来源一致）。
+  function animPool(a){
+    a=a||{};
+    function str(x){return typeof x==='string'&&x?x:''}
+    var idle=(Array.isArray(a.idle)?a.idle.map(str):[]).filter(Boolean);
+    var click=(Array.isArray(a.clicks)?a.clicks.map(str):[]).filter(Boolean);
+    var acts=[];
+    var mv=a.moves&&Array.isArray(a.moves.actions)?a.moves.actions:[];
+    mv.forEach(function(x){var n=str(x)||(x&&str(x.name))||'';if(n)acts.push(n)});
+    var cats=Array.isArray(a.categories)?a.categories:[];
+    cats.forEach(function(c){
+      if(!c||!Array.isArray(c.actions))return;
+      c.actions.forEach(function(x){var n=str(x)||(x&&str(x.name))||'';if(n)acts.push(n)});
+    });
+    // 去重但保序：同一只的动作在不同类别里重名很常见（比如「原地踱步」）。
+    function uniq(list){
+      var out=[],seen={};
+      list.forEach(function(n){if(!seen[n]){seen[n]=1;out.push(n)}});
+      return out;
+    }
+    return {idle:uniq(idle),click:uniq(click),actions:uniq(acts)};
+  }
+  // 随机挑一个「手机上真有素材」的名字。local 为 null（浏览器形态）时不过滤 —— 素材现从电脑取，
+  // 取不到就 play() 返回 null，不会把舞台弄黑（旧层还在）。
+  function pickAnim(kind){
+    var pool=state.pool||{},src=pool[kind]||[];
+    var have=(state.local&&state.local[state.assetRoot])||null;
+    // 离线启动时拿不到 /config，池子是空的 —— 此时包内清单就是唯一的池子
+    // （这正是「把电脑端所有动画放进手机」换来的能力：不联网也能换着放）。
+    if(!src.length&&have)src=have.slice();
+    if(!src.length)return '';
+    if(have&&have.length){
+      var idx={};have.forEach(function(n){idx[n]=1});
+      var ok=src.filter(function(n){return idx[n]});
+      if(!ok.length)return '';           // 这套素材里一个都没有 → 宁可不播，也别 404 换黑屏
+      src=ok;
+    }
+    var pick=src[Math.floor(Math.random()*src.length)]||'';
+    // 别把正在放的这条再抽一次（看着像卡住）。
+    if(state.cur&&state.cur.__name===pick&&src.length>1){
+      pick=src[(src.indexOf(pick)+1)%src.length];
+    }
+    return pick;
+  }
+  // APK 随包动画清单：打包脚本写 www/pets/manifest.json。取不到就当没有（浏览器形态）。
+  function loadLocalPack(){
+    return fetch('pets/manifest.json',{cache:'force-cache'})
+      .then(function(r){return r.ok?r.json():null})
+      .then(function(j){
+        state.local=(j&&typeof j==='object')?j:null;
+      })
+      .catch(function(){state.local=null});
+  }
+  function localUrl(name){
+    var have=(state.local&&state.local[state.assetRoot])||null;
+    if(!have)return '';
+    for(var i=0;i<have.length;i++)if(have[i]===name)return 'pets/'+encodeURIComponent(state.assetRoot)+'/'+encodeURIComponent(name)+'.webm';
+    return '';
+  }
   function assetUrl(name){
+    // 先查包内素材：手机离线时电脑不可达，只有这条路能出画面（这也是「放着动画」的意义）。
+    var local=localUrl(name);
+    if(local)return local;
     return state.base+'/dsh-pet-7340/thumb/'+encodeURIComponent(state.assetRoot)+'/'+encodeURIComponent(name)+'.webm';
   }
   // 素材必须走 fetch + blob，不能直接把 URL 塞进 <video src>：
@@ -406,27 +866,43 @@ export const mobileScript = `'use strict';
   // 直接塞 src 会稳定 403、宠物整只不显示。桌面端也是这么做的（src/client/pet.ts 的
   // "素材加载走 fetch+blob"）。blob URL 记住并复用，19 段素材各取一次就够。
   var blobCache={};
+  function grab(url,token){
+    var opt={cache:'force-cache'};
+    // 令牌只对电脑发（包内文件是本地读，带上无害但没必要；这里按需带，免得以后有人误以为
+    // 本地素材也要令牌，把 fetch 改坏了查半天）。
+    if(token)opt.headers={'X-DSH-Pet-Token':state.token};
+    return fetch(url,opt).then(function(r){
+      if(!r.ok)throw new Error('素材 HTTP '+r.status);
+      return r.blob();
+    });
+  }
   function fetchAsset(name){
-    if(blobCache[name])return Promise.resolve(blobCache[name]);
-    return fetch(assetUrl(name),{headers:{'X-DSH-Pet-Token':state.token},cache:'force-cache'})
-      .then(function(r){
-        if(!r.ok)throw new Error('素材 '+name+' HTTP '+r.status);
-        return r.blob();
-      })
+    // 缓存键带素材根：换宠物后同名素材（「待机呼吸」哥伦比娅和纳西妲都有）绝不能串。
+    var key=state.assetRoot+'/'+name;
+    if(blobCache[key])return Promise.resolve(blobCache[key]);
+    var local=localUrl(name);
+    var task=local?grab(local,false).catch(function(){
+      // 清单说有、文件却不在（打包漏了/被删）：退回向电脑取，别把宠物弄没。
+      return grab(assetUrl(name),true);
+    }):grab(assetUrl(name),true);
+    return task
       .then(function(b){
         var u=URL.createObjectURL(b);
-        blobCache[name]=u;
+        blobCache[key]=u;
         return u;
       });
   }
   function mountPet(){
     var host=$('pet');host.innerHTML='';
-    function play(name){
+    // once=true：这个动作只放一遍，放完回到待机。
+    // 待机循环本身是一条 loop 的 webm；随机动作（伸懒腰、玩魔方…）如果也 loop，
+    // 宠物会卡在动作最后一帧不动 —— 手机端原来只有待机一条动画，所以没暴露这个区别。
+    function play(name,once){
       if(!name)return Promise.resolve(null);
       return fetchAsset(name).then(function(u){
         var nv=document.createElement('video');
         nv.muted=true;nv.defaultMuted=true;nv.playsInline=true;nv.setAttribute('webkit-playsinline','');
-        nv.loop=true;nv.preload='auto';nv.setAttribute('disablepictureinpicture','');
+        nv.loop=!once;nv.preload='auto';nv.setAttribute('disablepictureinpicture','');
         nv.__name=name;nv.src=u;
         return new Promise(function(res){
           nv.oncanplay=function(){
@@ -442,13 +918,27 @@ export const mobileScript = `'use strict';
             res(nv);
           };
           nv.onerror=function(){res(null)};
+          // 单次动作播完回待机。必须**先**判「还是不是当前层」：用户在动作播到一半时点了
+          // 别的宠物/别的动作，这个 ended 才迟一步到，此时回待机会把新画面顶掉。
+          if(once)nv.onended=function(){
+            if(state.cur===nv)play(state.idle||'待机呼吸');
+          };
         });
       }).catch(function(){return null});
     }
-    play(state.idle||'待机呼吸');
+    // 首帧：有配置来的待机名就用它；没有（离线启动）就从包内清单里挑一条真实存在的 ——
+    // 「待机呼吸」这种猜出来的名字在蓝毛的池子里不存在，硬播只会黑屏。
+    play(state.idle||pickAnim('idle')||'待机呼吸');
     window.__petAnim=function(name){
       if(!name||(state.cur&&state.cur.__name===name))return;
       play(name);
+    };
+    // 放一遍就回待机（现点什么、待机随机动作都走这条）。同名正在播就不重开，
+    // 否则点两下会把同一段从头再放，看着像卡住。
+    window.__petOnce=function(name){
+      if(!name)return;
+      if(state.cur&&state.cur.__name===name&&!state.cur.ended)return;
+      play(name,true);
     };
     loadPos();
     bindDrag();
@@ -469,10 +959,13 @@ export const mobileScript = `'use strict';
     var p=clampPos(state.pos.x||0,state.pos.y||0);state.pos=p;
     var el=$('pet');if(el)el.style.transform='translate('+p.x+'px,'+p.y+'px)';
   }
+  // 位置按「宿主+宠物」记：插件端那只和独立端那只不该互相覆盖拖到哪儿了。
+  function posKey(){return pk('dshpet.petpos')+'/'+(state.pet||'pet')}
   function loadPos(){
     try{
-      var v=JSON.parse(localStorage.getItem('dshpet.petpos')||'null');
+      var v=JSON.parse(localStorage.getItem(posKey())||'null');
       if(v&&typeof v.x==='number'&&typeof v.y==='number')state.pos={x:v.x,y:v.y};
+      else state.pos={x:0,y:0};
     }catch(e){}
   }
   function bindDrag(){
@@ -498,9 +991,12 @@ export const mobileScript = `'use strict';
       if(!drag||e.pointerId!==drag.id)return;
       var started=drag.started;drag=null;
       el.classList.remove('dragging');
-      if(started){localStorage.setItem('dshpet.petpos',JSON.stringify(state.pos));return}
-      // 没挪动 = 点了一下：跟桌面端一样给一次「点击回应」（名字取配置里第一个）
-      if(state.click&&window.__petAnim)window.__petAnim(state.click);
+      if(started){try{localStorage.setItem(posKey(),JSON.stringify(state.pos))}catch(err){};return}
+      // 没挪动 = 点了一下：跟桌面端一样给一次「点击回应」。
+      // 池子里有几条（开心跃动／害羞惊讶／傲娇生气…）就随机挑一条，否则每次都同一段像卡住；
+      // 单次播放、放完回待机 —— 点击回应是"回应"，不该变成新待机。
+      var one=pickAnim('click')||state.click;
+      if(one&&window.__petOnce)window.__petOnce(one);
     }
     el.addEventListener('pointerup',end);
     el.addEventListener('pointercancel',function(e){drag=null;el.classList.remove('dragging')});
@@ -519,6 +1015,15 @@ export const mobileScript = `'use strict';
     api(path).then(function(s){
       setConn(true);
       if(s&&s.counter!==undefined)state.since=s.counter;
+      if(s&&s.sections&&s.sections.config){
+        // 配置版本变了 = 有人改过设置（电脑设置页 / 另一台手机 / 桌面右键改显示位置）。
+        // 首拍只记基线：否则一进页面就当作「被别人改了」，白刷一次设置屏。
+        var cf=s.sections.config.counter;
+        if(cf!==state.cfgVer){
+          if(state.cfgVer)sxOnConfigSignal();
+          state.cfgVer=cf;
+        }
+      }
       if(s){
         // /state 的形状：pets.<实例id>.{ say, anim, position, throw, lock }，
         // 每一项都是 { counter, data } 叶子 —— anim 与 say **并列**，不是 say.data.anim。
@@ -817,8 +1322,11 @@ export const mobileScript = `'use strict';
       if (r && r.host && r.token && !state.token) {
         state.base = location.protocol + '//' + r.host;
         state.token = r.token;
-        localStorage.setItem(LS_HOST, r.host);
-        localStorage.setItem(LS_TOKEN, r.token);
+        // 原生记忆里只有地址+令牌（没有电脑自报的 hostId）：先按地址记一条，
+        // 等这台电脑下次连上、/config 回来时再补全。直接写旧键会让整套多宿主失效。
+        var nid = 'h:' + String(r.host);
+        state.hostId = nid;
+        upsertProfile({ id: nid, host: r.host, token: r.token, label: '', pets: [], at: Date.now() });
         boot().catch(function () {});
       }
       refreshNative();
@@ -903,12 +1411,15 @@ export const mobileScript = `'use strict';
   $('composer').addEventListener('submit',function(e){e.preventDefault();send($('text').value)});
   $('mic').addEventListener('click',startVoice);
   $('disconnect').addEventListener('click',function(){
-    stopPoll();
-    localStorage.removeItem(LS_HOST);localStorage.removeItem(LS_TOKEN);
-    state.base='';state.token='';state.since=null;
+    stopPoll();stopIdleLoop();stopScreenLoop();
+    // 「断开」= 忘掉当前这台电脑的配对（别的电脑的记录保留，列表里还能切回去）。
+    // 老版本是把唯一的 host/token 删掉；现在有多条记录，必须按宿主 id 精确删。
+    if(state.hostId)forgetHost(state.hostId);
+    else{state.base='';state.token='';state.since=null;showConnect('已断开',true)}
     $('host').value='';$('pin').value='';
-    showConnect('已断开',true);
+    closePicker();
   });
+  bindPicker();
   document.addEventListener('visibilitychange',function(){
     if(document.hidden)stopPoll();else if(state.base)startPoll();
   });
@@ -1008,6 +1519,183 @@ export const mobileScript = `'use strict';
   }
   bindSelfai();
 
+  // ---- 设置屏（2026-11-01）----
+  var sxDirty=false;    // 用户手上有没保存的改动：有就不自动覆盖，改为提示
+  var sxBusy=false;     // 保存中：防止连点两下发两遍
+  var sxLoadedAt=0;
+
+  function sxShow(msg){
+    $('setts').classList.remove('is-hidden');
+    $('main').classList.add('is-hidden');
+    if(msg)sxNote(msg,false);
+    sxLoad();
+  }
+  function sxHide(){
+    $('setts').classList.add('is-hidden');
+    $('main').classList.remove('is-hidden');
+  }
+  function sxNote(text,ok){
+    var m=$('set-result');m.textContent=text||'';
+    m.className='msg'+(ok?' ok':'');
+  }
+  function sxSyncNote(text){
+    var b=$('set-sync');
+    if(!text){b.classList.add('is-hidden');b.textContent='';return}
+    b.textContent=text;b.classList.remove('is-hidden');
+  }
+  function sxGroupVis(){
+    var on=$('set-group').checked;
+    $('set-group-block').classList.toggle('is-hidden',!on);
+    $('set-recentn').disabled=!on||$('set-scope').value!=='recent';
+    $('set-ownerqq').disabled=!on||!$('set-ownersync').checked;
+  }
+
+  // 读取：人设（按当前宠物）+ 全局设置，两个接口一次并发。
+  function sxLoad(){
+    if(!state.token){sxNote('还没连上电脑，设置要连上电脑才能改。',false);return Promise.resolve()}
+    var pet=state.pet||'';
+    if(!pet){sxNote('还没选宠物，先回上一步点一下宠物再进来。',false);return Promise.resolve()}
+    sxNote('正在读取…',false);
+    return Promise.all([
+      api('/dsh-pet-7340/pet-persona?pet='+encodeURIComponent(pet)),
+      api('/dsh-pet-7340/assistant/settings')
+    ]).then(function(res){
+      var per=res[0]||{},st=res[1]||{};
+      $('set-title').textContent='设置 · '+(per.pet&&per.pet.name?per.pet.name:pet);
+      $('set-persona').value=per.persona||'';
+      $('set-persona-note').textContent=per.persona
+        ? '这段是这只宠物自己的（'+per.persona.length+' 字），会覆盖电脑上所属条目的默认人设。'
+        : (per.entryPersona? '现在留空，生效的是所属条目的默认人设（'+per.entryPersona.length+' 字）。' : '现在留空，也没读到默认人设。');
+      $('set-rounds').value=String(typeof st.chatMemoryRounds==='number'?st.chatMemoryRounds:5);
+      $('set-recall').value=String(typeof st.memoryRecallK==='number'?st.memoryRecallK:3);
+      $('set-group').checked=st.groupBotEnabled===true;
+      $('set-scope').value=st.groupMemoryScope==='recent'?'recent':'everyone';
+      $('set-recentn').value=String(typeof st.groupMemoryRecentN==='number'?st.groupMemoryRecentN:10);
+      $('set-ownersync').checked=st.ownerSyncEnabled===true;
+      $('set-ownerqq').value=typeof st.ownerQq==='string'?st.ownerQq:'';
+      $('set-split').checked=st.chatSplitEnabled!==false;
+      $('set-merge').value=String(typeof st.chatMergeWindowMs==='number'?st.chatMergeWindowMs:800);
+      $('set-proactive').checked=st.proactiveChatEnabled===true;
+      $('set-prosec').value=String(typeof st.proactiveChatSec==='number'?st.proactiveChatSec:1800);
+      $('set-screen').checked=st.screenContextEnabled===true;
+      $('set-assistant').checked=st.assistantEnabled===true;
+      $('set-perm').value=st.assistantPermission||'readonly';
+      $('set-net').checked=st.assistantNetworkEnabled!==false;
+      if(st.screenAvailable===false){
+        $('set-screen').disabled=true;$('set-screen').checked=false;
+        $('set-screen').parentNode.appendChild(document.createTextNode('（这台电脑上找不到读屏脚本，暂时不可用）'));
+      }
+      $('set-ver').textContent='工作区：'+(st.workspaceRoot||'（未知）');
+      sxGroupVis();
+      sxDirty=false;
+      sxLoadedAt=Date.now();
+      sxNote('已读取。改完点下面「保存设置」。',true);
+    }).catch(function(e){
+      // 口令失效与「电脑不在」要分开说：前者必须回电脑重配，后者等一会儿再试就行。
+      if(e&&(e.status===401||e.status===403)){
+        sxNote('电脑换了新的口令（重启过桌宠），请回电脑重新拿一次配对码。',false);
+      }else{
+        sxNote('读不到设置：'+(e&&e.message?e.message:'网络没通')+'。离线时改不了设置，连回电脑再试。',false);
+      }
+    });
+  }
+
+  function sxSave(){
+    if(sxBusy)return;
+    if(!state.token){sxNote('还没连上电脑，设置要连上电脑才能存。',false);return}
+    // 先在本机校验一遍：后端的 topFieldValid 越界会整包拒绝（bad-request），
+    // 那样用户只看到「提交的值不合法」，不知道是哪个格子错了。
+    var rounds=Number($('set-rounds').value);
+    if(!isFinite(rounds)||rounds<0||rounds>200){sxNote('「带多少轮对话」要在 0–200 之间。',false);return}
+    var recall=Number($('set-recall').value);
+    if(!isFinite(recall)||recall<0||recall>50){sxNote('「每次回捞往事」要在 0–50 之间。',false);return}
+    var recentN=Number($('set-recentn').value);
+    if($('set-group').checked&&(!isFinite(recentN)||recentN<1||recentN>100)){sxNote('群成员记忆的 N 要在 1–100 之间。',false);return}
+    var merge=Number($('set-merge').value);
+    if(!isFinite(merge)||merge<0||merge>3000){sxNote('合并窗口要在 0–3000 毫秒之间（0 = 不合并）。',false);return}
+    var prosecute=Number($('set-prosec').value);
+    if(!isFinite(prosecute)||prosecute<120||prosecute>86400){sxNote('主动聊天间隔要在 120–86400 秒之间（最短 2 分钟）。',false);return}
+
+    sxBusy=true;
+    var btn=$('set-save');btn.disabled=true;
+    sxNote('正在保存…',false);
+    var body={
+      chatMemoryRounds:Math.floor(rounds),
+      memoryRecallK:Math.floor(recall),
+      groupBotEnabled:$('set-group').checked,
+      groupMemoryScope:$('set-scope').value==='recent'?'recent':'everyone',
+      groupMemoryRecentN:Math.floor(recentN),
+      ownerSyncEnabled:$('set-ownersync').checked,
+      ownerQq:$('set-ownerqq').value.trim(),
+      chatSplitEnabled:$('set-split').checked,
+      chatMergeWindowMs:Math.floor(merge),
+      proactiveChatEnabled:$('set-proactive').checked,
+      proactiveChatSec:Math.floor(prosecute),
+      screenContextEnabled:$('set-screen').checked,
+      assistantEnabled:$('set-assistant').checked,
+      assistantPermission:$('set-perm').value,
+      assistantNetworkEnabled:$('set-net').checked
+    };
+    var persona=$('set-persona').value;
+    // 两个接口：设置走 PATCH 语义的 POST（只写 body 里给出的键），人设走 /pet-persona。
+    // 人设放第二个，是为了让「设置存了、人设没存」这种半成功能被准确说出口。
+    api('/dsh-pet-7340/assistant/settings',{method:'POST',body:JSON.stringify(body)})
+      .then(function(r){
+        if(r&&r.ok===false)throw new Error(r.message||r.reason||'电脑拒了这组设置');
+        return api('/dsh-pet-7340/pet-persona?pet='+encodeURIComponent(state.pet||''),
+          {method:'POST',body:JSON.stringify({persona:persona})});
+      })
+      .then(function(r2){
+        if(r2&&r2.ok===false)throw new Error('设置已存，但人设没存上：'+(r2.message||r2.reason||''));
+        sxDirty=false;
+        sxBusy=false;btn.disabled=false;
+        sxNote('已保存。电脑那一端会自己同步。',true);
+        return sxLoad();
+      })
+      .catch(function(e){
+        sxBusy=false;btn.disabled=false;
+        sxNote('没存上：'+(e&&e.message?e.message:'网络没通')+'。',false);
+      });
+  }
+
+  /**
+   * 配置被别人改过（电脑设置页 / 桌面右键改显示位置 / 另一台手机）。
+   * 宿主每次写配置都会写 config 信号叶子，手机在 /state 长轮询里就能看到。
+   * 用户手上有未保存的改动时**绝不自动覆盖**——那等于把人家正在写的东西冲掉。
+   */
+  function sxOnConfigSignal(){
+    if($('setts').classList.contains('is-hidden'))return; // 没打开就等下次打开时读
+    if(sxDirty){sxSyncNote('另一端改了设置。你这里有没保存的改动，所以没有自动覆盖——想跟电脑一致就点这里重新读取。');return}
+    sxSyncNote('');
+    sxLoad().then(function(){sxSyncNote('')}).catch(function(){});
+  }
+
+  function sxBind(){
+    if(!$('set-btn'))return;
+    $('set-btn').addEventListener('click',function(){sxShow('')});
+    $('set-back').addEventListener('click',function(){sxHide()});
+    $('set-save').addEventListener('click',sxSave);
+    $('set-group').addEventListener('change',function(){sxDirty=true;sxGroupVis()});
+    $('set-scope').addEventListener('change',function(){sxDirty=true;sxGroupVis()});
+    $('set-ownersync').addEventListener('change',function(){sxDirty=true;sxGroupVis()});
+    // 其余控件：任何一次改动都置脏，同步逻辑据此不覆盖。
+    var ids=['set-persona','set-rounds','set-recall','set-recentn','set-ownerqq','set-split','set-merge',
+      'set-proactive','set-prosec','set-screen','set-assistant','set-perm','set-net'];
+    for(var i=0;i<ids.length;i++){
+      (function(id){
+        var el=$(id);
+        if(!el)return;
+        el.addEventListener('input',function(){sxDirty=true});
+        el.addEventListener('change',function(){sxDirty=true});
+      })(ids[i]);
+    }
+    $('set-sync').addEventListener('click',function(){
+      sxDirty=false;sxSyncNote('');sxLoad();
+    });
+  }
+  sxBind();
+
+
   // ---- 回家就补：一发现能连上电脑，就把离线那段整段追加进去 ----
   // 触发点是 /state 长轮询回来（那是「能打到电脑」的唯一可靠信号，不是看 SSID）。
   // 追加成功后才清队列；失败就留着，下一拍再试 —— 顺序与去重都靠消息编号，重复传也安全。
@@ -1026,12 +1714,31 @@ export const mobileScript = `'use strict';
   }
 
   // ---- 启动 ----
-  // 同样跟随页面协议：用户之前存下的地址只有 host:port，协议由「怎么打开的」决定。
-  var savedHost=localStorage.getItem(LS_HOST),savedToken=localStorage.getItem(LS_TOKEN);
-  if(savedHost&&savedToken){
-    state.base=location.protocol+'//'+savedHost;state.token=savedToken;
-    boot().then(function(){refreshSelfai();startScreenLoop();}).catch(function(){showConnect('')});
-  }else{
-    showConnect('');
+  // 多宿主的启动顺序：
+  //   ① 老版本的单条 host/token 迁成一条记录（不逼已经配过的人重配）；
+  //   ② 先取包内动画清单（决定「本地播」还是「向电脑取」，mountPet 第一帧就要用）；
+  //   ③ 按「上次在用的那台」恢复；没有就取列表里第一台。
+  migrateLegacy();
+  function activate(id){
+    var p=profileById(id);
+    if(!p||!p.token){showConnect('');return Promise.resolve()}
+    state.hostId=p.id;
+    // 协议跟随页面：存下来的只有 host:port，怎么打开的（https）就怎么连。
+    state.base=location.protocol+'//'+p.host;
+    state.token=p.token;
+    setActiveId(p.id);
+    return boot();
   }
+  loadLocalPack().then(function(){
+    var act=getActiveId();
+    var prof=act?profileById(act):null;
+    if(!prof){
+      var all=readProfiles();
+      if(all.length)prof=all[0];
+    }
+    if(prof&&prof.token){
+      return activate(prof.id).then(function(){refreshSelfai();startScreenLoop()});
+    }
+    showConnect('');
+  }).catch(function(){showConnect('')});
 })();`;

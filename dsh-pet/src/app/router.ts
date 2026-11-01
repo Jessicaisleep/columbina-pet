@@ -26,6 +26,14 @@ interface RouterDeps {
   landingPage(port: number): string;
   /** 手机配对（短码换令牌）。不提供 = 手机连接功能未启用。 */
   pairing?: Pairing;
+  /**
+   * 这台电脑的长期身份（见 `standalone/host-identity`）。
+   *
+   * 手机要同时记住几台电脑（家里的插件端 2 只、独立端 3 只各一份数据），一次只用一份。
+   * 身份键不能用 ip:port —— 网络一换、端口一顺延就认不出来了；所以由电脑自报一个长期
+   * 不变的 id，手机按它归档。拿不到就回空串，手机那边退化成「按地址记」。
+   */
+  hostId?: () => string;
   /** 手机端远程访问是否已开启（运行时可变）。 */
   remoteEnabled?: () => boolean;
   /** 实际监听地址；默认 127.0.0.1（只回环）。手机连接开启时才应传 0.0.0.0。 */
@@ -117,7 +125,16 @@ export function startRouter(
         }
         deps.log('手机配对成功');
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, token: deps.security.token }));
+        // hostId 一起带回去（2026-11-01）：手机可能同时配过几台电脑，要一个**不随网络变化**
+        // 的键来归档「这条连接是哪台电脑的」。缺了它手机只能按地址记，换网就认不出来。
+        let hostId: string;
+        try {
+          hostId = deps.hostId?.() ?? '';
+        } catch {
+          // 身份文件读/写失败不该连累配对：退化成空串，手机按地址记
+          hostId = '';
+        }
+        res.end(JSON.stringify({ ok: true, token: deps.security.token, hostId }));
       })
       .catch(() => rejectRequest(res, 400, '配对请求无法处理'));
   };

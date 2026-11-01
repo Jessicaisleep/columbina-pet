@@ -106,6 +106,11 @@ import { generateWhisper } from './whisper';
 import { automaticWhisperSchedule, type StandaloneWhisperPolicy } from './whisper-policy';
 import { generateChat, generateMemorySummary, trimToUserBoundary } from './chat';
 import type { ChatMemoryMessage } from './chat';
+// 回话节奏（2026-11-01，用户要求「像真人那样分多条说」）：
+//   ./split-reply —— 生成端拆条（提示词 + 解析）
+//   ./chat-merge  —— 接收端合并（连发几条只回一次）
+import { ChatMerger, mergeWindowMsOf } from './chat-merge';
+import { splitEnabledOf, splitReply, stripSplitMarks } from './split-reply';
 import {
   PROACTIVE_ORIGIN,
   proactiveDecision,
@@ -1724,12 +1729,56 @@ export function apply(ctx: any): void {
     return { ok: true, overview: overviewOf(entry) };
   };
 
+  /**
+   * 分条气泡的节奏（2026-11-01，用户要求「像真人那样分多条说」）。
+   *
+   * 一次 `state.writePet(petId,'say',…)` = 一个新 seq = 前端一个新气泡，所以「逐条出现」
+   * 在传输层就是**真的逐条**，不需要给电脑端/手机端加任何协议。条与条之间停 400–900ms：
+   * 固定间隔读起来像机械输出，抖动一点才像人在打字。
+   *
+   * 只有一条时**同步写**（不开定时器）：绝大多数回复都是一条，不该为此多绕一圈，
+   * 也让既有测试与调用方看到的行为逐字不变。
+   *
+   * 图挂在最后一条上：先弹一张图再跟着说话，看起来像「图发在话前面」，很怪。
+   */
+  const SAY_GAP_MS = 400;
+  const SAY_JITTER_MS = 500;
+  const saySleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+  const publishSayParts = (petId: string, parts: string[], image?: string, origin?: string): void => {
+    const list = parts.length > 0 ? parts : [''];
+    const write = (i: number): void => {
+      const last = i === list.length - 1;
+      const payload: { text: string; image?: string; origin?: string } = { text: list[i] };
+      if (last && image) payload.image = image;
+      if (origin) payload.origin = origin;
+      state.writePet(petId, 'say', payload);
+    };
+    if (list.length === 1) {
+      write(0);
+      return;
+    }
+    // 不 await：HTTP 响应不该为「演出节奏」多等一两秒；记忆与写盘都已经在上一步完成，
+    // 这里慢的只是气泡出场。失败也就少显示一条，不值得让整次对话报错。
+    void (async () => {
+      for (let i = 0; i < list.length; i += 1) {
+        write(i);
+        if (i < list.length - 1) await saySleep(SAY_GAP_MS + Math.floor(Math.random() * SAY_JITTER_MS));
+      }
+    })();
+  };
+
   /** 与某只宠物对话：截取最近记忆 → 生成回复 → 写入记忆 → 把回复写进 S 的 pets.<id>.say。
    *  配图（chatImageEnabled 开启时）：把表情包清单交给模型按语境选一张，命中池内才随回复写回。
    *  成功**带回回复文本**（与同时写进叶子的那份完全相同）——调用方拿到就不必再拉一拍 /state。 */
   const chatWithPet = async (
     petId: string,
-    text: string,
+    /**
+     * 用户说的话。**可以是多条**（2026-11-01）：接收端合并窗口把「你连发的三条」
+     * 一次交进来（见 ./chat-merge）。生成时模型看到的是拼好的一段，
+     * 但记忆里留的是三条**各自独立**的 user 消息 —— 用户确实说了三句，
+     * 压成一句会让他事后翻历史时以为是自己被总结了。
+     */
+    texts: string | string[],
     /**
      * 群聊发言者（2026-10-29）。`memoryMode: 'single'` 时**完全不看**它——
      * 单人模式没有「谁在说话」这个维度，传了也不该改变任何行为（否则同一次对话
@@ -1750,6 +1799,9 @@ export function apply(ctx: any): void {
       // 一进对话就先记一笔：这样整轮生成（几秒到几十秒）期间碎碎念调度器会看到「正在对话」，
       // 不会在她组织回答的时候插一句自言自语。
       chatActivity.note(petId);
+      // 统一成数组：生成时模型看到拼好的一段，记忆里留各自独立的几条（见参数注释）。
+      const textList = (Array.isArray(texts) ? texts : [texts]).map((s) => s.trim()).filter((s) => s !== '');
+      const text = textList.join('\n');
       const cfg = readAllConfig(configPaths);
       const found = findPetInstance(cfg, petId);
       // 宠物在"校验那次读"与这里之间被删了——本函数还要先排 withMemoryLock 的串行队列（等前一次生成
@@ -1976,10 +2028,20 @@ export function apply(ctx: any): void {
         // 同轮搭车：助手最后那句也可能带 `[标:…]`，与普通对话同一套剥除口径
         // （解析失败一律原样返回，绝不吞掉回复——见 memory-tags.ts 的 extractAiTags）。
         const said = extractAiTags(outcome.text);
-        const userMsg2 = userMessageFor(text, now2, sender, isGroup ? 'group' : 'single');
-        if (said.tags) userMsg2.aiTags = { ...said.tags, at: now2 };
-        target.messages.push(userMsg2);
-        target.messages.push({ role: 'assistant', content: said.text, ts: now2 });
+        // 用户连发几条被合并成一批时，历史里要留**几条真实的 user 消息**：用户确实说了三句，
+        // 压成一句会让下轮检索把「第2句」当成同一句话的一部分（实测合并后历史只剩一条带换行的）。
+        const userMsgs2 = textList.map((t, i) => userMessageFor(t, now2 + i, sender, isGroup ? 'group' : 'single'));
+        if (said.tags && userMsgs2.length > 0) userMsgs2[userMsgs2.length - 1].aiTags = { ...said.tags, at: now2 };
+        // 分条（2026-11-01 补）：助手分支也得拆 —— 开了助手模式后对话全走这条分支，
+        // 原先这里只推一条消息，等于「分条」在实际使用里一次都没生效过
+        // （真机日志 `助手完成 pet=main，0 步动作` 后面只跟一个气泡，才发现的）。
+        // 拆法与普通对话同源（./split-reply）：模型守约就给几条，不守约按句末标点兜底。
+        const saidSplit = splitEnabledOf(found.conf) ? splitReply(said.text) : [];
+        const saidList = saidSplit.length > 0 ? saidSplit : [stripSplitMarks(said.text)];
+        target.messages.push(...userMsgs2);
+        for (let i = 0; i < saidList.length; i += 1) {
+          target.messages.push({ role: 'assistant', content: saidList[i], ts: now2 + textList.length + i });
+        }
         // 事实卡增量更新（在 writeMemory **之前**，让本轮抽到的事实与本轮消息一次落盘）。
         // 群聊下**跳过**：target 是群级条目，写进去就是跨人混的一份（见 baseSystem 处注释）；
         // 每人的事实卡由下面 recordGroupSpeaker → touchMember 写进 members[id].facts。
@@ -2009,28 +2071,48 @@ export function apply(ctx: any): void {
           );
         }
         // 用户看到的、记进历史的、写进操作记录的，一律是**剥掉标记的正文**
-        // （标记只给记忆库用，露出 `[标:…]` 就是没做完）
-        state.writePet(petId, 'say', { text: said.text });
+        // （标记只给记忆库用，露出 `[标:…]` 就是没做完；`[分]` 同理，这里已按条切开）。
+        const assistantText = saidList.join('\n');
+        publishSayParts(petId, saidList);
         log.info(
           `[dsh-pet] 助手完成 pet=${petId}，${outcome.steps.length} 步动作：` +
             outcome.steps.map((s) => s.name + (s.ok ? '✓' : '✗')).join(' '),
         );
-        record('ok', said.text);
-        return { ok: true as const, text: said.text };
+        record('ok', assistantText);
+        return { ok: true as const, text: assistantText };
       }
 
       // 模型：条目配置的 chatModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
-      const generated = await generateChat(ctx, system, list, text, pool, configuredModel(found.conf, 'chatModel'));
+      const splitOn = splitEnabledOf(found.conf);
+      const generated = await generateChat(
+        ctx,
+        system,
+        list,
+        text,
+        pool,
+        configuredModel(found.conf, 'chatModel'),
+        true,
+        splitOn,
+      );
       if (!generated.ok) return generated;
       const now = Date.now();
-      const userMsg = userMessageFor(text, now, sender, isGroup ? 'group' : 'single');
-      // 同轮搭车（用户 m09397/m09441 定的主路）：模型在回复末尾附了 `[标:…]`，host 已解析并剥除，
-      // 这里直接把它焊在这条 user 消息上——**零额外往返**，也不必再排队后台补标。
-      // 落盘形状与后台补标完全一致（`aiTags` + `at`），检索侧一视同仁。
-      if (generated.tags) userMsg.aiTags = { ...generated.tags, at: now };
-      target.messages.push(userMsg);
+      // 分条（2026-11-01）：「像真人那样分多条说」——模型按指令用 [分] 隔开几条短句，
+      // 这里切开后**每条各算一条 assistant 消息**（一条消息 = 一个气泡，三端都不用改协议）。
+      // 关掉开关时不拆，但仍要剥掉可能残留的标记（协议字符不能露给用户）。
+      const parts = splitOn ? splitReply(generated.text) : [stripSplitMarks(generated.text)];
+      const said = parts.length > 0 ? parts : [generated.text];
+      // 用户这几句各存一条（ts 递增 1ms，保证顺序可恢复）。
+      // `[标:…]` 焊在**最后一条**上：模型看到的是合并后那段话，它打的标签描述的是整段，
+      // 挂在收口那句最不容易被后续检索切走。
+      const userMsgs = textList.map((t, i) => userMessageFor(t, now + i, sender, isGroup ? 'group' : 'single'));
+      // 同轮搭车（用户定的主路）：模型在回复末尾附的 `[标:…]` 已由 host 解析并剥除，
+      // 这里直接焊到消息上——**零额外往返**，也不必再排队后台补标。落盘形状与后台补标一致。
+      if (generated.tags && userMsgs.length > 0) userMsgs[userMsgs.length - 1].aiTags = { ...generated.tags, at: now };
+      target.messages.push(...userMsgs);
       // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
-      target.messages.push({ role: 'assistant', content: generated.text, ts: now });
+      for (let i = 0; i < said.length; i += 1) {
+        target.messages.push({ role: 'assistant', content: said[i], ts: now + textList.length + i });
+      }
       // 事实卡增量更新（同助手分支：在 writeMemory 之前，一次落盘）。
       // 群聊下跳过，理由同上——每人的事实卡走 members[id].facts。
       if (!isGroup) learnFacts(target, text, now);
@@ -2062,15 +2144,40 @@ export function apply(ctx: any): void {
           '[dsh-pet] 自动记忆压缩异常（已忽略，不影响本次回复）：' + (e instanceof Error ? e.message : String(e)),
         );
       }
-      // 回复写进 S（与碎碎念同一个叶子：前端本来就是同一条展示链路）
-      state.writePet(
-        petId,
-        'say',
-        generated.image ? { text: generated.text, image: generated.image } : { text: generated.text },
-      );
+      // 回复写进 S（与碎碎念同一个叶子：前端本来就是同一条展示链路）。
+      // 分条时逐条写、条间停顿（见 publishSayParts）——前端因此天然多出几个气泡。
+      publishSayParts(petId, said, generated.image);
       // 同一份文本随返回值带出（叶子照写，不是二选一）
-      return { ok: true as const, text: generated.text, ...(generated.image ? { image: generated.image } : {}) };
+      const joined = said.join('\n');
+      return { ok: true as const, text: joined, ...(generated.image ? { image: generated.image } : {}) };
     });
+
+  /**
+   * 接收端合并器（2026-11-01，见 ./chat-merge）。
+   *
+   * **每只宠物一个实例**：合并必须局限在同一只会话里——主人跟 A 说的话被端给 B 回答，
+   * 既是越界也是离谱。懒建：没开这个开关（窗口 = 0）时一个实例都不会创建。
+   *
+   * `sender` 随每条一起排队：群里三个人连着说话时，取这一批的**第一条**那个 sender 归属
+   * （合并批次本来就是同一轮对话，按第一个人记比按最后一个人记更接近原意）。
+   */
+  type ChatReply = Awaited<ReturnType<typeof chatWithPet>>;
+  const chatMergers = new Map<string, ChatMerger<{ text: string; sender?: Sender }, ChatReply>>();
+  const mergerFor = (petId: string): ChatMerger<{ text: string; sender?: Sender }, ChatReply> => {
+    let m = chatMergers.get(petId);
+    if (!m) {
+      m = new ChatMerger<{ text: string; sender?: Sender }, ChatReply>({
+        run: (items) =>
+          chatWithPet(
+            petId,
+            items.map((i) => i.text),
+            items[0]?.sender,
+          ),
+      });
+      chatMergers.set(petId, m);
+    }
+    return m;
+  };
 
   /**
    * 主动聊天该往哪个群说（2026-10-31）。
@@ -2216,6 +2323,10 @@ export function apply(ctx: any): void {
         proactiveInstruction(groupName),
         [],
         configuredModel(found.conf, 'chatModel'),
+        // wantTags 与以前一样取默认（true）；第 8 个参数才是这次新增的分条开关。
+        // 主动搭话更该拆成两三条：一整段推过来一眼就是推送，不像人。
+        true,
+        splitEnabledOf(found.conf),
       );
       if (!generated.ok) {
         log.warn(
@@ -2228,7 +2339,14 @@ export function apply(ctx: any): void {
         return generated;
       }
 
-      target.messages.push(proactiveMessage(generated.text, now));
+      // 分条（与对话同一套）：每条各算一条 assistant 消息，`origin` 由 proactiveMessage 自带，
+      // 所以每一条在手机上都会显示「她主动来找你」的小标题，不会只在最后一条上出现。
+      const splitOn = splitEnabledOf(found.conf);
+      const proParts = splitOn ? splitReply(generated.text) : [stripSplitMarks(generated.text)];
+      const proSaid = proParts.length > 0 ? proParts : [generated.text];
+      for (let i = 0; i < proSaid.length; i += 1) {
+        target.messages.push(proactiveMessage(proSaid[i], now + i));
+      }
       await writeMemory(mem);
       // 自动压缩：与对话同一条理由——主动聊天也会把消息堆长，不压缩迟早撑爆上下文。
       // 失败不冒泡（摘要只是优化，绝不能让"她说了句话"因为压缩失败而失败）。
@@ -2239,9 +2357,9 @@ export function apply(ctx: any): void {
       }
       // 写 S 的同一个叶子：前端本来就是同一条展示链路，所以"她主动说话"和"碎碎念"
       // 在画面上长得一模一样（都是气泡），区别只在记忆里有没有痕迹。
-      state.writePet(petId, 'say', { text: generated.text, origin: 'proactive' });
+      publishSayParts(petId, proSaid, undefined, 'proactive');
       log.info(`[dsh-pet] 主动聊天成功 pet=${petId}${isGroup ? ' group=' + groupId : ''}，${generated.text.length} 字`);
-      return { ok: true, text: generated.text, ...(isGroup ? { group: groupId } : {}) };
+      return { ok: true, text: proSaid.join('\n'), ...(isGroup ? { group: groupId } : {}) };
     });
 
   /**
@@ -4492,6 +4610,10 @@ export function apply(ctx: any): void {
             // 与碎碎念的 eventsRefreshSec.whisper **不是同一个键**——两者语义不同（见 ./proactive 文件头）。
             proactiveChatEnabled: proactiveEnabled(mainNow),
             proactiveChatSec: proactivePeriodSec(mainNow),
+            // 回话节奏（2026-11-01，用户要求「像真人那样分多条说」）：
+            // 分条回复开关 + 合并静默窗口。缺键回默认（开 / 800ms），设置页直接照抄进控件。
+            chatSplitEnabled: splitEnabledOf(mainNow),
+            chatMergeWindowMs: mergeWindowMsOf(mainNow),
             workspaceRoot: assistantWorkspace,
             pets,
             /** 读屏能力是否可用（pwsh 找不到时为 false，设置页据此禁用开关并说明原因） */
@@ -4544,6 +4666,10 @@ export function apply(ctx: any): void {
         // 间隔越界（<120 或 >86400）在那一层被拒 → bad-request，不静默夹紧。
         'proactiveChatEnabled',
         'proactiveChatSec',
+        // 回话节奏（2026-11-01）：同上，显式给了才写。saveUserConfig 会再过一次 topFieldValid，
+        // 窗口越界（<0 或 >3000）在那一层被拒 → bad-request，不静默夹紧。
+        'chatSplitEnabled',
+        'chatMergeWindowMs',
       ]) {
         if (patch[key] === undefined) continue;
         next[key] = patch[key];
@@ -4741,7 +4867,14 @@ export function apply(ctx: any): void {
           // 群聊发言者（2026-10-29）：`sender` 可以是字符串（id）或 `{id, name}`。
           // 解错就当成没带（单人模式本来就不看它；群聊模式按单人处理并记日志，不猜身份）。
           const sender = parseSender(parsed.sender);
-          const result = await chatWithPet(petId, text, sender);
+          // 接收端合并（2026-11-01）：你连发几条时先攒一个静默窗口，再统一生成一次、只回一次。
+          // 放在 host 而不是每个前端各做一遍：电脑对话窗、手机页、独立端窗口三条发送路径都过这里，
+          // 放这里三端自动一致，也不必改协议。窗口 = 0 表示关合并，直接走原路。
+          const windowMs = mergeWindowMsOf(who.conf);
+          const result =
+            windowMs <= 0
+              ? await chatWithPet(petId, [text], sender)
+              : await mergerFor(petId).submit({ text, sender }, windowMs);
           return { kind: 'json', status: 200, obj: result };
         }
       } catch (e) {
