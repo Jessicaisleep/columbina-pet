@@ -413,7 +413,10 @@ export const settingsScript = `
         del.disabled = true;
         mobileMsg('正在删除…');
         try {
-          const next = await petRequest('/mobile/api/devices/remove', 'POST', JSON.stringify({ id: d.id }));
+          // 这里必须传**对象**：petRequest 内部会 JSON.stringify 一次（见它的实现）。
+          // 传 JSON.stringify({id}) 等于序列化两遍，服务端 parse 出来是字符串而不是对象，
+          // 于是永远回 400「缺少设备 id」—— 用户看到的就是「点删除没反应」（2026-11-02 修）。
+          const next = await petRequest('/mobile/api/devices/remove', 'POST', { id: d.id });
           renderDevices(next);
           mobileMsg('已删除。这台电脑现在可以正常聊天了。', false);
         } catch (error) {

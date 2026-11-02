@@ -507,6 +507,11 @@ export const mobileScript = `'use strict';
     var base=location.protocol+'//'+host;
     $('connect-btn').disabled=true;
     showConnect('正在配对…',true);
+    // 配对是整台手机唯一「还没有任何信任」的时刻：宿主的证书是自签的，而原生侧只认
+    // 「已经配对的那台」—— 此刻它还是空的。不先把这次的目标地址报备给原生，
+    // WebView 会在 onReceivedSslError 里直接 cancel，页面上只剩一句
+    // 「连不上：Failed to fetch」，用户看到的就是「IP 明明填对了却连不上」。
+    try{if(native&&native.markCandidate)native.markCandidate({host:host})}catch(e){}
     fetch(base+'/pair',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({pin:pin,deviceId:deviceId(),deviceName:deviceName()})})
       .then(function(r){return r.text().then(function(t){var j=null;try{j=JSON.parse(t)}catch(e){};if(!r.ok)throw new Error((j&&j.message)||('HTTP '+r.status));return j})})
@@ -519,11 +524,17 @@ export const mobileScript = `'use strict';
         var id=(j&&j.hostId)?String(j.hostId):('h:'+host);
         state.hostId=id;
         upsertProfile({id:id,host:host,token:j.token,label:'',pets:[],at:Date.now()});
+        // 让原生侧也记住这台：悬浮窗/语音唤醒/读屏都是独立服务，冷启动只能靠
+        // PetState 自恢复；不写这一下，它们重启后就是「不知道连哪台电脑」。
+        // 顺带把刚才临时放行的 candidate 作废（证书信任此后只认这个正式地址）。
+        try{if(native&&native.saveConn)native.saveConn({host:host,token:j.token})}catch(e){}
         // 老键顺手清掉：留着会让下次启动的迁移逻辑把旧地址又变出一条记录
         try{localStorage.removeItem(LS_HOST);localStorage.removeItem(LS_TOKEN)}catch(e){}
         return boot();
       })
       .catch(function(e){
+        // 配对没成：把临时放行的地址收回，别让它一直挂在「可信主机」里
+        try{if(native&&native.markCandidate)native.markCandidate({host:''})}catch(e2){}
         showConnect('连不上：'+e.message+'（确认同一 Wi-Fi / 电脑上桌宠开着 / 配对码没过期）');
       })
       .then(function(){$('connect-btn').disabled=false});
@@ -617,6 +628,9 @@ export const mobileScript = `'use strict';
       state.pool=hit.pool||{idle:[],click:[],actions:[]};
       localStorage.setItem(pk(LS_PET),state.pet);
       $('pet-name').textContent=hit.name||hit.id;
+      // 冷启动时原生侧（悬浮窗/读屏/唤醒）也要知道现在放的是哪只 —— 只存 host/token
+      // 会让它按默认那只取素材，换过宠物的人重启后会看到「悬浮窗里是另一只」。
+      try{if(native&&native.saveConn)native.saveConn({petId:state.pet,assetRoot:state.assetRoot})}catch(e){}
       // 宿主记录里存一份「几台、几宠物」的快照：切换面板要在**没连上**的时候也能说清
       // 「这一条是 3 只的那台」还是「2 只的那台」。
       var prof=profileById(state.hostId);
@@ -684,6 +698,9 @@ export const mobileScript = `'use strict';
     state.idle=hit.idle||'待机呼吸';state.click=hit.click||'';
     state.pool=hit.pool||{idle:[],click:[],actions:[]};
     try{localStorage.setItem(pk(LS_PET),state.pet)}catch(e){}
+    // 原生侧（悬浮窗/读屏/唤醒）按 petId+assetRoot 取素材，换宠物必须同步过去，
+    // 否则悬浮窗还挂着上一只的动画。
+    try{if(native&&native.saveConn)native.saveConn({petId:state.pet,assetRoot:state.assetRoot})}catch(e){}
     $('pet-name').textContent=hit.name||hit.id;
     // 对话与气泡都是按宠物分域的，换宠物必须整块重来：
     // 不重来就会把上一只说的话贴到这一只脸上，用户会以为是记忆串了。
@@ -717,6 +734,8 @@ export const mobileScript = `'use strict';
     $('pet-name').textContent=p.petName||p.pet||'';
     blobCache={};
     setActiveId(p.id);
+    // 换电脑也要同步给原生：证书信任、悬浮窗取数都看这一格
+    try{if(native&&native.saveConn)native.saveConn({host:p.host,token:p.token})}catch(e){}
     closePicker();
     boot().then(function(){refreshSelfai()}).catch(function(){});
   }
