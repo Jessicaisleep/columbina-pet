@@ -20,12 +20,16 @@ test('设置屏的每个 id 都真的渲染在页面里', () => {
 });
 
 test('脚本里 $() 取到的 id 必须存在', () => {
+  // 这些 id 是**运行时动态创建**的元素（长按菜单 petmenu / 遮罩 petmenu-mask），
+  // 本就不该出现在静态 HTML 里——它们由 openPetMenu() 用 createElement 造出来。
+  const DYNAMIC = new Set(['petmenu', 'petmenu-mask']);
   const used = new Set<string>();
   const re = /\$\('([a-z0-9-]+)'\)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(mobileScript)) !== null) used.add(m[1]);
   assert.ok(used.size > 30, '取到的 id 太少，说明设置屏的脚本没拼进产物');
   for (const id of used) {
+    if (DYNAMIC.has(id)) continue;
     assert.ok(
       mobilePage.includes('id="' + id + '"'),
       `脚本里取了 $('${id}')，但页面里没有这个 id —— 运行时会是 null 然后整段脚本报错`,

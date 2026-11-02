@@ -49,6 +49,7 @@ export const mobilePage = `<!doctype html>
     <header class="bar">
       <span id="pet-name">桌宠</span>
       <span id="conn-state" class="dot" title="连接状态"></span>
+      <button id="show-pet-btn" type="button" class="link" style="display:none" title="把桌宠叫回来">显示桌宠</button>
       <button id="pick-btn" type="button" class="link">切换</button>
       <button id="set-btn" type="button" class="link">设置</button>
       <button id="disconnect" type="button" class="link">断开</button>
@@ -168,6 +169,10 @@ export const mobilePage = `<!doctype html>
 export const mobileStyle = `:root{color-scheme:dark}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
+/* overflow-x:hidden 是气泡避让的前提：气泡 fixed 定位一旦出屏会把**布局视口撑大**，
+   clientWidth 跟着变大 → clamp 以为屏幕更宽 → 气泡更出屏（恶性循环，2026-11-02 模拟器
+   实测 clientWidth 在 393~596 之间跳就是这个原因）。锁住水平溢出，视口才稳定。 */
+html,body{overflow-x:hidden}
 body{background:#0f1218;color:#e8ecf3;font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
   -webkit-text-size-adjust:100%;overscroll-behavior:none}
 #app{height:100%;display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
@@ -209,18 +214,37 @@ button.link{background:none;color:#9aa6b8;font-weight:400;padding:6px 8px;font-s
 .pempty{padding:12px 14px;font-size:13px;color:#7f8ea6}
 .prow{display:flex;gap:8px;padding:12px 14px 0}
 .prow .nbtn{flex:1}
+/* 长按宠物弹出的菜单（对齐桌面右键菜单）。fixed 定位在手指旁，不挤布局。 */
+.petmenu{position:fixed;z-index:60;min-width:168px;background:#1b2230;border:1px solid #2a3444;
+  border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.55);padding:6px;overflow:hidden}
+.petmenu .mi{display:flex;align-items:center;gap:8px;width:100%;padding:11px 12px;border:0;border-radius:9px;
+  background:none;color:#e8ecf3;font-size:14px;text-align:left;line-height:1.3}
+.petmenu .mi:active{background:#2a3444}
+.petmenu .mi.warn{color:#ff9a9a}
+.petmenu .mi.on{color:#7ee0a8}
+.petmenu .msep{height:1px;background:#2a3444;margin:5px 8px}
+.petmenu-mask{position:fixed;inset:0;z-index:59;background:transparent}
 .stage{position:relative;height:34vh;min-height:180px;max-height:300px;display:flex;align-items:flex-end;justify-content:center;
-  background:radial-gradient(120% 80% at 50% 100%,#1b2330 0%,#0f1218 70%);overflow:hidden}
+  background:radial-gradient(120% 80% at 50% 100%,#1b2330 0%,#0f1218 70%);
+  /* overflow 必须 visible：宠物要能拖出舞台（拖到屏幕任意位置，见 clampPos 全屏化）。
+     原来 hidden 会把拖出去的宠物裁掉——「拖不动」的一半原因是这个。 */
+  overflow:visible}
 /* 顶部提示条：发消息前同步慢（>1 秒）、或某次操作失败时在这里说人话。 */
 .tipbar{margin:0;padding:6px 14px;font-size:12px;line-height:1.5;color:#ffd479;background:#2a2416;border-bottom:1px solid #3b3320}
 /* 拖动状态只改光标：位置本身用 transform，交给 pointer 事件算（见 bindDrag）。 */
 .pet{cursor:grab}
 .pet.dragging{cursor:grabbing}
-.pet{width:min(72vw,280px);aspect-ratio:16/9;position:relative;touch-action:none;-webkit-user-select:none;user-select:none}
+.pet{width:min(72vw,280px);aspect-ratio:16/9;position:relative;touch-action:none;-webkit-user-select:none;user-select:none;
+  /* z-index：拖出舞台后要压在聊天区上面（否则被聊天流盖住，看着像消失了）。 */
+  z-index:10}
 .pet video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;background:transparent}
-.bubble{position:absolute;top:10px;left:50%;transform:translateX(-50%);max-width:86%;
+/* 气泡：水平永远居中于屏幕（left:50% + translateX(-50%)，宽度 86vw —— 这样永不出屏、
+   永不被压窄）。垂直方向由 placeBubble() 选「宠物上方 / 下方」，避免被宠物挡住。
+   2026-11-02 教训：曾改成「left 设像素、水平追宠物」，结果 fixed 的 shrink-to-fit 把气泡
+   压成 47px 宽的竖条（left 越靠右可用宽越小）；水平居中是唯一既不出屏又不压窄的做法。 */
+.bubble{position:fixed;top:10px;left:50%;transform:translateX(-50%);width:86vw;max-width:420px;
   background:#f3f6fb;color:#14181f;padding:9px 13px;border-radius:14px;font-size:14px;line-height:1.45;
-  box-shadow:0 6px 18px rgba(0,0,0,.35);word-break:break-word;z-index:2}
+  box-shadow:0 6px 18px rgba(0,0,0,.35);word-break:break-word;z-index:30}
 /* 来意档位（与桌面端、安卓悬浮窗同一套语义，取值表在 shared/bubble-kind.ts）：
    calling = 她主动来找你：粉色描边 + 小标题，是最需要你回的那一个
    murmur  = 自言自语：灰底小字，一眼看出不用回
@@ -460,7 +484,10 @@ export const mobileScript = `'use strict';
     cfgVer:0,
     // overlayOn：悬浮窗开着时页面里弹出的话也推一份过去——用户此刻可能正在别的 App 里，
     // 只看得到悬浮宠物，看不到这个页面。
-    idle:'',click:'',pool:{idle:[],click:[],actions:[]},pos:{x:0,y:0},overlayOn:false};
+    idle:'',click:'',pool:{idle:[],click:[],actions:[]},pos:{x:0,y:0},overlayOn:false,
+    // posLocked：长按菜单「固定位置」——锁定后拖动无效（桌面右键的同名功能）。
+    // petHidden：长按菜单「隐藏桌宠」——收起舞台，聊天区保留，顶栏出现「显示桌宠」。
+    posLocked:false,petHidden:false};
 
   function api(path,opt){
     opt=opt||{};
@@ -960,23 +987,32 @@ export const mobileScript = `'use strict';
       play(name,true);
     };
     loadPos();
+    // 恢复「固定位置 / 隐藏桌宠」（按宿主记，换宠物不清——用户藏的是这个舞台，不是某一只）。
+    try{state.posLocked=localStorage.getItem(pk('dshpet.poslock'))==='1'}catch(e){}
+    try{state.petHidden=localStorage.getItem(pk('dshpet.pethidden'))==='1'}catch(e){}
+    setPetHidden(state.petHidden);
     bindDrag();
     requestAnimationFrame(applyPos);
   }
 
-  // ---- 拖动宠物（手机上原来完全挪不动）----
+  // ---- 拖动宠物 ----
   // 舞台是 flex 居中 + 底对齐，用 transform 平移最省事：不触发 layout、也不会让 video 重排。
-  // 边界按「舞台内可见」算：宠物本来贴底居中，所以 y 只能往上（负值），x 左右对称。
+  // 全屏可拖（2026-11-02 用户反馈「宠物拖不动」：原来被钳在舞台里，左右只能挪
+  // ±(舞台宽−宠物宽)/2 ≈ 56px、只能往上挪 ≈107px、完全不能往下）。现在与桌面端一致：
+  // 松手位置即最终位置，不强制拉回；只留宽松边界，宠物至少露出 1/4 在屏幕内。
   var drag=null;
   function clampPos(x,y){
-    var st=$('stage'),el=$('pet');
-    var maxX=Math.max(0,Math.round((st.clientWidth-el.offsetWidth)/2));
-    var maxY=Math.max(0,Math.round(st.clientHeight-el.offsetHeight));
-    return {x:Math.min(maxX,Math.max(-maxX,x)),y:Math.min(0,Math.max(-maxY,y))};
+    var el=$('pet');
+    var w=el.offsetWidth;
+    var maxX=Math.round(window.innerWidth/2+w/4);
+    var maxY=Math.round(window.innerHeight);
+    return {x:Math.min(maxX,Math.max(-maxX,x)),y:Math.min(maxY,Math.max(-maxY,y))};
   }
   function applyPos(){
     var p=clampPos(state.pos.x||0,state.pos.y||0);state.pos=p;
     var el=$('pet');if(el)el.style.transform='translate('+p.x+'px,'+p.y+'px)';
+    // 宠物挪了，气泡要跟着重新选边（否则气泡停在旧位置，可能飘在半空或挡住宠物）。
+    var bb=$('bubble');if(bb&&!bb.classList.contains('is-hidden'))placeBubble();
   }
   // 位置按「宿主+宠物」记：插件端那只和独立端那只不该互相覆盖拖到哪儿了。
   function posKey(){return pk('dshpet.petpos')+'/'+(state.pet||'pet')}
@@ -987,12 +1023,70 @@ export const mobileScript = `'use strict';
       else state.pos={x:0,y:0};
     }catch(e){}
   }
+  // ---- 长按菜单（对齐桌面右键菜单）----
+  // 桌面右键有：查看余额/碎碎念/对话/压缩记忆/回到初始位置/固定位置/隐藏桌宠/动作。
+  // 手机没有右键，用「长按 0.5 秒不动」触发；短按仍是「点击回应」。
+  function closePetMenu(){
+    var m=$('petmenu'),k=$('petmenu-mask');
+    if(m)m.remove();if(k)k.remove();
+  }
+  function menuItem(label,fn,cls){
+    var b=document.createElement('button');
+    b.type='button';b.className='mi'+(cls?' '+cls:'');b.textContent=label;
+    b.addEventListener('click',function(e){e.stopPropagation();closePetMenu();try{fn()}catch(err){tip('操作失败：'+err.message,4000)}});
+    return b;
+  }
+  function openPetMenu(cx,cy){
+    closePetMenu();
+    var mask=document.createElement('div');mask.id='petmenu-mask';mask.className='petmenu-mask';
+    mask.addEventListener('click',closePetMenu);
+    var m=document.createElement('div');m.id='petmenu';m.className='petmenu';
+    m.appendChild(menuItem('对话',function(){var i=$('text');if(i){i.focus();i.scrollIntoView({block:'center'})}}));
+    m.appendChild(menuItem('让她念一句（碎碎念）',function(){
+      if(state.offline){tip('离线时不能碎碎念（要连上电脑生成）',4000);return}
+      tip('她在想…');
+      api('/dsh-pet-7340/whisper?pet='+encodeURIComponent(state.pet)+'&surface=any',{method:'POST',body:'{}'})
+        .then(function(){tip('')}).catch(function(e){tip('碎碎念失败：'+e.message,4000)});
+    }));
+    m.appendChild(menuItem('做一个动作',function(){var n=pickAnim('actions')||pickAnim('idle');if(n&&window.__petOnce)window.__petOnce(n);else tip('没有可播的动作',3000)}));
+    m.appendChild(menuItem('查看余额',function(){
+      if(state.offline){tip('离线时查不了余额',4000);return}
+      api('/dsh-pet-7340/balance',{method:'POST',body:'{}'})
+        .then(function(){tip('余额已刷新，看宠物头顶的气泡',4000)}).catch(function(e){tip('余额查询失败：'+e.message,4000)});
+    }));
+    var sep=document.createElement('div');sep.className='msep';m.appendChild(sep);
+    m.appendChild(menuItem('回到初始位置',function(){state.pos={x:0,y:0};applyPos();try{localStorage.setItem(posKey(),JSON.stringify(state.pos))}catch(e){}}));
+    m.appendChild(menuItem(state.posLocked?'取消固定位置':'固定位置',function(){
+      state.posLocked=!state.posLocked;
+      try{localStorage.setItem(pk('dshpet.poslock'),state.posLocked?'1':'')}catch(e){}
+      tip(state.posLocked?'已固定：拖动已锁定':'已取消固定',3000);
+    },state.posLocked?'on':''));
+    m.appendChild(menuItem('隐藏桌宠',function(){setPetHidden(true)},'warn'));
+    document.body.appendChild(mask);document.body.appendChild(m);
+    // 定位：优先放在手指右下方，贴边则收回到屏幕内。
+    var mw=m.offsetWidth,mh=m.offsetHeight;
+    var x=Math.min(cx+8,window.innerWidth-mw-8),y=Math.min(cy+8,window.innerHeight-mh-8);
+    m.style.left=Math.max(8,x)+'px';m.style.top=Math.max(8,y)+'px';
+  }
+  // 隐藏桌宠 = 收起舞台（聊天区保留），顶栏给一个「显示桌宠」入口。按宿主+宠物记。
+  function setPetHidden(v){
+    state.petHidden=!!v;
+    try{localStorage.setItem(pk('dshpet.pethidden'),state.petHidden?'1':'')}catch(e){}
+    var st=$('stage');if(st)st.style.display=state.petHidden?'none':'';
+    var b=$('show-pet-btn');if(b)b.style.display=state.petHidden?'':'none';
+  }
   function bindDrag(){
     var el=$('pet');if(!el||el.__drag)return;el.__drag=true;
     var TAP=6; // 移动不超过 6px 算「点一下」，与桌面端的判定一致
+    var LONGPRESS=500; // 按住不动 0.5 秒 = 长按，弹菜单
     el.addEventListener('pointerdown',function(e){
       if(e.button&&e.button!==0)return;
-      drag={id:e.pointerId,x:e.clientX,y:e.clientY,ox:state.pos.x,oy:state.pos.y,moved:0,started:false};
+      if(state.posLocked)return; // 固定位置后不允许拖动（菜单里可解锁）
+      drag={id:e.pointerId,x:e.clientX,y:e.clientY,ox:state.pos.x,oy:state.pos.y,moved:0,started:false,long:false,timer:0};
+      // 长按计时：500ms 内没挪动就弹菜单，并取消这次拖动/点击。
+      drag.timer=setTimeout(function(){
+        if(drag&&!drag.started){drag.long=true;el.classList.remove('dragging');openPetMenu(e.clientX,e.clientY)}
+      },LONGPRESS);
       el.classList.add('dragging');
       if(el.setPointerCapture)try{el.setPointerCapture(e.pointerId)}catch(err){}
     });
@@ -1001,6 +1095,9 @@ export const mobileScript = `'use strict';
       var dx=e.clientX-drag.x,dy=e.clientY-drag.y;
       drag.moved=Math.max(drag.moved,Math.abs(dx)+Math.abs(dy));
       if(!drag.started&&drag.moved<TAP)return;
+      // 一动就不是长按了：取消长按计时，进入拖动。
+      if(drag.timer){clearTimeout(drag.timer);drag.timer=0}
+      if(drag.long)return; // 已经弹了菜单，这次手势不再拖动
       drag.started=true;
       if(e.cancelable)e.preventDefault();
       state.pos=clampPos(drag.ox+dx,drag.oy+dy);
@@ -1008,9 +1105,12 @@ export const mobileScript = `'use strict';
     });
     function end(e){
       if(!drag||e.pointerId!==drag.id)return;
-      var started=drag.started;drag=null;
+      var started=drag.started,long=drag.long;
+      if(drag.timer){clearTimeout(drag.timer);drag.timer=0}
+      drag=null;
       el.classList.remove('dragging');
-      if(started){try{localStorage.setItem(posKey(),JSON.stringify(state.pos))}catch(err){};return}
+      if(long)return; // 长按已弹菜单，不再触发点击回应
+      if(started){try{localStorage.setItem(posKey(),JSON.stringify(state.pos))}catch(err){};applyPos();return}
       // 没挪动 = 点了一下：跟桌面端一样给一次「点击回应」。
       // 池子里有几条（开心跃动／害羞惊讶／傲娇生气…）就随机挑一条，否则每次都同一段像卡住；
       // 单次播放、放完回待机 —— 点击回应是"回应"，不该变成新待机。
@@ -1018,7 +1118,7 @@ export const mobileScript = `'use strict';
       if(one&&window.__petOnce)window.__petOnce(one);
     }
     el.addEventListener('pointerup',end);
-    el.addEventListener('pointercancel',function(e){drag=null;el.classList.remove('dragging')});
+    el.addEventListener('pointercancel',function(e){if(drag&&drag.timer)clearTimeout(drag.timer);drag=null;el.classList.remove('dragging')});
   }
 
   // ---- 轮询 /state ----
@@ -1052,7 +1152,10 @@ export const mobileScript = `'use strict';
           if(say&&say.text)showBubble(say.text,say.origin);
           var anim=p.anim&&p.anim.data;
           if(anim){
-            if(anim.name)window.__petAnim(anim.name);
+            // /state 的 anim 是「点播动画」指令（一次性动作：碎碎念/点击回应/工作状态…），
+            // 不是待机——必须播一遍就回待机（__petOnce），不能循环（__petAnim）。
+            // 2026-11-02 用户反馈「碎碎念循环不停播放」：根因就是这里走了 loop。
+            if(anim.name)window.__petOnce(anim.name);
             // url 形态（第三方给的完整地址）本页不播：手机上跨域取视频还要过 CORS，
             // 而这条路径的用途是"给宿主所在那一端演一段"，手机端不是它的目标端。
           }
@@ -1071,6 +1174,29 @@ export const mobileScript = `'use strict';
   var SAY_LOOK={"proactive":{"label":"她主动来找你","tone":"calling","hold":0,"focus":true},"whisper":{"label":"自言自语","tone":"murmur","hold":4000,"focus":false},"note":{"label":"","tone":"plain","hold":10000,"focus":false}};
   function sayLook(origin){
     return SAY_LOOK[origin==='proactive'||origin==='whisper'?origin:'note'];
+  }
+  // 气泡自动选边（对话/碎碎念/余额提示都走这一个 #bubble，所以在这里统一避让）。
+  // 规则：量出宠物的屏幕矩形，分别算「上/下/左/右」四个方位能放多大的气泡，
+  // 挑第一个「放得下且不遮宠物」的；都不行就放在宠物正上方并 clamp 进屏幕。
+  function placeBubble(){
+    var b=$('bubble'),pet=$('pet');
+    if(!b||!pet)return;
+    // 水平方向交给 CSS（left:50% + translateX(-50%)，永不出屏）。这里只选**垂直**：
+    // 宠物上方放得下就放上方（默认），上方不够（宠物贴着屏幕顶）就放宠物下方。
+    // 只用量出来的矩形判断，不写死任何像素。
+    var pr=pet.getBoundingClientRect();
+    var bh=b.offsetHeight;
+    var gap=10;
+    b.style.left='';b.style.transform=''; // 交还 CSS 的水平居中
+    var above=pr.top-bh-gap;
+    if(above>=8){
+      b.style.top=Math.round(above)+'px';
+    }else{
+      // 上方放不下 → 放宠物下方；下方也出屏就吸到屏幕底（留 8px）。
+      var below=pr.bottom+gap;
+      var vh=document.documentElement.clientHeight;
+      b.style.top=Math.round(Math.min(below,vh-bh-8))+'px';
+    }
   }
   function showBubble(text,origin){
     var look=sayLook(origin);
@@ -1091,6 +1217,9 @@ export const mobileScript = `'use strict';
     b.className='bubble'+(look.tone!=='plain'?' tone-'+look.tone:'');
     tag.textContent=look.label||'';
     body.textContent=text;
+    // 先按新文字布局，再量尺寸选边（文字变了气泡宽高就变，必须先写文字再 placeBubble）。
+    b.classList.remove('is-hidden');
+    placeBubble();
     if(bubbleTimer){clearTimeout(bubbleTimer);bubbleTimer=null}
     // hold=0 表示不自动消失（她主动来找你，得等你回一句）
     var hold=look.hold>0?Math.max(look.hold,Math.min(30000,text.length*220)):0;
@@ -1165,7 +1294,8 @@ export const mobileScript = `'use strict';
         var say=p.say&&p.say.data;
         if(say&&say.text)showBubble(say.text,say.origin);
         var anim=p.anim&&p.anim.data;
-        if(anim&&anim.name)window.__petAnim(anim.name);
+        // 同上：点播动画播一遍回待机，不循环（见 tick() 里的注释）。
+        if(anim&&anim.name)window.__petOnce(anim.name);
       }
       return loadHistory();
     }).then(function(){return Date.now()-t0});
@@ -1738,6 +1868,8 @@ export const mobileScript = `'use strict';
   //   ② 先取包内动画清单（决定「本地播」还是「向电脑取」，mountPet 第一帧就要用）；
   //   ③ 按「上次在用的那台」恢复；没有就取列表里第一台。
   migrateLegacy();
+  // 顶栏「显示桌宠」：把被长按菜单藏起来的舞台叫回来。
+  (function(){var b=$('show-pet-btn');if(b)b.addEventListener('click',function(){setPetHidden(false)})})();
   function activate(id){
     var p=profileById(id);
     if(!p||!p.token){showConnect('');return Promise.resolve()}
